@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.claude/
+retirement_mc_dashboard_streamlit copy.py
+.DS_Store
