@@ -54,6 +54,21 @@ BASE_CORR = {
     ("Bond", "Alt"): 0.10,
 }
 
+# Regime-switching model: 3-state Markov (Bull / Normal / Bear)
+REGIME_NAMES = ["Bull", "Normal", "Bear"]
+DEFAULT_REGIME_PARAMS = {
+    "Bull":   {"eq_mu": 0.15, "eq_vol": 0.12, "reit_mu": 0.14, "reit_vol": 0.14, "bond_mu": 0.04, "bond_vol": 0.04, "alt_mu": 0.10, "alt_vol": 0.10, "cash_mu": 0.03},
+    "Normal": {"eq_mu": 0.07, "eq_vol": 0.16, "reit_mu": 0.07, "reit_vol": 0.18, "bond_mu": 0.03, "bond_vol": 0.06, "alt_mu": 0.05, "alt_vol": 0.14, "cash_mu": 0.02},
+    "Bear":   {"eq_mu": -0.10, "eq_vol": 0.28, "reit_mu": -0.08, "reit_vol": 0.30, "bond_mu": 0.02, "bond_vol": 0.10, "alt_mu": -0.03, "alt_vol": 0.22, "cash_mu": 0.02},
+}
+# Transition matrix: rows = from-state, cols = to-state [Bull, Normal, Bear]
+DEFAULT_TRANSITION_MATRIX = [
+    [0.90, 0.08, 0.02],   # Bull stays Bull 90%, to Normal 8%, to Bear 2%
+    [0.15, 0.75, 0.10],   # Normal to Bull 15%, stays Normal 75%, to Bear 10%
+    [0.10, 0.30, 0.60],   # Bear to Bull 10%, to Normal 30%, stays Bear 60%
+]
+DEFAULT_REGIME_INITIAL_PROBS = [0.35, 0.50, 0.15]
+
 # ============================================================
 # SECTION 2: Utility functions
 # ============================================================
@@ -225,6 +240,21 @@ def draw_shocks(rng, n, cov, dist_type: str, t_df: int) -> np.ndarray:
         return z / np.sqrt(g)[:, None]
     return rng.multivariate_normal(np.zeros(cov.shape[0]), cov, size=n)
 
+def draw_regime_sequence(rng, n: int, T: int, transition: list, initial_probs: list) -> np.ndarray:
+    """Draw (n, T) array of regime state indices (0=Bull, 1=Normal, 2=Bear)."""
+    states = np.zeros((n, T), dtype=int)
+    trans = np.array(transition)  # (3, 3)
+    # Initial state
+    states[:, 0] = rng.choice(3, size=n, p=initial_probs)
+    for t in range(1, T):
+        for s in range(3):
+            mask = states[:, t-1] == s
+            if mask.any():
+                count = int(mask.sum())
+                states[mask, t] = rng.choice(3, size=count, p=trans[s])
+    return states
+
+
 def scenario_table(scenarios: dict) -> pd.DataFrame:
     rows = []
     for name, p in scenarios.items():
@@ -306,6 +336,12 @@ FED_BRACKETS_SINGLE_2024 = [
 ]
 IRMAA_MAGI_TIERS_MFJ_2024 = [206000, 258000, 322000, 386000, 750000]
 IRMAA_MAGI_TIERS_SINGLE_2024 = [103000, 129000, 161000, 193000, 500000]
+
+# 0% LTCG bracket thresholds (2024) — taxable income up to this amount pays 0% on LTCG
+LTCG_0PCT_THRESHOLD_MFJ_2024 = 94050
+LTCG_0PCT_THRESHOLD_SINGLE_2024 = 47025
+STANDARD_DEDUCTION_MFJ_2024 = 29200
+STANDARD_DEDUCTION_SINGLE_2024 = 14600
 
 
 def bracket_fill_conversion(ordinary_income: np.ndarray, trad_balance: np.ndarray,
@@ -452,6 +488,31 @@ def simulate(cfg: dict, hold: dict) -> dict:
                     float(cfg["corr_eq_infl"]), float(cfg["corr_reit_infl"]), float(cfg["corr_bond_infl"]), float(cfg["corr_alt_infl"]),
                     float(cfg["corr_home_infl"]), float(cfg["corr_home_eq"]))
 
+    # Regime-switching model setup
+    use_regime = str(cfg.get("return_model", "standard")) == "regime"
+    regime_states = None
+    regime_covs = {}
+    regime_means = {}
+    if use_regime:
+        r_params = cfg.get("regime_params", DEFAULT_REGIME_PARAMS)
+        r_trans = cfg.get("regime_transition", DEFAULT_TRANSITION_MATRIX)
+        r_init = cfg.get("regime_initial_probs", DEFAULT_REGIME_INITIAL_PROBS)
+        regime_states = draw_regime_sequence(rng, n, T, r_trans, r_init)
+        # Pre-compute covariance matrices and mean vectors per state
+        for si, sname in enumerate(REGIME_NAMES):
+            sp = r_params.get(sname, DEFAULT_REGIME_PARAMS[sname])
+            regime_covs[si] = build_cov(
+                float(sp["eq_vol"]), float(sp["reit_vol"]), float(sp["bond_vol"]),
+                float(sp["alt_vol"]), infl_vol, home_vol,
+                float(cfg["corr_eq_infl"]), float(cfg["corr_reit_infl"]),
+                float(cfg["corr_bond_infl"]), float(cfg["corr_alt_infl"]),
+                float(cfg["corr_home_infl"]), float(cfg["corr_home_eq"]))
+            regime_means[si] = np.array([
+                float(sp["eq_mu"]), float(sp["reit_mu"]), float(sp["bond_mu"]),
+                float(sp["alt_mu"]), float(sp["cash_mu"])
+            ])
+    regime_track = np.zeros((n, T+1), dtype=int)  # track which regime
+
     # taxes
     eff_capg = min(0.95, max(0.0, float(cfg["fed_capg"]) + float(cfg["state_capg"])))
     eff_div = min(0.95, max(0.0, float(cfg["fed_div"]) + float(cfg["state_capg"])))
@@ -472,7 +533,14 @@ def simulate(cfg: dict, hold: dict) -> dict:
     seq_years = int(cfg["seq_years"])
 
     # spending + GK
+    spend_split_on = bool(cfg.get("spend_split_on", False))
     base_spend_real_input = float(cfg["spend_real"])
+    if spend_split_on:
+        base_essential_real = float(cfg.get("spend_essential_real", 180000.0))
+        base_discretionary_real = float(cfg.get("spend_discretionary_real", 120000.0))
+        base_spend_real_input = base_essential_real + base_discretionary_real
+        essential_real = np.full(n, base_essential_real)
+        discretionary_real = np.full(n, base_discretionary_real)
     spend_real = np.full(n, base_spend_real_input)
 
     total_liquid_start = start_tax + start_ret + (float(cfg["hsa_balance0"]) if bool(cfg["hsa_on"]) else 0.0)
@@ -513,6 +581,22 @@ def simulate(cfg: dict, hold: dict) -> dict:
     # RMD
     rmd_on = bool(cfg["rmd_on"])
     rmd_age = int(cfg["rmd_start_age"])
+
+    # QCD (Qualified Charitable Distributions)
+    qcd_on = bool(cfg.get("qcd_on", False))
+    qcd_annual_real = float(cfg.get("qcd_annual_real", 20000.0))
+    qcd_start_age = int(cfg.get("qcd_start_age", 70))
+    qcd_max_annual = float(cfg.get("qcd_max_annual", 105000.0))
+
+    # Gain harvesting
+    gain_harvest_on = bool(cfg.get("gain_harvest_on", False))
+    gain_harvest_filing = str(cfg.get("gain_harvest_filing", "mfj"))
+    if gain_harvest_filing == "mfj":
+        ltcg_0pct_threshold = LTCG_0PCT_THRESHOLD_MFJ_2024
+        std_deduction = STANDARD_DEDUCTION_MFJ_2024
+    else:
+        ltcg_0pct_threshold = LTCG_0PCT_THRESHOLD_SINGLE_2024
+        std_deduction = STANDARD_DEDUCTION_SINGLE_2024
 
     # fees
     fee_tax = float(cfg["fee_tax"])
@@ -633,6 +717,11 @@ def simulate(cfg: dict, hold: dict) -> dict:
     gross_hsa_wd_track = np.zeros((n, T+1))
     taxes_paid_track = np.zeros((n, T+1))
     conv_gross_track = np.zeros((n, T+1))
+    qcd_track = np.zeros((n, T+1))
+    gain_harvest_track = np.zeros((n, T+1))
+    essential_spend_track = np.zeros((n, T+1))
+    discretionary_spend_track = np.zeros((n, T+1))
+    essential_funded_track = np.zeros((n, T+1))
 
     for t in range(1, T+1):
         age = int(ages[t-1])
@@ -644,18 +733,44 @@ def simulate(cfg: dict, hold: dict) -> dict:
         one_alive = alive1 ^ alive2
         none_alive = ~(alive1 | alive2)
 
-        shocks = draw_shocks(rng, n, cov, str(cfg["dist_type"]), int(cfg["t_df"]))
+        if use_regime and t <= regime_states.shape[1]:
+            # Regime-switching: draw shocks per-state, combine
+            r_eq = np.zeros(n)
+            r_reit = np.zeros(n)
+            r_bond = np.zeros(n)
+            r_alt = np.zeros(n)
+            r_cash = np.zeros(n)
+            infl_shocks = np.zeros(n)
+            home_shocks = np.zeros(n)
+            state_t = regime_states[:, t-1]
+            regime_track[:, t] = state_t
+            for si in range(3):
+                mask = state_t == si
+                cnt = int(mask.sum())
+                if cnt == 0:
+                    continue
+                s_shocks = draw_shocks(rng, cnt, regime_covs[si], str(cfg["dist_type"]), int(cfg["t_df"]))
+                r_eq[mask] = regime_means[si][0] + s_shocks[:, 0]
+                r_reit[mask] = regime_means[si][1] + s_shocks[:, 1]
+                r_bond[mask] = regime_means[si][2] + s_shocks[:, 2]
+                r_alt[mask] = regime_means[si][3] + s_shocks[:, 3]
+                r_cash[mask] = regime_means[si][4] + s_shocks[:, 4]
+                infl_shocks[mask] = s_shocks[:, 5]
+                home_shocks[mask] = s_shocks[:, 6]
+            infl = np.clip(infl_mu + infl_shocks, infl_min, infl_max)
+            home_app = home_mu + home_shocks
+        else:
+            # Standard model
+            shocks = draw_shocks(rng, n, cov, str(cfg["dist_type"]), int(cfg["t_df"]))
+            r_eq = eq_mu + shocks[:, 0]
+            r_reit = reit_mu + shocks[:, 1]
+            r_bond = bond_mu + shocks[:, 2]
+            r_alt = alt_mu + shocks[:, 3]
+            r_cash = cash_mu + shocks[:, 4]
+            infl = np.clip(infl_mu + shocks[:, 5], infl_min, infl_max)
+            home_app = home_mu + shocks[:, 6]
 
-        r_eq = eq_mu + shocks[:, 0]
-        r_reit = reit_mu + shocks[:, 1]
-        r_bond = bond_mu + shocks[:, 2]
-        r_alt = alt_mu + shocks[:, 3]
-        r_cash = cash_mu + shocks[:, 4]
-
-        infl = np.clip(infl_mu + shocks[:, 5], infl_min, infl_max)
         infl_index[:, t] = infl_index[:, t-1] * (1 + infl)
-
-        home_app = home_mu + shocks[:, 6]
 
         if crash_on:
             crash = rng.uniform(size=n) < crash_prob
@@ -741,26 +856,49 @@ def simulate(cfg: dict, hold: dict) -> dict:
         if age >= retire_age and bool(cfg["gk_on"]):
             liquid_prev = taxable[:, t-1] + trad[:, t-1] + roth[:, t-1] + hsa[:, t-1]
             liquid_prev_real = liquid_prev / infl_index[:, t-1]
-            spend_real = gk_update(
-                spend_real,
-                base_spend_real_input,
-                liquid_prev_real,
-                initial_wr,
-                True,
-                float(cfg["gk_upper_pct"]),
-                float(cfg["gk_lower_pct"]),
-                float(cfg["gk_cut"]),
-                float(cfg["gk_raise"]),
-            )
+            if spend_split_on:
+                # GK adjusts total spend, then attribute delta to discretionary only
+                total_before_gk = spend_real.copy()
+                spend_real = gk_update(
+                    spend_real,
+                    base_spend_real_input,
+                    liquid_prev_real,
+                    initial_wr,
+                    True,
+                    float(cfg["gk_upper_pct"]),
+                    float(cfg["gk_lower_pct"]),
+                    float(cfg["gk_cut"]),
+                    float(cfg["gk_raise"]),
+                )
+                delta = spend_real - total_before_gk
+                # Apply delta ONLY to discretionary (essentials never cut)
+                discretionary_real = np.maximum(0.0, discretionary_real + delta)
+                # Re-derive total from components
+                spend_real = essential_real + discretionary_real
+            else:
+                spend_real = gk_update(
+                    spend_real,
+                    base_spend_real_input,
+                    liquid_prev_real,
+                    initial_wr,
+                    True,
+                    float(cfg["gk_upper_pct"]),
+                    float(cfg["gk_lower_pct"]),
+                    float(cfg["gk_cut"]),
+                    float(cfg["gk_raise"]),
+                )
         else:
             spend_real[:] = base_spend_real_input
+            if spend_split_on:
+                essential_real[:] = base_essential_real
+                discretionary_real[:] = base_discretionary_real
 
         spend_eff = spend_real.copy()
         if mort_on:
             spend_eff[one_alive] *= (1 - float(cfg["spend_drop_after_death"]))
             spend_eff[none_alive] = 0.0
 
-        # phase multiplier
+        # phase multiplier — when split on, phases apply only to discretionary
         if age < retire_age:
             phase_mult = 0.0
         else:
@@ -778,8 +916,26 @@ def simulate(cfg: dict, hold: dict) -> dict:
         health_track[:, t] = health_nom
 
         # Baseline vs GK-adjusted core spending (nominal)
-        baseline_core_nom = (base_spend_real_input * phase_mult) * infl_index[:, t-1]
-        adjusted_core_nom = (spend_eff * phase_mult) * infl_index[:, t-1]
+        if spend_split_on and age >= retire_age:
+            # Essentials: no phase multiplier. Discretionary: phase multiplier.
+            mort_factor = np.ones(n)
+            if mort_on:
+                mort_factor[one_alive] = 1 - spend_drop
+                mort_factor[none_alive] = 0.0
+            ess_nom = essential_real * mort_factor * infl_index[:, t-1]
+            disc_nom = discretionary_real * phase_mult * mort_factor * infl_index[:, t-1]
+            adjusted_core_nom = ess_nom + disc_nom
+            baseline_core_nom = (base_spend_real_input * phase_mult) * infl_index[:, t-1]
+            essential_spend_track[:, t] = ess_nom
+            discretionary_spend_track[:, t] = disc_nom
+            # Check if guaranteed income covers essentials (use prev year annuity as proxy)
+            ss_nom_est = ss_real * infl_index[:, t-1]
+            ann_prev_year = annuity_income_track[:, t-1] if t > 1 else np.zeros(n)
+            guaranteed_income = ss_nom_est + ann_prev_year
+            essential_funded_track[:, t] = np.where(guaranteed_income >= ess_nom, 1.0, 0.0)
+        else:
+            baseline_core_nom = (base_spend_real_input * phase_mult) * infl_index[:, t-1]
+            adjusted_core_nom = (spend_eff * phase_mult) * infl_index[:, t-1]
         baseline_core_track[:, t] = baseline_core_nom
         core_spend_track[:, t] = adjusted_core_nom
 
@@ -918,7 +1074,18 @@ def simulate(cfg: dict, hold: dict) -> dict:
             factor = float(RMD_FACTOR.get(age, RMD_FACTOR.get(95, 8.9)))
             gross_rmd = np.minimum(trad_prev, trad_prev / max(1.0, factor))
 
-        net_rmd_cash = gross_rmd * (1 - eff_ord)
+        # QCD: divert part of RMD to charity (no tax, no cash to retiree)
+        qcd_amount = np.zeros(n)
+        if qcd_on and age >= qcd_start_age and rmd_on and age >= rmd_age:
+            qcd_desired = np.minimum(qcd_annual_real * infl_index[:, t-1],
+                                     qcd_max_annual * infl_index[:, t-1])
+            qcd_amount = np.minimum(qcd_desired, gross_rmd)
+            if mort_on:
+                qcd_amount[none_alive] = 0.0
+        qcd_track[:, t] = qcd_amount
+        taxable_rmd = gross_rmd - qcd_amount
+
+        net_rmd_cash = taxable_rmd * (1 - eff_ord)
         used_rmd = np.minimum(net_rmd_cash, need_before)
         need = np.maximum(0.0, need_before - used_rmd)
         excess = np.maximum(0.0, net_rmd_cash - used_rmd)
@@ -926,9 +1093,30 @@ def simulate(cfg: dict, hold: dict) -> dict:
         bas_prev += excess
         trad_prev = np.maximum(0.0, trad_prev - gross_rmd)
 
+        # Gain harvesting: step up basis when in 0% LTCG bracket
+        gain_harvested = np.zeros(n)
+        if gain_harvest_on and age >= retire_age:
+            # Estimate taxable ordinary income
+            ss_for_tax = 0.85 * ss_real * infl_index[:, t-1]
+            div_inc = tax_prev * (float(cfg["div_yield"]) + float(cfg["dist_yield"]))
+            ordinary_income_est = ss_for_tax + taxable_rmd + conv_gross + ann_income_this_year + div_inc
+            # Subtract inflation-adjusted standard deduction
+            std_ded_adj = std_deduction * infl_index[:, t-1]
+            taxable_income_est = np.maximum(0.0, ordinary_income_est - std_ded_adj)
+            # Room in 0% LTCG bracket
+            ltcg_threshold_adj = ltcg_0pct_threshold * infl_index[:, t-1]
+            room = np.maximum(0.0, ltcg_threshold_adj - taxable_income_est)
+            # Harvest: step up basis (no balance change, no cash)
+            unrealized_gain = np.maximum(0.0, tax_prev - bas_prev)
+            gain_harvested = np.minimum(room, unrealized_gain)
+            bas_prev += gain_harvested  # step up basis
+            if mort_on:
+                gain_harvested[none_alive] = 0.0
+        gain_harvest_track[:, t] = gain_harvested
+
         # IRMAA
         if irmaa_on and age >= medicare_age:
-            magi = gross_rmd + conv_gross + ann_income_this_year + tax_prev * (float(cfg["div_yield"]) + float(cfg["dist_yield"]))
+            magi = taxable_rmd + conv_gross + ann_income_this_year + tax_prev * (float(cfg["div_yield"]) + float(cfg["dist_yield"]))
             magi_track[:, t] = magi
             prem = irmaa_monthly_per_person(magi, irmaa_base, irmaa_schedule)
             irmaa_nom = prem * 12.0 * irmaa_people
@@ -1106,7 +1294,14 @@ def simulate(cfg: dict, hold: dict) -> dict:
             "annuity_income": annuity_income_track,
             "annuity_purchase": annuity_purchase_track,
             "conv_gross": conv_gross_track,
-        }
+            "qcd": qcd_track,
+            "gain_harvest": gain_harvest_track,
+            "essential_spend": essential_spend_track,
+            "discretionary_spend": discretionary_spend_track,
+            "essential_funded": essential_funded_track,
+        },
+        "infl_index": infl_index,
+        "regime_states": regime_track,
     }
 
 def summarize_end(paths: np.ndarray) -> dict:
@@ -1434,6 +1629,21 @@ def _run_sensitivity_tests(cfg_run: dict, hold: dict, n_fast: int = 3000) -> pd.
          "Fill to 24%", {"conv_on": True, "conv_type": "bracket_fill", "conv_target_bracket": 0.24,
                           "conv_start": 62, "conv_end": 72, "conv_irmaa_aware": True, "conv_filing_status": "mfj"},
          "No conversions", {"conv_on": False}),
+        ("Discretionary Spending ±$50k",
+         "Discretionary +$50k", {"spend_split_on": True,
+                                  "spend_essential_real": float(cfg_fast.get("spend_essential_real", 180000.0)),
+                                  "spend_discretionary_real": float(cfg_fast.get("spend_discretionary_real", 120000.0)) + 50000.0,
+                                  "spend_real": float(cfg_fast["spend_real"]) + 50000.0},
+         "Discretionary −$50k", {"spend_split_on": True,
+                                  "spend_essential_real": float(cfg_fast.get("spend_essential_real", 180000.0)),
+                                  "spend_discretionary_real": max(10000.0, float(cfg_fast.get("spend_discretionary_real", 120000.0)) - 50000.0),
+                                  "spend_real": max(float(cfg_fast.get("spend_essential_real", 180000.0)) + 10000.0, float(cfg_fast["spend_real"]) - 50000.0)}),
+        ("0% LTCG Gain Harvesting",
+         "Harvest 0% gains", {"gain_harvest_on": True, "gain_harvest_filing": "mfj"},
+         "No harvesting", {"gain_harvest_on": False}),
+        ("$30k QCD",
+         "$30k QCD", {"qcd_on": True, "qcd_annual_real": 30000.0, "qcd_start_age": 70, "rmd_on": True},
+         "No QCD", {"qcd_on": False}),
     ]
 
     rows = []
@@ -1585,6 +1795,9 @@ def init_defaults():
 
     # Spending
     _d("spend_real", 300000.0)
+    _d("spend_split_on", False)
+    _d("spend_essential_real", 180000.0)
+    _d("spend_discretionary_real", 120000.0)
     _d("phase1_end", 70)
     _d("phase2_end", 80)
     _d("phase1_mult", 1.10)
@@ -1615,6 +1828,12 @@ def init_defaults():
     # Return distribution
     _d("dist_type", "t")
     _d("t_df", 7)
+
+    # Regime-switching model
+    _d("return_model", "standard")      # "standard" or "regime"
+    _d("regime_params", dict(DEFAULT_REGIME_PARAMS))
+    _d("regime_transition", [list(row) for row in DEFAULT_TRANSITION_MATRIX])
+    _d("regime_initial_probs", list(DEFAULT_REGIME_INITIAL_PROBS))
 
     # Crash overlay
     _d("crash_on", True)
@@ -1655,6 +1874,16 @@ def init_defaults():
     _d("conv_irmaa_aware", True)
     _d("conv_irmaa_target_tier", 0)
     _d("conv_filing_status", "mfj")
+
+    # Gain harvesting (0% LTCG bracket)
+    _d("gain_harvest_on", False)
+    _d("gain_harvest_filing", "mfj")
+
+    # Qualified Charitable Distributions
+    _d("qcd_on", False)
+    _d("qcd_annual_real", 20000.0)
+    _d("qcd_start_age", 70)
+    _d("qcd_max_annual", 105000.0)
 
     # Glide path (age-based allocation)
     _d("glide_on", False)
@@ -1936,24 +2165,24 @@ def dashboard_page():
     m1, m2, m3, m4 = st.columns(4, border=True)
     with m1:
         st.html(_metric_card_html(
-            "Won't Run Out", f"{pct_success:.0f}%",
-            f"of {int(cfg['n_sims']):,} simulations", sr_color
+            "Success Rate", f"{pct_success:.0f}%",
+            f"of {int(cfg['n_sims']):,} sims have money at {end_age_val}", sr_color
         ))
     with m2:
         ft_str = f"{funded_through}+" if funded_through >= end_age_val else str(funded_through)
         st.html(_metric_card_html(
             "Funded Through Age", ft_str,
-            "p10 liquid > $0", "metric-navy"
+            "in a bad (p10) scenario", "metric-navy"
         ))
     with m3:
         st.html(_metric_card_html(
-            "Median Liquid Assets", f"${sL['p50']/1e6:.1f}M",
-            f"Real: ${sLr['p50']/1e6:.1f}M", "metric-navy"
+            f"Liquid Assets at {end_age_val}", f"${sL['p50']/1e6:.1f}M",
+            f"median nominal · real: ${sLr['p50']/1e6:.1f}M", "metric-navy"
         ))
     with m4:
         st.html(_metric_card_html(
-            "Median Net Worth", f"${sN['p50']/1e6:.1f}M",
-            f"Real: ${sNr['p50']/1e6:.1f}M", "metric-navy"
+            f"Net Worth at {end_age_val}", f"${sN['p50']/1e6:.1f}M",
+            f"median nominal · real: ${sNr['p50']/1e6:.1f}M", "metric-navy"
         ))
 
     st.markdown("")
@@ -2265,12 +2494,31 @@ def plan_setup_page():
     # ================================================================
     elif section == "Spending":
         st.html('<div class="pro-section-title">Annual Core Spending</div>')
-        cfg["spend_real"] = st.number_input(
-            "Annual core living expenses (today's dollars)", value=float(cfg["spend_real"]), step=10000.0, key="ps_spend_real",
-            help="Everyday costs only. Housing, health insurance, and medical are entered separately."
-        )
-        st.info("This covers groceries, dining, utilities, transportation, travel, entertainment, etc. "
-                "Housing, health insurance, and medical costs are tracked separately.")
+        cfg["spend_split_on"] = st.toggle("Split into essential vs. discretionary",
+            value=bool(cfg.get("spend_split_on", False)), key="ps_split_on",
+            help="Separate must-have expenses (food, utilities, insurance) from nice-to-have (travel, dining out). "
+                 "Guardrails only cut discretionary. Phase multipliers apply to discretionary only.")
+        if cfg["spend_split_on"]:
+            sp1, sp2 = st.columns(2, border=True)
+            with sp1:
+                cfg["spend_essential_real"] = st.number_input("Essential spending (today's $)",
+                    value=float(cfg.get("spend_essential_real", 180000.0)), step=5000.0, key="ps_ess_real",
+                    help="Must-have: groceries, utilities, basic transport, insurance premiums, property tax.")
+            with sp2:
+                cfg["spend_discretionary_real"] = st.number_input("Discretionary spending (today's $)",
+                    value=float(cfg.get("spend_discretionary_real", 120000.0)), step=5000.0, key="ps_disc_real",
+                    help="Nice-to-have: travel, dining out, entertainment, gifts, hobbies.")
+            total_split = float(cfg["spend_essential_real"]) + float(cfg["spend_discretionary_real"])
+            cfg["spend_real"] = total_split
+            st.info(f"**Total: ${total_split:,.0f}** · Guardrails only cut discretionary. Phase multipliers apply to discretionary only. "
+                    "Housing, health insurance, and medical costs are tracked separately.")
+        else:
+            cfg["spend_real"] = st.number_input(
+                "Annual core living expenses (today's dollars)", value=float(cfg["spend_real"]), step=10000.0, key="ps_spend_real",
+                help="Everyday costs only. Housing, health insurance, and medical are entered separately."
+            )
+            st.info("This covers groceries, dining, utilities, transportation, travel, entertainment, etc. "
+                    "Housing, health insurance, and medical costs are tracked separately.")
 
         st.html('<div class="pro-section-title">Spending Phases</div>')
         pc1, pc2, pc3 = st.columns(3, border=True)
@@ -2430,6 +2678,39 @@ def plan_setup_page():
         with tl2:
             cfg["roth_frac"] = st.number_input("Roth fraction of retirement", min_value=0.0, max_value=1.0, value=float(cfg["roth_frac"]), step=0.05, format="%.2f", key="ps_roth_frac")
 
+        st.html('<div class="pro-section-title">Gain Harvesting & QCDs</div>')
+        gh1, gh2 = st.columns(2, border=True)
+        with gh1:
+            cfg["gain_harvest_on"] = st.toggle("Harvest gains in 0% LTCG bracket",
+                value=bool(cfg["gain_harvest_on"]), key="ps_gh_on",
+                help="When taxable income is low enough to qualify for the 0% long-term capital gains rate, "
+                     "sell and immediately rebuy assets to step up cost basis — no tax owed.")
+            if cfg["gain_harvest_on"]:
+                cfg["gain_harvest_filing"] = st.selectbox("Filing status for LTCG brackets",
+                    ["mfj", "single"],
+                    index=["mfj", "single"].index(str(cfg["gain_harvest_filing"])),
+                    format_func=lambda x: "Married Filing Jointly" if x == "mfj" else "Single",
+                    key="ps_gh_filing")
+            else:
+                st.caption("Toggle on to automatically harvest capital gains when they fall in the 0% LTCG bracket.")
+        with gh2:
+            cfg["qcd_on"] = st.toggle("Qualified Charitable Distributions (QCDs)",
+                value=bool(cfg["qcd_on"]), key="ps_qcd_on",
+                help="Donate part of your RMD directly to charity. The QCD satisfies your RMD but isn't taxable income, "
+                     "which can lower your MAGI and reduce IRMAA surcharges.")
+            if cfg["qcd_on"]:
+                cfg["qcd_annual_real"] = st.number_input("Annual QCD amount (today's $)",
+                    value=float(cfg["qcd_annual_real"]), step=5000.0, key="ps_qcd_amt",
+                    help="How much to donate via QCD each year. Capped at your RMD and the IRS annual limit.")
+                cfg["qcd_start_age"] = st.number_input("QCD start age",
+                    value=int(cfg["qcd_start_age"]), min_value=70, step=1, key="ps_qcd_age",
+                    help="QCDs are available starting at age 70½.")
+                cfg["qcd_max_annual"] = st.number_input("IRS annual QCD limit",
+                    value=float(cfg["qcd_max_annual"]), step=5000.0, key="ps_qcd_max",
+                    help="Current IRS maximum per person per year.")
+            else:
+                st.caption("Toggle on to model QCDs that reduce taxable RMD income and IRMAA exposure.")
+
         st.html('<div class="pro-section-title">RMDs & Roth Conversions</div>')
         rc1, rc2 = st.columns(2, border=True)
         with rc1:
@@ -2498,36 +2779,100 @@ def plan_setup_page():
     # MARKET
     # ================================================================
     elif section == "Market":
-        st.html('<div class="pro-section-title">Market Scenarios</div>')
-        tbl = scenario_table(DEFAULT_SCENARIOS).copy()
-        for c in ["Eq mean","Eq vol","REIT mean","REIT vol","Bond mean","Bond vol","Alt mean","Alt vol","Cash mean"]:
-            tbl[c] = (tbl[c] * 100).round(2).astype(str) + "%"
-        st.dataframe(tbl, use_container_width=True, hide_index=True)
+        st.html('<div class="pro-section-title">Return Model</div>')
+        cfg["return_model"] = st.selectbox("Return generation model",
+            ["standard", "regime"],
+            index=["standard", "regime"].index(str(cfg.get("return_model", "standard"))),
+            format_func=lambda x: "Standard (t-distribution)" if x == "standard" else "Regime-switching (Markov)",
+            key="ps_return_model",
+            help="Standard: single set of return parameters with optional crash overlay. "
+                 "Regime-switching: returns vary depending on whether we're in a Bull, Normal, or Bear market state.")
 
-        cfg["scenario"] = st.selectbox("Select scenario",
-            list(DEFAULT_SCENARIOS.keys()),
-            index=list(DEFAULT_SCENARIOS.keys()).index(cfg["scenario"]),
-            key="ps_scenario")
+        if cfg["return_model"] == "regime":
+            st.info("When regime-switching is on, the scenario table is ignored. "
+                    "Returns are drawn from state-specific distributions with Markov transitions between Bull, Normal, and Bear markets.")
+            r_params = cfg.get("regime_params", dict(DEFAULT_REGIME_PARAMS))
+            r_trans = cfg.get("regime_transition", [list(row) for row in DEFAULT_TRANSITION_MATRIX])
+            r_init = cfg.get("regime_initial_probs", list(DEFAULT_REGIME_INITIAL_PROBS))
 
-        if not cfg.get("manual_override", False):
-            cfg["override_params"] = dict(DEFAULT_SCENARIOS[cfg["scenario"]])
+            st.html('<div class="pro-section-title">State Parameters</div>')
+            for si, sname in enumerate(REGIME_NAMES):
+                sp = r_params.get(sname, DEFAULT_REGIME_PARAMS[sname])
+                with st.expander(f"**{sname}** state", expanded=(si == 1)):
+                    rc1, rc2 = st.columns(2)
+                    with rc1:
+                        sp["eq_mu"] = st.number_input(f"Stocks: return", value=float(sp["eq_mu"]), step=0.01, format="%.3f", key=f"ps_reg_{sname}_eq_mu")
+                        sp["eq_vol"] = st.number_input(f"Stocks: volatility", value=float(sp["eq_vol"]), step=0.01, format="%.3f", key=f"ps_reg_{sname}_eq_vol")
+                        sp["reit_mu"] = st.number_input(f"REITs: return", value=float(sp["reit_mu"]), step=0.01, format="%.3f", key=f"ps_reg_{sname}_reit_mu")
+                        sp["reit_vol"] = st.number_input(f"REITs: volatility", value=float(sp["reit_vol"]), step=0.01, format="%.3f", key=f"ps_reg_{sname}_reit_vol")
+                        sp["cash_mu"] = st.number_input(f"Cash: return", value=float(sp["cash_mu"]), step=0.005, format="%.3f", key=f"ps_reg_{sname}_cash_mu")
+                    with rc2:
+                        sp["bond_mu"] = st.number_input(f"Bonds: return", value=float(sp["bond_mu"]), step=0.005, format="%.3f", key=f"ps_reg_{sname}_bond_mu")
+                        sp["bond_vol"] = st.number_input(f"Bonds: volatility", value=float(sp["bond_vol"]), step=0.005, format="%.3f", key=f"ps_reg_{sname}_bond_vol")
+                        sp["alt_mu"] = st.number_input(f"Alts: return", value=float(sp["alt_mu"]), step=0.01, format="%.3f", key=f"ps_reg_{sname}_alt_mu")
+                        sp["alt_vol"] = st.number_input(f"Alts: volatility", value=float(sp["alt_vol"]), step=0.01, format="%.3f", key=f"ps_reg_{sname}_alt_vol")
+                    r_params[sname] = sp
+            cfg["regime_params"] = r_params
 
-        cfg["manual_override"] = st.toggle("Override with custom returns", value=bool(cfg["manual_override"]), key="ps_manual_override")
-        if cfg["manual_override"]:
-            p = cfg["override_params"]
-            mc1, mc2 = st.columns(2, border=True)
-            with mc1:
-                p["eq_mu"] = st.number_input("Stocks: return", value=float(p["eq_mu"]), step=0.005, format="%.4f", key="ps_eq_mu")
-                p["eq_vol"] = st.number_input("Stocks: volatility", value=float(p["eq_vol"]), step=0.01, format="%.4f", key="ps_eq_vol")
-                p["reit_mu"] = st.number_input("REITs: return", value=float(p["reit_mu"]), step=0.005, format="%.4f", key="ps_reit_mu")
-                p["reit_vol"] = st.number_input("REITs: volatility", value=float(p["reit_vol"]), step=0.01, format="%.4f", key="ps_reit_vol")
-                p["cash_mu"] = st.number_input("Cash: return", value=float(p["cash_mu"]), step=0.0025, format="%.4f", key="ps_cash_mu")
-            with mc2:
-                p["bond_mu"] = st.number_input("Bonds: return", value=float(p["bond_mu"]), step=0.0025, format="%.4f", key="ps_bond_mu")
-                p["bond_vol"] = st.number_input("Bonds: volatility", value=float(p["bond_vol"]), step=0.005, format="%.4f", key="ps_bond_vol")
-                p["alt_mu"] = st.number_input("Alternatives: return", value=float(p["alt_mu"]), step=0.005, format="%.4f", key="ps_alt_mu")
-                p["alt_vol"] = st.number_input("Alternatives: volatility", value=float(p["alt_vol"]), step=0.01, format="%.4f", key="ps_alt_vol")
-            cfg["override_params"] = p
+            st.html('<div class="pro-section-title">Transition Probabilities</div>')
+            st.caption("Probability of moving from one state to another each year. Each row must sum to 1.")
+            for si, sname in enumerate(REGIME_NAMES):
+                tc1, tc2, tc3 = st.columns(3)
+                with tc1:
+                    r_trans[si][0] = st.number_input(f"{sname} → Bull", value=float(r_trans[si][0]), min_value=0.0, max_value=1.0, step=0.05, format="%.2f", key=f"ps_trans_{si}_0")
+                with tc2:
+                    r_trans[si][1] = st.number_input(f"{sname} → Normal", value=float(r_trans[si][1]), min_value=0.0, max_value=1.0, step=0.05, format="%.2f", key=f"ps_trans_{si}_1")
+                with tc3:
+                    r_trans[si][2] = st.number_input(f"{sname} → Bear", value=float(r_trans[si][2]), min_value=0.0, max_value=1.0, step=0.05, format="%.2f", key=f"ps_trans_{si}_2")
+                row_sum = sum(r_trans[si])
+                if abs(row_sum - 1.0) > 0.01:
+                    st.warning(f"Row '{sname}' sums to {row_sum:.2f} — should be 1.00")
+            cfg["regime_transition"] = r_trans
+
+            st.html('<div class="pro-section-title">Initial State Probabilities</div>')
+            ip1, ip2, ip3 = st.columns(3)
+            with ip1:
+                r_init[0] = st.number_input("Bull", value=float(r_init[0]), min_value=0.0, max_value=1.0, step=0.05, format="%.2f", key="ps_init_0")
+            with ip2:
+                r_init[1] = st.number_input("Normal", value=float(r_init[1]), min_value=0.0, max_value=1.0, step=0.05, format="%.2f", key="ps_init_1")
+            with ip3:
+                r_init[2] = st.number_input("Bear", value=float(r_init[2]), min_value=0.0, max_value=1.0, step=0.05, format="%.2f", key="ps_init_2")
+            init_sum = sum(r_init)
+            if abs(init_sum - 1.0) > 0.01:
+                st.warning(f"Initial probabilities sum to {init_sum:.2f} — should be 1.00")
+            cfg["regime_initial_probs"] = r_init
+
+        else:
+            st.html('<div class="pro-section-title">Market Scenarios</div>')
+            tbl = scenario_table(DEFAULT_SCENARIOS).copy()
+            for c in ["Eq mean","Eq vol","REIT mean","REIT vol","Bond mean","Bond vol","Alt mean","Alt vol","Cash mean"]:
+                tbl[c] = (tbl[c] * 100).round(2).astype(str) + "%"
+            st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+            cfg["scenario"] = st.selectbox("Select scenario",
+                list(DEFAULT_SCENARIOS.keys()),
+                index=list(DEFAULT_SCENARIOS.keys()).index(cfg["scenario"]),
+                key="ps_scenario")
+
+            if not cfg.get("manual_override", False):
+                cfg["override_params"] = dict(DEFAULT_SCENARIOS[cfg["scenario"]])
+
+            cfg["manual_override"] = st.toggle("Override with custom returns", value=bool(cfg["manual_override"]), key="ps_manual_override")
+            if cfg["manual_override"]:
+                p = cfg["override_params"]
+                mc1, mc2 = st.columns(2, border=True)
+                with mc1:
+                    p["eq_mu"] = st.number_input("Stocks: return", value=float(p["eq_mu"]), step=0.005, format="%.4f", key="ps_eq_mu")
+                    p["eq_vol"] = st.number_input("Stocks: volatility", value=float(p["eq_vol"]), step=0.01, format="%.4f", key="ps_eq_vol")
+                    p["reit_mu"] = st.number_input("REITs: return", value=float(p["reit_mu"]), step=0.005, format="%.4f", key="ps_reit_mu")
+                    p["reit_vol"] = st.number_input("REITs: volatility", value=float(p["reit_vol"]), step=0.01, format="%.4f", key="ps_reit_vol")
+                    p["cash_mu"] = st.number_input("Cash: return", value=float(p["cash_mu"]), step=0.0025, format="%.4f", key="ps_cash_mu")
+                with mc2:
+                    p["bond_mu"] = st.number_input("Bonds: return", value=float(p["bond_mu"]), step=0.0025, format="%.4f", key="ps_bond_mu")
+                    p["bond_vol"] = st.number_input("Bonds: volatility", value=float(p["bond_vol"]), step=0.005, format="%.4f", key="ps_bond_vol")
+                    p["alt_mu"] = st.number_input("Alternatives: return", value=float(p["alt_mu"]), step=0.005, format="%.4f", key="ps_alt_mu")
+                    p["alt_vol"] = st.number_input("Alternatives: volatility", value=float(p["alt_vol"]), step=0.01, format="%.4f", key="ps_alt_vol")
+                cfg["override_params"] = p
 
         st.html('<div class="pro-section-title">Inflation</div>')
         inf1, inf2 = st.columns(2, border=True)
@@ -2696,7 +3041,7 @@ def deep_dive_page():
 
     analysis = st.segmented_control(
         "Analysis",
-        ["Cashflows", "Sensitivity", "IRMAA", "Legacy", "Annuity", "Roth Strategy", "Reallocation"],
+        ["Cashflows", "Sensitivity", "IRMAA", "Legacy", "Annuity", "Roth Strategy", "Tax Brackets", "Regimes", "Reallocation"],
         default="Cashflows", key="dd_analysis"
     )
 
@@ -2727,6 +3072,8 @@ def deep_dive_page():
                 "Home Equity": float(np.percentile(home_eq[:, idx], 50)),
                 "Core Spending (planned)": float(np.percentile(de["baseline_core"][:, idx], 50)),
                 "Core Spending (guardrails)": float(np.percentile(de["core_adjusted"][:, idx], 50)),
+                "Essential Spending": float(np.percentile(de["essential_spend"][:, idx], 50)),
+                "Discretionary Spending": float(np.percentile(de["discretionary_spend"][:, idx], 50)),
                 "Home Costs": float(np.percentile(de["home_cost"][:, idx], 50)),
                 "Mortgage": float(np.percentile(de["mort_pay"][:, idx], 50)),
                 "Rent": float(np.percentile(de["rent"][:, idx], 50)),
@@ -2743,6 +3090,8 @@ def deep_dive_page():
                 "Trad IRA WD": float(np.percentile(de["gross_trad_wd"][:, idx], 50)),
                 "Roth WD": float(np.percentile(de["gross_roth_wd"][:, idx], 50)),
                 "Taxes": float(np.percentile(de["taxes_paid"][:, idx], 50)),
+                "QCD": float(np.percentile(de["qcd"][:, idx], 50)),
+                "Gain Harvest": float(np.percentile(de["gain_harvest"][:, idx], 50)),
                 "HSA Balance": float(np.percentile(hsa_bal[:, idx], 50)),
             })
 
@@ -2959,6 +3308,149 @@ def deep_dive_page():
                 st.altair_chart(conv_chart, use_container_width=True)
             else:
                 st.info("No conversions occurred in the simulation.")
+
+    # ================================================================
+    # TAX BRACKETS
+    # ================================================================
+    elif analysis == "Tax Brackets":
+        st.html('<div class="pro-section-title">Tax Bracket Projection</div>')
+        st.caption("Estimated income sources, deductions, and marginal bracket by age. Median values across simulations.")
+
+        de = out["decomp"]
+        infl_idx = out.get("infl_index", None)
+        if infl_idx is None:
+            st.info("Run the simulation again to see tax bracket projections.")
+        else:
+            retire_age = int(cfg_run["retire_age"])
+            filing = str(cfg_run.get("conv_filing_status", cfg_run.get("gain_harvest_filing", "mfj")))
+            if filing == "mfj":
+                brackets = FED_BRACKETS_MFJ_2024
+                std_ded_base = STANDARD_DEDUCTION_MFJ_2024
+            else:
+                brackets = FED_BRACKETS_SINGLE_2024
+                std_ded_base = STANDARD_DEDUCTION_SINGLE_2024
+
+            tb_rows = []
+            for idx, age in enumerate(ages):
+                if age < retire_age:
+                    continue
+                med_infl = float(np.median(infl_idx[:, idx]))
+                ss_inc = float(np.percentile(de["ss_inflow"][:, idx], 50))
+                # Approximate taxable SS as 85%
+                ss_taxable = 0.85 * ss_inc
+                rmd_inc = float(np.percentile(de["gross_trad_wd"][:, idx], 50))  # approx
+                conv_inc = float(np.percentile(de["conv_gross"][:, idx], 50))
+                ann_inc = float(np.percentile(de["annuity_income"][:, idx], 50))
+                qcd_inc = float(np.percentile(de["qcd"][:, idx], 50))
+
+                total_ordinary = ss_taxable + rmd_inc + conv_inc + ann_inc - qcd_inc
+                std_ded_adj = std_ded_base * med_infl
+                taxable_income = max(0.0, total_ordinary - std_ded_adj)
+
+                # Find marginal bracket
+                marginal_rate = 0.10
+                for i in range(len(brackets) - 1, -1, -1):
+                    thresh, rate = brackets[i]
+                    if taxable_income >= thresh * med_infl:
+                        marginal_rate = rate
+                        break
+
+                # Effective rate estimate
+                tax_est = 0.0
+                for i in range(len(brackets)):
+                    thresh, rate = brackets[i]
+                    adj_thresh = thresh * med_infl
+                    if i + 1 < len(brackets):
+                        next_thresh = brackets[i + 1][0] * med_infl
+                    else:
+                        next_thresh = 1e12
+                    if taxable_income > adj_thresh:
+                        bracket_income = min(taxable_income, next_thresh) - adj_thresh
+                        tax_est += bracket_income * rate
+                eff_rate = tax_est / max(1.0, taxable_income)
+
+                tb_rows.append({
+                    "Age": int(age),
+                    "SS (taxable)": ss_taxable,
+                    "RMD/Trad WD": rmd_inc,
+                    "Conversions": conv_inc,
+                    "Annuity": ann_inc,
+                    "QCD": qcd_inc,
+                    "Total Ordinary": total_ordinary,
+                    "Std Deduction": std_ded_adj,
+                    "Taxable Income": taxable_income,
+                    "Marginal Bracket": f"{marginal_rate:.0%}",
+                    "Est. Effective Rate": f"{eff_rate:.1%}",
+                })
+
+            if tb_rows:
+                tb_df = pd.DataFrame(tb_rows)
+                # Format dollar columns
+                dollar_cols = ["SS (taxable)", "RMD/Trad WD", "Conversions", "Annuity", "QCD",
+                               "Total Ordinary", "Std Deduction", "Taxable Income"]
+                for c in dollar_cols:
+                    tb_df[c] = tb_df[c].apply(fmt_dollars)
+                st.dataframe(tb_df, use_container_width=True, hide_index=True, height=500)
+            else:
+                st.info("No retirement-age data to display.")
+
+    # ================================================================
+    # REGIMES
+    # ================================================================
+    elif analysis == "Regimes":
+        # Check the SIMULATION config (cfg_run), not live config, to see what model was actually used
+        _rmodel_run = str(cfg_run.get("return_model", "standard"))
+        _rmodel_live = str(cfg.get("return_model", "standard"))
+        if _rmodel_run != "regime":
+            if _rmodel_live == "regime":
+                st.warning("You've enabled regime-switching, but the current results were simulated with the standard model. "
+                           "Go to the Dashboard and re-run the simulation to see regime analysis.")
+            else:
+                st.info("Regime-switching is off. Enable it in Assumptions > Market, then re-run the simulation to see regime analysis.")
+        else:
+            st.html('<div class="pro-section-title">Regime Analysis</div>')
+            st.caption("Distribution of market regimes across simulations by age.")
+            r_states = out.get("regime_states", None)
+            # Verify actual regime diversity (not all zeros from a standard run)
+            has_diversity = r_states is not None and r_states.shape[1] > 1 and int(r_states[:, 1:].max()) > 0
+            if has_diversity:
+                # Average time in each state
+                total_steps = r_states[:, 1:].size  # exclude t=0
+                bull_pct = float((r_states[:, 1:] == 0).sum()) / total_steps * 100
+                normal_pct = float((r_states[:, 1:] == 1).sum()) / total_steps * 100
+                bear_pct = float((r_states[:, 1:] == 2).sum()) / total_steps * 100
+                rm1, rm2, rm3 = st.columns(3, border=True)
+                with rm1:
+                    st.html(_metric_card_html("Bull", f"{bull_pct:.1f}%", "avg time in state", "metric-green"))
+                with rm2:
+                    st.html(_metric_card_html("Normal", f"{normal_pct:.1f}%", "avg time in state", "metric-navy"))
+                with rm3:
+                    st.html(_metric_card_html("Bear", f"{bear_pct:.1f}%", "avg time in state", "metric-coral"))
+
+                # Stacked area chart: regime distribution by age
+                reg_rows = []
+                for idx in range(1, len(ages)):
+                    col = r_states[:, idx]
+                    n_total = len(col)
+                    for si, sname in enumerate(REGIME_NAMES):
+                        reg_rows.append({
+                            "Age": int(ages[idx]),
+                            "Regime": sname,
+                            "Fraction": float((col == si).sum()) / n_total,
+                        })
+                reg_df = pd.DataFrame(reg_rows)
+                regime_chart = alt.Chart(reg_df).mark_area().encode(
+                    x=alt.X("Age:Q", title="Age"),
+                    y=alt.Y("Fraction:Q", title="Fraction of Simulations", stack="normalize"),
+                    color=alt.Color("Regime:N",
+                        scale=alt.Scale(domain=["Bull", "Normal", "Bear"],
+                                        range=["#00897B", "#1B2A4A", "#E53935"]),
+                        legend=alt.Legend(orient="bottom", title=None)),
+                    tooltip=["Age:Q", "Regime:N", alt.Tooltip("Fraction:Q", format=".1%")],
+                ).properties(height=350, title="Regime Distribution by Age")
+                st.altair_chart(regime_chart, use_container_width=True)
+            else:
+                st.info("No regime data available. Run a simulation with regime-switching enabled.")
 
     # ================================================================
     # REALLOCATION
