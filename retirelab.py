@@ -1,5 +1,11 @@
-# retirement_mc_pro.py
-# Professional Retirement Planning Dashboard
+"""
+RetireLab — Monte Carlo Retirement Planning Simulator
+Author: Scott Wallsten
+Disclaimer: This tool is for educational and informational purposes only.
+It does not constitute financial, tax, or investment advice. Consult a
+qualified financial advisor before making retirement planning decisions.
+"""
+
 # Built with Streamlit 1.50+ (st.navigation, st.segmented_control, st.dialog)
 
 # ============================================================
@@ -16,7 +22,7 @@ import streamlit as st
 import altair as alt
 
 st.set_page_config(
-    page_title="Retirement Planner Pro",
+    page_title="RetireLab",
     page_icon=":material/account_balance:",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -257,6 +263,73 @@ def combined_weights(parts: List[Tuple[float, Dict[str, float]]]) -> Dict[str, f
         out[k] = sum(v * float(w.get(k, 0.0)) for v, w in parts) / total
     return out
 
+def glide_equity_frac(age: int, eq_start: float, eq_end: float,
+                      age_start: int, age_end: int) -> float:
+    """Return target equity fraction at a given age via linear interpolation."""
+    if age <= age_start:
+        return eq_start
+    if age >= age_end:
+        return eq_end
+    return eq_start + (eq_end - eq_start) * (age - age_start) / max(1, age_end - age_start)
+
+
+def _build_glide_weights(eq_frac: float, base_weights: np.ndarray) -> np.ndarray:
+    """Build a 5-element weight array for a target equity fraction,
+    preserving the sub-asset ratios from the original base_weights.
+    Indices: 0=Equities, 1=REIT, 2=Bonds, 3=Alternatives, 4=Cash."""
+    eq_orig = base_weights[0] + base_weights[1]
+    noneq_orig = base_weights[2] + base_weights[3] + base_weights[4]
+    # Equity sub-split
+    eq_ratio = base_weights[0] / eq_orig if eq_orig > 0 else 0.9
+    # Non-equity sub-split
+    if noneq_orig > 0:
+        ne_ratios = base_weights[2:5] / noneq_orig
+    else:
+        ne_ratios = np.array([0.9, 0.0, 0.1])
+    return np.array([
+        eq_frac * eq_ratio,
+        eq_frac * (1 - eq_ratio),
+        (1 - eq_frac) * ne_ratios[0],
+        (1 - eq_frac) * ne_ratios[1],
+        (1 - eq_frac) * ne_ratios[2],
+    ])
+
+
+# 2024 Federal tax brackets (used for dynamic Roth conversions)
+FED_BRACKETS_MFJ_2024 = [
+    (0, 0.10), (23200, 0.12), (94300, 0.22), (201050, 0.24),
+    (383900, 0.32), (487450, 0.35), (731200, 0.37),
+]
+FED_BRACKETS_SINGLE_2024 = [
+    (0, 0.10), (11600, 0.12), (47150, 0.22), (100525, 0.24),
+    (191950, 0.32), (243725, 0.35), (609350, 0.37),
+]
+IRMAA_MAGI_TIERS_MFJ_2024 = [206000, 258000, 322000, 386000, 750000]
+IRMAA_MAGI_TIERS_SINGLE_2024 = [103000, 129000, 161000, 193000, 500000]
+
+
+def bracket_fill_conversion(ordinary_income: np.ndarray, trad_balance: np.ndarray,
+                            target_bracket: float, brackets: list,
+                            infl_factor: np.ndarray,
+                            irmaa_aware: bool, irmaa_limit: float) -> np.ndarray:
+    """Compute how much to convert from trad→Roth to fill up to target_bracket.
+    All inputs are (n,) arrays except scalars. Returns (n,) conversion amount."""
+    n = len(ordinary_income)
+    # Find the top of the target bracket (inflation-adjusted)
+    bracket_top = np.full(n, 1e12)
+    for i in range(len(brackets) - 1):
+        _, rate = brackets[i]
+        next_thresh, next_rate = brackets[i + 1]
+        if next_rate > target_bracket:
+            bracket_top = next_thresh * infl_factor
+            break
+    room = np.maximum(0.0, bracket_top - ordinary_income)
+    if irmaa_aware:
+        irmaa_nom = irmaa_limit * infl_factor
+        room = np.minimum(room, np.maximum(0.0, irmaa_nom - ordinary_income))
+    return np.maximum(0.0, np.minimum(room, trad_balance))
+
+
 @st.cache_data(show_spinner=False)
 def simulate(cfg: dict, hold: dict) -> dict:
     rng = np.random.default_rng(int(cfg["seed"]))
@@ -424,6 +497,18 @@ def simulate(cfg: dict, hold: dict) -> dict:
     conv_start = int(cfg["conv_start"])
     conv_end = int(cfg["conv_end"])
     conv_real = float(cfg["conv_real"])
+    conv_type = str(cfg.get("conv_type", "fixed"))
+    conv_target_bracket = float(cfg.get("conv_target_bracket", 0.24))
+    conv_irmaa_aware = bool(cfg.get("conv_irmaa_aware", True))
+    conv_irmaa_target_tier = int(cfg.get("conv_irmaa_target_tier", 0))
+    conv_filing_status = str(cfg.get("conv_filing_status", "mfj"))
+    if conv_filing_status == "mfj":
+        conv_brackets = FED_BRACKETS_MFJ_2024
+        conv_irmaa_tiers = IRMAA_MAGI_TIERS_MFJ_2024
+    else:
+        conv_brackets = FED_BRACKETS_SINGLE_2024
+        conv_irmaa_tiers = IRMAA_MAGI_TIERS_SINGLE_2024
+    conv_irmaa_limit = float(conv_irmaa_tiers[conv_irmaa_target_tier]) if conv_irmaa_aware and conv_irmaa_target_tier < len(conv_irmaa_tiers) else 1e12
 
     # RMD
     rmd_on = bool(cfg["rmd_on"])
@@ -432,6 +517,46 @@ def simulate(cfg: dict, hold: dict) -> dict:
     # fees
     fee_tax = float(cfg["fee_tax"])
     fee_ret = float(cfg["fee_ret"])
+
+    # Annuities
+    ann_configs = []
+    for prefix in ("ann1", "ann2"):
+        if bool(cfg[f"{prefix}_on"]):
+            ann_configs.append({
+                "purchase_age": int(cfg[f"{prefix}_purchase_age"]),
+                "income_start_age": int(cfg[f"{prefix}_income_start_age"]),
+                "purchase_amount": float(cfg[f"{prefix}_purchase_amount"]),
+                "payout_rate": float(cfg[f"{prefix}_payout_rate"]),
+                "cola_on": bool(cfg[f"{prefix}_cola_on"]),
+                "cola_rate": float(cfg[f"{prefix}_cola_rate"]),
+                "cola_match_inflation": bool(cfg[f"{prefix}_cola_match_inflation"]),
+                "purchased": np.zeros(n, dtype=bool),
+                "base_payment": np.zeros(n),  # annual payout at purchase (real)
+            })
+    annuity_income_track = np.zeros((n, T + 1))
+    annuity_purchase_track = np.zeros((n, T + 1))
+
+    # Glide path
+    glide_on = bool(cfg["glide_on"])
+    if glide_on:
+        glide_tax_eq_start = float(cfg["glide_tax_eq_start"])
+        glide_tax_eq_end = float(cfg["glide_tax_eq_end"])
+        glide_tax_start_age = int(cfg["glide_tax_start_age"])
+        glide_tax_end_age = int(cfg["glide_tax_end_age"])
+        glide_ret_same = bool(cfg["glide_ret_same"])
+        if glide_ret_same:
+            glide_ret_eq_start = glide_tax_eq_start
+            glide_ret_eq_end = glide_tax_eq_end
+            glide_ret_start_age = glide_tax_start_age
+            glide_ret_end_age = glide_tax_end_age
+        else:
+            glide_ret_eq_start = float(cfg["glide_ret_eq_start"])
+            glide_ret_eq_end = float(cfg["glide_ret_eq_end"])
+            glide_ret_start_age = int(cfg["glide_ret_start_age"])
+            glide_ret_end_age = int(cfg["glide_ret_end_age"])
+        # Store original weights as basis for sub-asset ratio preservation
+        base_w_tax = w_tax.copy()
+        base_w_ret = w_ret.copy()
 
     # IRMAA
     irmaa_on = bool(cfg["irmaa_on"])
@@ -507,6 +632,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
     gross_roth_wd_track = np.zeros((n, T+1))
     gross_hsa_wd_track = np.zeros((n, T+1))
     taxes_paid_track = np.zeros((n, T+1))
+    conv_gross_track = np.zeros((n, T+1))
 
     for t in range(1, T+1):
         age = int(ages[t-1])
@@ -699,10 +825,71 @@ def simulate(cfg: dict, hold: dict) -> dict:
         trad_prev = trad[:, t-1]
         roth_prev = roth[:, t-1]
 
+        # Annuity purchase and income
+        ann_income_this_year = np.zeros(n)
+        for ac in ann_configs:
+            # Purchase: deduct lump sum from portfolio at purchase age
+            if age == ac["purchase_age"] and not ac["purchased"].any():
+                purchase_nom = ac["purchase_amount"] * infl_index[:, t-1]
+                # Deduct from taxable first
+                from_tax = np.minimum(tax_prev, purchase_nom)
+                tax_prev -= from_tax
+                bas_prev = np.where(tax_prev + from_tax > 0,
+                                    bas_prev * (tax_prev / (tax_prev + from_tax)),
+                                    0.0)
+                remaining_purchase = purchase_nom - from_tax
+                # Then from trad (with tax hit accounted for in spending)
+                from_trad = np.minimum(trad_prev, remaining_purchase)
+                trad_prev -= from_trad
+                ac["purchased"][:] = True
+                ac["base_payment"][:] = ac["purchase_amount"] * ac["payout_rate"]
+                annuity_purchase_track[:, t] = annuity_purchase_track[:, t] + purchase_nom
+
+            # Income: add guaranteed payments after income start age
+            if ac["purchased"].any() and age >= ac["income_start_age"]:
+                years_paying = age - ac["income_start_age"]
+                if ac["cola_on"]:
+                    if ac["cola_match_inflation"]:
+                        # COLA matches simulated inflation
+                        ann_pay = ac["base_payment"] * infl_index[:, t-1]
+                    else:
+                        # Fixed COLA rate
+                        ann_pay = ac["base_payment"] * ((1 + ac["cola_rate"]) ** years_paying)
+                        ann_pay = ann_pay * infl_index[:, 0]  # convert to nominal from real base
+                else:
+                    # No COLA — fixed nominal payment (value erodes with inflation)
+                    ann_pay = ac["base_payment"] * infl_index[:, 0]  # nominal from year-0 dollars
+                # Annuity stops at death
+                if mort_on:
+                    ann_pay[none_alive] = 0.0
+                    ann_pay[one_alive] *= 0.60  # joint-and-survivor reduction
+                ann_income_this_year += ann_pay
+        annuity_income_track[:, t] = ann_income_this_year
+
+        # RMD preview (needed by bracket-fill conversions before actual RMD)
+        rmd_preview = np.zeros(n)
+        if rmd_on and age >= rmd_age:
+            factor = float(RMD_FACTOR.get(age, RMD_FACTOR.get(95, 8.9)))
+            rmd_preview = np.minimum(trad_prev, trad_prev / max(1.0, factor))
+
         # conversions
         conv_gross = np.zeros(n)
-        if conv_on and (int(cfg["conv_start"]) <= age <= int(cfg["conv_end"])):
-            conv_gross[:] = float(cfg["conv_real"]) * infl_index[:, t-1]
+        if conv_on and (conv_start <= age <= conv_end):
+            if conv_type == "bracket_fill":
+                # Estimate ordinary income for bracket calculation
+                ss_est = ss_real * infl_index[:, t-1]
+                div_est = tax_prev * (float(cfg["div_yield"]) + float(cfg["dist_yield"]))
+                ordinary_est = ss_est + rmd_preview + div_est + ann_income_this_year
+                infl_factor_t = infl_index[:, t-1]
+                # Use median inflation factor for bracket inflation
+                median_infl = float(np.median(infl_factor_t))
+                conv_gross = bracket_fill_conversion(
+                    ordinary_est, trad_prev, conv_target_bracket,
+                    conv_brackets, median_infl, conv_irmaa_aware, conv_irmaa_limit
+                )
+            else:
+                # Fixed real amount (original behavior)
+                conv_gross[:] = conv_real * infl_index[:, t-1]
             if mort_on:
                 conv_gross[one_alive] *= 0.60
                 conv_gross[none_alive] = 0.0
@@ -714,15 +901,18 @@ def simulate(cfg: dict, hold: dict) -> dict:
             trad_prev = np.maximum(0.0, trad_prev - remaining)
             trad_prev = np.maximum(0.0, trad_prev - conv_gross)
             roth_prev = roth_prev + conv_gross
+        conv_gross_track[:, t] = conv_gross
 
         inflows_nom = ss_real * infl_index[:, t-1]
         ss_nom_track[:, t] = inflows_nom
+        # Add annuity income to inflows
+        inflows_nom = inflows_nom + ann_income_this_year
 
         need_before = np.maximum(0.0, outflow_nom - inflows_nom)
         if mort_on:
             need_before[none_alive] = 0.0
 
-        # RMD
+        # RMD (re-compute on post-conversion trad balance)
         gross_rmd = np.zeros(n)
         if rmd_on and age >= rmd_age:
             factor = float(RMD_FACTOR.get(age, RMD_FACTOR.get(95, 8.9)))
@@ -738,7 +928,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
 
         # IRMAA
         if irmaa_on and age >= medicare_age:
-            magi = gross_rmd + conv_gross + tax_prev * (float(cfg["div_yield"]) + float(cfg["dist_yield"]))
+            magi = gross_rmd + conv_gross + ann_income_this_year + tax_prev * (float(cfg["div_yield"]) + float(cfg["dist_yield"]))
             magi_track[:, t] = magi
             prem = irmaa_monthly_per_person(magi, irmaa_base, irmaa_schedule)
             irmaa_nom = prem * 12.0 * irmaa_people
@@ -807,9 +997,19 @@ def simulate(cfg: dict, hold: dict) -> dict:
         bas_after = bas_prev * (1 - frac_withdraw)
         bas_after = np.minimum(bas_after, tax_before)
 
-        # returns
-        rt = (1+r_eq)*w_tax[0] + (1+r_reit)*w_tax[1] + (1+r_bond)*w_tax[2] + (1+r_alt)*w_tax[3] + (1+r_cash)*w_tax[4] - 1
-        rr = (1+r_eq)*w_ret[0] + (1+r_reit)*w_ret[1] + (1+r_bond)*w_ret[2] + (1+r_alt)*w_ret[3] + (1+r_cash)*w_ret[4] - 1
+        # returns (with optional glide path)
+        if glide_on:
+            eq_t = glide_equity_frac(age, glide_tax_eq_start, glide_tax_eq_end,
+                                     glide_tax_start_age, glide_tax_end_age)
+            wt = _build_glide_weights(eq_t, base_w_tax)
+            eq_r = glide_equity_frac(age, glide_ret_eq_start, glide_ret_eq_end,
+                                     glide_ret_start_age, glide_ret_end_age)
+            wr = _build_glide_weights(eq_r, base_w_ret)
+        else:
+            wt = w_tax
+            wr = w_ret
+        rt = (1+r_eq)*wt[0] + (1+r_reit)*wt[1] + (1+r_bond)*wt[2] + (1+r_alt)*wt[3] + (1+r_cash)*wt[4] - 1
+        rr = (1+r_eq)*wr[0] + (1+r_reit)*wr[1] + (1+r_bond)*wr[2] + (1+r_alt)*wr[3] + (1+r_cash)*wr[4] - 1
         rt = np.clip(rt - taxable_tax_drag - fee_tax, -0.95, 2.0)
         rr = np.clip(rr - fee_ret, -0.95, 2.0)
 
@@ -903,6 +1103,9 @@ def simulate(cfg: dict, hold: dict) -> dict:
             "gross_roth_wd": gross_roth_wd_track,
             "taxes_paid": taxes_paid_track,
             "hsa_end": hsa_end_track,
+            "annuity_income": annuity_income_track,
+            "annuity_purchase": annuity_purchase_track,
+            "conv_gross": conv_gross_track,
         }
     }
 
@@ -1218,6 +1421,19 @@ def _run_sensitivity_tests(cfg_run: dict, hold: dict, n_fast: int = 3000) -> pd.
         ("Medical Costs ±$5k/yr",
          "Med costs +$5k", {"hsa_med_real": float(cfg_fast["hsa_med_real"]) + 5000.0},
          "Med costs −$5k", {"hsa_med_real": max(0.0, float(cfg_fast["hsa_med_real"]) - 5000.0)}),
+        ("Equity Glide Path",
+         "Rising equity 40→70%", {"glide_on": True, "glide_tax_eq_start": 0.40, "glide_tax_eq_end": 0.70,
+                                   "glide_tax_start_age": 55, "glide_tax_end_age": 85, "glide_ret_same": True},
+         "Declining equity 70→30%", {"glide_on": True, "glide_tax_eq_start": 0.70, "glide_tax_eq_end": 0.30,
+                                      "glide_tax_start_age": 55, "glide_tax_end_age": 85, "glide_ret_same": True}),
+        ("$200k SPIA at 65",
+         "Buy $200k SPIA", {"ann1_on": True, "ann1_type": "SPIA", "ann1_purchase_age": 65,
+                             "ann1_income_start_age": 65, "ann1_purchase_amount": 200000.0, "ann1_payout_rate": 0.065},
+         "No annuity", {"ann1_on": False}),
+        ("Roth: Bracket-fill 24%",
+         "Fill to 24%", {"conv_on": True, "conv_type": "bracket_fill", "conv_target_bracket": 0.24,
+                          "conv_start": 62, "conv_end": 72, "conv_irmaa_aware": True, "conv_filing_status": "mfj"},
+         "No conversions", {"conv_on": False}),
     ]
 
     rows = []
@@ -1434,6 +1650,45 @@ def init_defaults():
     _d("conv_start", 62)
     _d("conv_end", 72)
     _d("conv_real", 100000.0)
+    _d("conv_type", "fixed")             # "fixed" or "bracket_fill"
+    _d("conv_target_bracket", 0.24)
+    _d("conv_irmaa_aware", True)
+    _d("conv_irmaa_target_tier", 0)
+    _d("conv_filing_status", "mfj")
+
+    # Glide path (age-based allocation)
+    _d("glide_on", False)
+    _d("glide_tax_eq_start", 0.60)
+    _d("glide_tax_eq_end", 0.40)
+    _d("glide_tax_start_age", 55)
+    _d("glide_tax_end_age", 80)
+    _d("glide_ret_same", True)
+    _d("glide_ret_eq_start", 0.60)
+    _d("glide_ret_eq_end", 0.40)
+    _d("glide_ret_start_age", 55)
+    _d("glide_ret_end_age", 80)
+
+    # Annuity 1 (SPIA or DIA)
+    _d("ann1_on", False)
+    _d("ann1_type", "SPIA")           # "SPIA" or "DIA"
+    _d("ann1_purchase_age", 65)
+    _d("ann1_income_start_age", 65)    # for SPIA = purchase age; for DIA can be later
+    _d("ann1_purchase_amount", 200000.0)
+    _d("ann1_payout_rate", 0.065)      # annual payout as fraction of purchase
+    _d("ann1_cola_on", False)
+    _d("ann1_cola_rate", 0.02)
+    _d("ann1_cola_match_inflation", False)
+
+    # Annuity 2 (optional second annuity)
+    _d("ann2_on", False)
+    _d("ann2_type", "DIA")
+    _d("ann2_purchase_age", 60)
+    _d("ann2_income_start_age", 75)
+    _d("ann2_purchase_amount", 100000.0)
+    _d("ann2_payout_rate", 0.08)
+    _d("ann2_cola_on", False)
+    _d("ann2_cola_rate", 0.02)
+    _d("ann2_cola_match_inflation", False)
 
     # Fees
     _d("fee_tax", 0.002)
@@ -1572,16 +1827,17 @@ def dashboard_page():
         scenario_name = cfg.get("scenario", "Base")
         st.html(f"""
         <div style="margin-bottom:0.2rem;">
-            <span style="font-size:1.8rem; font-weight:700; color:#1B2A4A;">Your Retirement Plan</span>
+            <span style="font-size:1.8rem; font-weight:700; color:#1B2A4A;">RetireLab</span>
             <span style="display:inline-block; background:#00897B; color:white; padding:2px 12px;
                          border-radius:12px; font-size:0.8rem; font-weight:600; margin-left:12px;
                          vertical-align:middle;">{scenario_name} scenario</span>
         </div>
         """)
+        st.caption("By Scott Wallsten · For educational and informational purposes only. Not financial, tax, or investment advice.")
     with hdr_mid:
         st.download_button(
             ":material/download: Save Settings",
-            json.dumps(cfg, indent=2), "retirement_config.json", "application/json",
+            json.dumps(cfg, indent=2), "retirelab_config.json", "application/json",
             use_container_width=True, key="dash_save",
         )
     with hdr_right:
@@ -1778,7 +2034,7 @@ def plan_setup_page():
 
     section = st.segmented_control(
         "Section",
-        ["Basics", "Income", "Spending", "Home", "Health", "Taxes", "Market", "Stress Tests", "Advanced"],
+        ["Basics", "Income", "Spending", "Home", "Health", "Taxes", "Market", "Allocation", "Stress Tests", "Advanced"],
         default="Basics", key="setup_section"
     )
 
@@ -1951,6 +2207,58 @@ def plan_setup_page():
                 cfg["inh_mean"] = st.number_input("Expected amount", value=float(cfg["inh_mean"]), step=100000.0, key="ps_inh_mean")
                 cfg["inh_min"] = st.number_input("Minimum amount", value=float(cfg["inh_min"]), step=100000.0, key="ps_inh_min")
             cfg["inh_sigma"] = st.number_input("Uncertainty (sigma)", min_value=0.05, max_value=0.80, value=float(cfg["inh_sigma"]), step=0.05, format="%.2f", key="ps_inh_sigma")
+
+        # ---- Annuity 1 (SPIA) ----
+        st.html('<div class="pro-section-title">Annuity 1 — Guaranteed Income</div>')
+        cfg["ann1_on"] = st.toggle("Purchase an annuity (SPIA or DIA)", value=bool(cfg["ann1_on"]), key="ps_ann1_on",
+            help="Model buying a single-premium immediate annuity (SPIA) or deferred income annuity (DIA) that provides guaranteed income for life.")
+        if not cfg["ann1_on"]:
+            st.caption("Toggle on to model a guaranteed income annuity. The purchase price is deducted from your portfolio at the purchase age, and fixed payments begin at the income start age.")
+        if cfg["ann1_on"]:
+            cfg["ann1_type"] = st.selectbox("Annuity type",
+                ["SPIA", "DIA"], index=["SPIA", "DIA"].index(str(cfg["ann1_type"])), key="ps_ann1_type",
+                help="SPIA: payments begin immediately at purchase. DIA: payments begin at a later age (deferred).")
+            a1c1, a1c2 = st.columns(2, border=True)
+            with a1c1:
+                cfg["ann1_purchase_age"] = st.number_input("Purchase age", value=int(cfg["ann1_purchase_age"]), step=1, key="ps_ann1_page")
+                cfg["ann1_purchase_amount"] = st.number_input("Purchase amount (today's $)", value=float(cfg["ann1_purchase_amount"]), step=25000.0, key="ps_ann1_amt")
+                cfg["ann1_payout_rate"] = st.number_input("Annual payout rate", min_value=0.01, max_value=0.20, value=float(cfg["ann1_payout_rate"]), step=0.005, format="%.3f", key="ps_ann1_pr",
+                    help="Annual income as fraction of purchase price. Typical SPIA rates: 6-7% at age 65.")
+            with a1c2:
+                cfg["ann1_income_start_age"] = st.number_input("Income start age", value=int(cfg["ann1_income_start_age"]), step=1, key="ps_ann1_isa",
+                    help="For SPIA, typically same as purchase age. For DIA, payments begin later.")
+                cfg["ann1_cola_on"] = st.toggle("Include COLA rider", value=bool(cfg["ann1_cola_on"]), key="ps_ann1_cola")
+                if cfg["ann1_cola_on"]:
+                    cfg["ann1_cola_match_inflation"] = st.toggle("Match simulated inflation", value=bool(cfg["ann1_cola_match_inflation"]), key="ps_ann1_cola_mi",
+                        help="If on, payment grows with actual simulated inflation. If off, grows at the fixed rate below.")
+                    if not cfg["ann1_cola_match_inflation"]:
+                        cfg["ann1_cola_rate"] = st.number_input("Fixed COLA rate", min_value=0.005, max_value=0.05, value=float(cfg["ann1_cola_rate"]), step=0.005, format="%.3f", key="ps_ann1_cola_r")
+            ann1_annual = float(cfg["ann1_purchase_amount"]) * float(cfg["ann1_payout_rate"])
+            st.info(f"Estimated annual income: **${ann1_annual:,.0f}** (today's dollars) starting at age {cfg['ann1_income_start_age']}.")
+
+        # ---- Annuity 2 (optional) ----
+        st.html('<div class="pro-section-title">Annuity 2 — Optional Second Annuity</div>')
+        cfg["ann2_on"] = st.toggle("Purchase a second annuity", value=bool(cfg["ann2_on"]), key="ps_ann2_on",
+            help="Model a second annuity, e.g. a DIA for longevity insurance starting at 75 or 80.")
+        if not cfg["ann2_on"]:
+            st.caption("Toggle on to model a second annuity (e.g., a deferred income annuity for late-life income).")
+        if cfg["ann2_on"]:
+            cfg["ann2_type"] = st.selectbox("Annuity 2 type",
+                ["SPIA", "DIA"], index=["SPIA", "DIA"].index(str(cfg["ann2_type"])), key="ps_ann2_type")
+            a2c1, a2c2 = st.columns(2, border=True)
+            with a2c1:
+                cfg["ann2_purchase_age"] = st.number_input("Purchase age", value=int(cfg["ann2_purchase_age"]), step=1, key="ps_ann2_page")
+                cfg["ann2_purchase_amount"] = st.number_input("Purchase amount (today's $)", value=float(cfg["ann2_purchase_amount"]), step=25000.0, key="ps_ann2_amt")
+                cfg["ann2_payout_rate"] = st.number_input("Annual payout rate", min_value=0.01, max_value=0.20, value=float(cfg["ann2_payout_rate"]), step=0.005, format="%.3f", key="ps_ann2_pr")
+            with a2c2:
+                cfg["ann2_income_start_age"] = st.number_input("Income start age", value=int(cfg["ann2_income_start_age"]), step=1, key="ps_ann2_isa")
+                cfg["ann2_cola_on"] = st.toggle("Include COLA rider", value=bool(cfg["ann2_cola_on"]), key="ps_ann2_cola")
+                if cfg["ann2_cola_on"]:
+                    cfg["ann2_cola_match_inflation"] = st.toggle("Match simulated inflation", value=bool(cfg["ann2_cola_match_inflation"]), key="ps_ann2_cola_mi")
+                    if not cfg["ann2_cola_match_inflation"]:
+                        cfg["ann2_cola_rate"] = st.number_input("Fixed COLA rate", min_value=0.005, max_value=0.05, value=float(cfg["ann2_cola_rate"]), step=0.005, format="%.3f", key="ps_ann2_cola_r")
+            ann2_annual = float(cfg["ann2_purchase_amount"]) * float(cfg["ann2_payout_rate"])
+            st.info(f"Estimated annual income: **${ann2_annual:,.0f}** (today's dollars) starting at age {cfg['ann2_income_start_age']}.")
 
     # ================================================================
     # SPENDING
@@ -2133,7 +2441,32 @@ def plan_setup_page():
             if cfg["conv_on"]:
                 cfg["conv_start"] = st.number_input("Start age", value=int(cfg["conv_start"]), step=1, key="ps_conv_start")
                 cfg["conv_end"] = st.number_input("End age", value=int(cfg["conv_end"]), step=1, key="ps_conv_end")
-                cfg["conv_real"] = st.number_input("Annual amount", value=float(cfg["conv_real"]), step=10000.0, key="ps_conv_amt")
+                cfg["conv_type"] = st.selectbox("Conversion strategy",
+                    ["fixed", "bracket_fill"],
+                    index=["fixed", "bracket_fill"].index(str(cfg["conv_type"])),
+                    format_func=lambda x: "Fixed annual amount" if x == "fixed" else "Fill to tax bracket",
+                    key="ps_conv_type",
+                    help="Fixed: convert a set dollar amount each year. Bracket fill: dynamically convert up to a target federal tax bracket each year.")
+                if cfg["conv_type"] == "fixed":
+                    cfg["conv_real"] = st.number_input("Annual amount (today's $)", value=float(cfg["conv_real"]), step=10000.0, key="ps_conv_amt")
+                else:
+                    bracket_options = {0.12: "12% bracket", 0.22: "22% bracket", 0.24: "24% bracket", 0.32: "32% bracket", 0.35: "35% bracket"}
+                    bracket_vals = list(bracket_options.keys())
+                    current_bracket = float(cfg["conv_target_bracket"])
+                    bracket_idx = bracket_vals.index(current_bracket) if current_bracket in bracket_vals else 2
+                    cfg["conv_target_bracket"] = st.selectbox("Fill up to bracket",
+                        bracket_vals, index=bracket_idx,
+                        format_func=lambda x: bracket_options[x],
+                        key="ps_conv_bracket",
+                        help="Convert enough each year to fill ordinary income up to the top of this bracket.")
+                    cfg["conv_filing_status"] = st.selectbox("Filing status",
+                        ["mfj", "single"],
+                        index=["mfj", "single"].index(str(cfg["conv_filing_status"])),
+                        format_func=lambda x: "Married Filing Jointly" if x == "mfj" else "Single",
+                        key="ps_conv_filing")
+                    cfg["conv_irmaa_aware"] = st.toggle("Cap conversions to avoid IRMAA",
+                        value=bool(cfg["conv_irmaa_aware"]), key="ps_conv_irmaa",
+                        help="Limit conversions so total MAGI stays below the lowest IRMAA threshold.")
 
         st.html('<div class="pro-section-title">Fees</div>')
         fc1, fc2 = st.columns(2, border=True)
@@ -2204,6 +2537,47 @@ def plan_setup_page():
         with inf2:
             cfg["infl_min"] = st.number_input("Minimum inflation", value=float(cfg["infl_min"]), step=0.01, format="%.2f", key="ps_infl_min")
             cfg["infl_max"] = st.number_input("Maximum inflation", value=float(cfg["infl_max"]), step=0.01, format="%.2f", key="ps_infl_max")
+
+    # ================================================================
+    # ALLOCATION (Glide Path)
+    # ================================================================
+    elif section == "Allocation":
+        st.html('<div class="pro-section-title">Age-Based Glide Path</div>')
+        cfg["glide_on"] = st.toggle("Enable age-based allocation glide path", value=bool(cfg["glide_on"]), key="ps_glide_on",
+            help="Gradually shift your portfolio from stocks to bonds as you age. The equity percentage changes linearly between a start and end age.")
+        if not cfg["glide_on"]:
+            st.caption("Toggle on to automatically shift your allocation over time. Without this, your portfolio weights stay constant throughout the simulation.")
+        if cfg["glide_on"]:
+            st.html('<div class="pro-section-title">Taxable Account Glide Path</div>')
+            gc1, gc2 = st.columns(2, border=True)
+            with gc1:
+                cfg["glide_tax_eq_start"] = st.number_input("Starting equity %", min_value=0.0, max_value=1.0,
+                    value=float(cfg["glide_tax_eq_start"]), step=0.05, format="%.2f", key="ps_glide_tax_start",
+                    help="Equity allocation at the start age (as a decimal, e.g. 0.60 = 60%).")
+                cfg["glide_tax_start_age"] = st.number_input("Glide start age", value=int(cfg["glide_tax_start_age"]), step=1, key="ps_glide_tax_sage")
+            with gc2:
+                cfg["glide_tax_eq_end"] = st.number_input("Ending equity %", min_value=0.0, max_value=1.0,
+                    value=float(cfg["glide_tax_eq_end"]), step=0.05, format="%.2f", key="ps_glide_tax_end",
+                    help="Equity allocation at the end age.")
+                cfg["glide_tax_end_age"] = st.number_input("Glide end age", value=int(cfg["glide_tax_end_age"]), step=1, key="ps_glide_tax_eage")
+            if float(cfg["glide_tax_eq_end"]) > float(cfg["glide_tax_eq_start"]):
+                st.info("📈 **Rising equity glidepath** — this increases stock allocation over time, which some research suggests may improve retirement outcomes.")
+            elif float(cfg["glide_tax_eq_end"]) < float(cfg["glide_tax_eq_start"]):
+                st.info("📉 **Traditional declining glidepath** — gradually reduces equity exposure as you age.")
+
+            st.html('<div class="pro-section-title">Retirement Account Glide Path</div>')
+            cfg["glide_ret_same"] = st.toggle("Same glide path as taxable", value=bool(cfg["glide_ret_same"]), key="ps_glide_ret_same",
+                help="If on, retirement accounts follow the same glide path as taxable. Turn off to set a different path.")
+            if not cfg["glide_ret_same"]:
+                gr1, gr2 = st.columns(2, border=True)
+                with gr1:
+                    cfg["glide_ret_eq_start"] = st.number_input("Starting equity %", min_value=0.0, max_value=1.0,
+                        value=float(cfg["glide_ret_eq_start"]), step=0.05, format="%.2f", key="ps_glide_ret_start")
+                    cfg["glide_ret_start_age"] = st.number_input("Glide start age", value=int(cfg["glide_ret_start_age"]), step=1, key="ps_glide_ret_sage")
+                with gr2:
+                    cfg["glide_ret_eq_end"] = st.number_input("Ending equity %", min_value=0.0, max_value=1.0,
+                        value=float(cfg["glide_ret_eq_end"]), step=0.05, format="%.2f", key="ps_glide_ret_end")
+                    cfg["glide_ret_end_age"] = st.number_input("Glide end age", value=int(cfg["glide_ret_end_age"]), step=1, key="ps_glide_ret_eage")
 
     # ================================================================
     # STRESS TESTS
@@ -2322,7 +2696,7 @@ def deep_dive_page():
 
     analysis = st.segmented_control(
         "Analysis",
-        ["Cashflows", "Sensitivity", "IRMAA", "Legacy", "Reallocation"],
+        ["Cashflows", "Sensitivity", "IRMAA", "Legacy", "Annuity", "Roth Strategy", "Reallocation"],
         default="Cashflows", key="dd_analysis"
     )
 
@@ -2362,6 +2736,8 @@ def deep_dive_page():
                 "LTC": float(np.percentile(de["ltc_cost"][:, idx], 50)),
                 "Total Spending": float(np.percentile(de["outflow_total"][:, idx], 50)),
                 "SS Income": float(np.percentile(de["ss_inflow"][:, idx], 50)),
+                "Annuity Income": float(np.percentile(de["annuity_income"][:, idx], 50)),
+                "Roth Conversions": float(np.percentile(de["conv_gross"][:, idx], 50)),
                 "IRMAA": float(np.percentile(de["irmaa"][:, idx], 50)),
                 "Taxable WD": float(np.percentile(de["gross_tax_wd"][:, idx], 50)),
                 "Trad IRA WD": float(np.percentile(de["gross_trad_wd"][:, idx], 50)),
@@ -2433,6 +2809,156 @@ def deep_dive_page():
                 y=alt.Y("count()", title="Number of simulations"),
             ).properties(height=280)
             st.altair_chart(hist_chart, use_container_width=True)
+
+    # ================================================================
+    # ANNUITY BREAKEVEN
+    # ================================================================
+    elif analysis == "Annuity":
+        st.html('<div class="pro-section-title">Annuity Breakeven Analysis</div>')
+        ann1_on = bool(cfg_run.get("ann1_on", False))
+        ann2_on = bool(cfg_run.get("ann2_on", False))
+        if not ann1_on and not ann2_on:
+            st.info("No annuities configured. Enable an annuity in Assumptions > Income to see this analysis.")
+        else:
+            de = out["decomp"]
+            for prefix, label in [("ann1", "Annuity 1"), ("ann2", "Annuity 2")]:
+                if not bool(cfg_run.get(f"{prefix}_on", False)):
+                    continue
+                st.html(f'<div class="pro-section-title">{label} — Breakeven & Return on Premium</div>')
+                purchase_amt = float(cfg_run[f"{prefix}_purchase_amount"])
+                payout_rate = float(cfg_run[f"{prefix}_payout_rate"])
+                income_start_age = int(cfg_run[f"{prefix}_income_start_age"])
+                annual_payment = purchase_amt * payout_rate
+
+                # Cumulative payments vs purchase price
+                paying_ages = [a for a in ages if a >= income_start_age]
+                if not paying_ages:
+                    st.warning(f"{label} income hasn't started yet in this simulation horizon.")
+                    continue
+
+                cum_payments = []
+                for yr_count, a in enumerate(paying_ages, 1):
+                    if bool(cfg_run.get(f"{prefix}_cola_on", False)):
+                        cola_r = float(cfg_run.get(f"{prefix}_cola_rate", 0.02))
+                        cum = sum(annual_payment * (1 + cola_r) ** y for y in range(yr_count))
+                    else:
+                        cum = annual_payment * yr_count
+                    cum_payments.append({"Age": int(a), "Cumulative Payments": cum, "Purchase Price": purchase_amt})
+
+                be_df = pd.DataFrame(cum_payments)
+                breakeven_age = None
+                for _, row in be_df.iterrows():
+                    if row["Cumulative Payments"] >= row["Purchase Price"]:
+                        breakeven_age = int(row["Age"])
+                        break
+
+                bc1, bc2, bc3 = st.columns(3, border=True)
+                with bc1:
+                    st.html(_metric_card_html("Purchase Price", f"${purchase_amt:,.0f}", "", "metric-navy"))
+                with bc2:
+                    st.html(_metric_card_html("Annual Payment", f"${annual_payment:,.0f}", "(today's $)", "metric-green"))
+                with bc3:
+                    be_text = f"Age {breakeven_age}" if breakeven_age else "Beyond plan"
+                    st.html(_metric_card_html("Breakeven Age", be_text, "(nominal)", "metric-coral"))
+
+                # Chart
+                chart_data = be_df.melt(id_vars=["Age"], value_vars=["Cumulative Payments", "Purchase Price"],
+                                        var_name="Series", value_name="Dollars")
+                be_chart = alt.Chart(chart_data).mark_line(strokeWidth=2).encode(
+                    x=alt.X("Age:Q", title="Age"),
+                    y=alt.Y("Dollars:Q", title="Dollars", axis=alt.Axis(format="$,.0f")),
+                    color=alt.Color("Series:N", scale=alt.Scale(range=["#00897B", "#E57373"])),
+                    strokeDash=alt.StrokeDash("Series:N"),
+                ).properties(height=280)
+                st.altair_chart(be_chart, use_container_width=True)
+
+                # Return on premium at various survival ages
+                st.markdown("**Return on Premium by Survival Age**")
+                rop_rows = []
+                for survive_to in [75, 80, 85, 90, 95]:
+                    years_paying = max(0, survive_to - income_start_age)
+                    if years_paying <= 0:
+                        continue
+                    if bool(cfg_run.get(f"{prefix}_cola_on", False)):
+                        cola_r = float(cfg_run.get(f"{prefix}_cola_rate", 0.02))
+                        total_received = sum(annual_payment * (1 + cola_r) ** y for y in range(years_paying))
+                    else:
+                        total_received = annual_payment * years_paying
+                    rop = (total_received - purchase_amt) / purchase_amt * 100
+                    rop_rows.append({"Survive To": survive_to, "Years Receiving": years_paying,
+                                     "Total Received": f"${total_received:,.0f}",
+                                     "Return on Premium": f"{rop:+.1f}%"})
+                if rop_rows:
+                    st.dataframe(pd.DataFrame(rop_rows), use_container_width=True, hide_index=True)
+
+    # ================================================================
+    # ROTH STRATEGY COMPARISON
+    # ================================================================
+    elif analysis == "Roth Strategy":
+        st.html('<div class="pro-section-title">Roth Conversion Strategy Comparison</div>')
+        # Use the live cfg so we pick up any changes made since last dashboard run
+        _roth_cfg = build_cfg_run(cfg)
+        if not bool(_roth_cfg.get("conv_on", False)):
+            st.info("Roth conversions are off. Enable them in Assumptions > Taxes, then come back here.")
+        else:
+            st.caption("Compares your current Roth conversion strategy against no conversions. Uses 3,000 simulations for speed.")
+            with st.spinner("Running comparison simulations..."):
+                # Run with conversions (current live settings)
+                cfg_with = dict(_roth_cfg)
+                cfg_with["n_sims"] = 3000
+                out_with = simulate(cfg_with, hold)
+
+                # Run without conversions
+                cfg_without = dict(_roth_cfg)
+                cfg_without["n_sims"] = 3000
+                cfg_without["conv_on"] = False
+                out_without = simulate(cfg_without, hold)
+
+            # Comparison metrics
+            rc1, rc2, rc3 = st.columns(3, border=True)
+            with rc1:
+                sr_with = float((out_with["liquid"][:, -1] > 0).mean()) * 100
+                sr_without = float((out_without["liquid"][:, -1] > 0).mean()) * 100
+                delta_sr = sr_with - sr_without
+                st.html(_metric_card_html("Success Rate", f"{sr_with:.1f}%", f"vs {sr_without:.1f}% without ({delta_sr:+.1f}pp)", "metric-green" if delta_sr >= 0 else "metric-coral"))
+            with rc2:
+                med_with = float(np.percentile(out_with["net_worth"][:, -1], 50)) / 1e6
+                med_without = float(np.percentile(out_without["net_worth"][:, -1], 50)) / 1e6
+                st.html(_metric_card_html("Median Net Worth", f"${med_with:.1f}M", f"vs ${med_without:.1f}M without", "metric-navy"))
+            with rc3:
+                leg_with = float(np.median(out_with["legacy"])) / 1e6
+                leg_without = float(np.median(out_without["legacy"])) / 1e6
+                st.html(_metric_card_html("Median Legacy", f"${leg_with:.1f}M", f"vs ${leg_without:.1f}M without", "metric-navy"))
+
+            # Cumulative taxes comparison
+            st.html('<div class="pro-section-title">Cumulative Taxes Paid</div>')
+            taxes_with = np.cumsum(np.percentile(out_with["decomp"]["taxes_paid"], 50, axis=0))
+            taxes_without = np.cumsum(np.percentile(out_without["decomp"]["taxes_paid"], 50, axis=0))
+            tax_df = pd.DataFrame({
+                "Age": list(out_with["ages"]) + list(out_without["ages"]),
+                "Cumulative Taxes ($)": list(taxes_with) + list(taxes_without),
+                "Strategy": ["With conversions"] * len(out_with["ages"]) + ["Without conversions"] * len(out_without["ages"]),
+            })
+            tax_chart = alt.Chart(tax_df).mark_line(strokeWidth=2).encode(
+                x=alt.X("Age:Q", title="Age"),
+                y=alt.Y("Cumulative Taxes ($):Q", title="Cumulative Taxes", axis=alt.Axis(format="$,.0f")),
+                color=alt.Color("Strategy:N", scale=alt.Scale(range=["#00897B", "#E57373"])),
+            ).properties(height=280)
+            st.altair_chart(tax_chart, use_container_width=True)
+
+            # Median conversion amounts by age
+            st.html('<div class="pro-section-title">Annual Roth Conversions (Median)</div>')
+            conv_med = np.percentile(out_with["decomp"]["conv_gross"], 50, axis=0)
+            conv_df = pd.DataFrame({"Age": out_with["ages"], "Conversion ($)": conv_med})
+            conv_df = conv_df[conv_df["Conversion ($)"] > 0]
+            if len(conv_df) > 0:
+                conv_chart = alt.Chart(conv_df).mark_bar(color="#00897B").encode(
+                    x=alt.X("Age:O", title="Age"),
+                    y=alt.Y("Conversion ($):Q", title="Conversion Amount", axis=alt.Axis(format="$,.0f")),
+                ).properties(height=250)
+                st.altair_chart(conv_chart, use_container_width=True)
+            else:
+                st.info("No conversions occurred in the simulation.")
 
     # ================================================================
     # REALLOCATION

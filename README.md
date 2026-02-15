@@ -1,4 +1,4 @@
-# Retirement Planner Pro
+# RetireLab
 
 A Monte Carlo retirement simulation dashboard that helps you stress-test whether your savings will last through retirement. It runs 10,000 randomized market simulations against your actual portfolio and spending plan, then shows you the odds.
 
@@ -17,7 +17,7 @@ A Monte Carlo retirement simulation dashboard that helps you stress-test whether
 
 ```bash
 pip install -r requirements.txt
-streamlit run retirement_mc_pro.py
+streamlit run retirelab.py
 ```
 
 A browser window opens automatically. That's it.
@@ -71,7 +71,7 @@ cd ~/Downloads
 Or if they're somewhere else, replace the path:
 
 ```bash
-cd /path/to/the/folder/containing/retirement_mc_pro.py
+cd /path/to/the/folder/containing/retirelab.py
 ```
 
 Then install the required packages:
@@ -83,7 +83,7 @@ pip3 install -r requirements.txt
 **Step 5: Run the app**
 
 ```bash
-streamlit run retirement_mc_pro.py
+streamlit run retirelab.py
 ```
 
 Your browser will open automatically to `http://localhost:8501` with the dashboard. To stop the app later, go back to Terminal and press **Ctrl + C**.
@@ -139,7 +139,7 @@ pip install -r requirements.txt
 **Step 6: Run the app**
 
 ```cmd
-streamlit run retirement_mc_pro.py
+streamlit run retirelab.py
 ```
 
 Your browser opens automatically. To stop the app, go back to Command Prompt and press **Ctrl + C**.
@@ -152,7 +152,7 @@ Make sure these files are all in the same folder:
 
 | File | What it is |
 |------|-----------|
-| `retirement_mc_pro.py` | The main application |
+| `retirelab.py` | The main application |
 | `requirements.txt` | List of Python packages needed |
 | `.streamlit/config.toml` | Theme configuration (light mode, colors) |
 
@@ -192,9 +192,9 @@ The app auto-detects CSV exports from most major brokerages. It looks for column
 **"streamlit: command not found"**
 Python packages were installed but the terminal can't find them. Try:
 ```bash
-python3 -m streamlit run retirement_mc_pro.py
+python3 -m streamlit run retirelab.py
 ```
-(On Windows, use `python -m streamlit run retirement_mc_pro.py`)
+(On Windows, use `python -m streamlit run retirelab.py`)
 
 **App runs but looks wrong (dark backgrounds, invisible text)**
 Make sure the `.streamlit/config.toml` file is present. It forces light mode. If your OS is in dark mode and the config file is missing, things may look broken.
@@ -205,5 +205,5 @@ The app accepts `.csv`, `.txt`, and `.tsv` files. If your brokerage export has a
 **Port already in use**
 If you see an error about port 8501, another instance is probably running. Either close it or specify a different port:
 ```bash
-streamlit run retirement_mc_pro.py --server.port 8502
+streamlit run retirelab.py --server.port 8502
 ```
