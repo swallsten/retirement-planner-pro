@@ -13,6 +13,7 @@ qualified financial advisor before making retirement planning decisions.
 # ============================================================
 from __future__ import annotations
 
+import copy
 import json
 from typing import Dict, List, Tuple
 
@@ -23,7 +24,7 @@ import altair as alt
 
 st.set_page_config(
     page_title="RetireLab",
-    page_icon=":material/account_balance:",
+    page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -33,6 +34,7 @@ st.set_page_config(
 # ============================================================
 ASSET_CLASSES = ["Equities", "REIT", "Bonds", "Alternatives", "Cash"]
 
+# Market outlooks — named return/vol assumptions for asset classes
 DEFAULT_SCENARIOS = {
     "Catastrophic": {"eq_mu": 0.00, "eq_vol": 0.35, "reit_mu": 0.01, "reit_vol": 0.30, "bond_mu": 0.01, "bond_vol": 0.10, "alt_mu": 0.01, "alt_vol": 0.20, "cash_mu": 0.02},
     "Bad":         {"eq_mu": 0.04, "eq_vol": 0.22, "reit_mu": 0.04, "reit_vol": 0.20, "bond_mu": 0.02, "bond_vol": 0.08, "alt_mu": 0.03, "alt_vol": 0.18, "cash_mu": 0.02},
@@ -259,7 +261,7 @@ def scenario_table(scenarios: dict) -> pd.DataFrame:
     rows = []
     for name, p in scenarios.items():
         rows.append({
-            "Scenario": name,
+            "Market Outlook": name,
             "Eq mean": p["eq_mu"], "Eq vol": p["eq_vol"],
             "REIT mean": p["reit_mu"], "REIT vol": p["reit_vol"],
             "Bond mean": p["bond_mu"], "Bond vol": p["bond_vol"],
@@ -1416,7 +1418,7 @@ def _metric_card_html(label: str, value: str, sub: str = "", color_class: str = 
 # SECTION 5: Chart builders
 # ============================================================
 def render_wealth_fan_chart(paths: np.ndarray, ages: np.ndarray, title_label: str = "Wealth ($M)",
-                            retire_age: int | None = None):
+                            retire_age: int | None = None, y_max: float | None = None):
     """Altair layered fan chart: 3 bands, median line, zero baseline, retirement line, tooltip."""
     pcts = [5, 10, 25, 50, 75, 90, 95]
     fan = {p: np.percentile(paths, p, axis=0) for p in pcts}
@@ -1424,10 +1426,13 @@ def render_wealth_fan_chart(paths: np.ndarray, ages: np.ndarray, title_label: st
     for p in pcts:
         fan_df[f"p{p}"] = (fan[p] / 1e6).round(3)
 
+    # Y-axis scale (shared when comparing side-by-side)
+    y_scale = alt.Scale(domain=[fan_df["p5"].min(), y_max]) if y_max is not None else alt.Undefined
+
     # Bands
     band_outer = alt.Chart(fan_df).mark_area(opacity=0.10, color="#1B2A4A").encode(
         x=alt.X("Age:Q", title="Age"),
-        y=alt.Y("p5:Q", title=title_label),
+        y=alt.Y("p5:Q", title=title_label, scale=y_scale),
         y2="p95:Q",
     )
     band_mid = alt.Chart(fan_df).mark_area(opacity=0.18, color="#1B2A4A").encode(
@@ -1488,7 +1493,7 @@ def render_wealth_fan_chart(paths: np.ndarray, ages: np.ndarray, title_label: st
     st.altair_chart(chart, use_container_width=True)
 
 
-def render_spending_fan_chart(out: dict, cfg_run: dict):
+def render_spending_fan_chart(out: dict, cfg_run: dict, y_max: float | None = None):
     """Teal-colored fan chart for real spending."""
     spend_real_track = out["decomp"]["spend_real_track"]
     retire_idx = max(0, int(cfg_run["retire_age"]) - int(cfg_run["start_age"]))
@@ -1507,9 +1512,11 @@ def render_spending_fan_chart(out: dict, cfg_run: dict):
 
     nearest = alt.selection_point(nearest=True, on="pointerover", fields=["Age"], empty=False)
 
+    sp_y_scale = alt.Scale(domain=[0, y_max]) if y_max is not None else alt.Undefined
+
     outer = alt.Chart(df).mark_area(opacity=0.12, color="#00897B").encode(
         x=alt.X("Age:Q", title="Age"),
-        y=alt.Y("p10:Q", title="Annual spending ($K, today's dollars)"),
+        y=alt.Y("p10:Q", title="Annual spending ($K, today's dollars)", scale=sp_y_scale),
         y2="p90:Q",
     )
     inner = alt.Chart(df).mark_area(opacity=0.25, color="#00897B").encode(
@@ -1775,7 +1782,7 @@ def init_defaults():
         if k not in cfg:
             cfg[k] = v
 
-    # Scenario
+    # Market outlook
     _d("scenario", "Base")
     _d("manual_override", False)
     _d("override_params", dict(DEFAULT_SCENARIOS["Base"]))
@@ -2006,6 +2013,9 @@ def init_defaults():
     st.session_state["cfg"] = cfg
 
     # Default holdings
+    if "saved_scenarios" not in st.session_state:
+        st.session_state["saved_scenarios"] = []
+
     if "hold" not in st.session_state:
         eq_pct_tax = 60
         eq_pct_ret = 70
@@ -2051,18 +2061,75 @@ def dashboard_page():
     hold = st.session_state["hold"]
 
     # Header row — compact, with save/load in popovers instead of file_uploader
-    hdr_left, hdr_mid, hdr_right = st.columns([4, 1, 1])
+    _saved_scenarios = st.session_state["saved_scenarios"]
+    _saved_names = [s["name"] for s in _saved_scenarios]
+    _active_sc = st.session_state.get("_active_scenario_name")
+
+    hdr_left, hdr_switch, hdr_save_sc, hdr_mid, hdr_right = st.columns([3, 1, 1, 1, 1])
     with hdr_left:
-        scenario_name = cfg.get("scenario", "Base")
+        outlook_name = cfg.get("scenario", "Base")
+        badges = f"""<span style="display:inline-block; background:#00897B; color:white; padding:2px 12px;
+                     border-radius:12px; font-size:0.8rem; font-weight:600; margin-left:12px;
+                     vertical-align:middle;">{outlook_name} market outlook</span>"""
+        if _active_sc:
+            badges += f"""<span style="display:inline-block; background:#1B2A4A; color:white; padding:2px 12px;
+                         border-radius:12px; font-size:0.8rem; font-weight:600; margin-left:6px;
+                         vertical-align:middle;">📋 {_active_sc}</span>"""
         st.html(f"""
         <div style="margin-bottom:0.2rem;">
             <span style="font-size:1.8rem; font-weight:700; color:#1B2A4A;">RetireLab</span>
-            <span style="display:inline-block; background:#00897B; color:white; padding:2px 12px;
-                         border-radius:12px; font-size:0.8rem; font-weight:600; margin-left:12px;
-                         vertical-align:middle;">{scenario_name} scenario</span>
+            {badges}
         </div>
         """)
         st.caption("By Scott Wallsten · For educational and informational purposes only. Not financial, tax, or investment advice.")
+    with hdr_switch:
+        if _saved_names:
+            _switch_opts = ["— Unsaved —"] + _saved_names
+            _cur_idx = (_switch_opts.index(_active_sc) if _active_sc in _switch_opts else 0)
+            _switch_pick = st.selectbox("Switch scenario", _switch_opts, index=_cur_idx,
+                                        key="hdr_switch_sc", label_visibility="collapsed")
+            if _switch_pick != "— Unsaved —" and _switch_pick != _active_sc:
+                sc_load = next(s for s in _saved_scenarios if s["name"] == _switch_pick)
+                st.session_state["cfg"] = copy.deepcopy(sc_load["cfg"])
+                st.session_state["hold"] = copy.deepcopy(sc_load["hold"])
+                st.session_state["_active_scenario_name"] = _switch_pick
+                st.rerun()
+            elif _switch_pick == "— Unsaved —" and _active_sc is not None:
+                st.session_state.pop("_active_scenario_name", None)
+                st.rerun()
+    with hdr_save_sc:
+        _saved = st.session_state["saved_scenarios"]
+        _n_saved = len(_saved)
+        _existing_names = [s["name"] for s in _saved]
+        with st.popover(":material/add_circle: Save as Scenario", use_container_width=True):
+            # Show what's already saved
+            if _existing_names:
+                st.caption(f"Saved: {', '.join(_existing_names)}")
+            _default_name = st.session_state.get("_active_scenario_name", f"Scenario {_n_saved + 1}")
+            _sc_name = st.text_input("Scenario name", value=_default_name, key="save_sc_name")
+            _is_overwrite = _sc_name in _existing_names
+            if _n_saved >= 4 and not _is_overwrite:
+                st.warning("Maximum 4 saved scenarios. Use an existing name to update, or delete one on the Compare page.")
+            else:
+                _btn_label = f"Update '{_sc_name}'" if _is_overwrite else "Save"
+                if st.button(_btn_label, key="save_sc_btn", use_container_width=True):
+                    if _is_overwrite:
+                        for i, s in enumerate(_saved):
+                            if s["name"] == _sc_name:
+                                _saved[i] = {
+                                    "name": _sc_name,
+                                    "cfg": copy.deepcopy(dict(cfg)),
+                                    "hold": copy.deepcopy(dict(hold)),
+                                }
+                                break
+                    else:
+                        _saved.append({
+                            "name": _sc_name,
+                            "cfg": copy.deepcopy(dict(cfg)),
+                            "hold": copy.deepcopy(dict(hold)),
+                        })
+                    st.session_state["_active_scenario_name"] = _sc_name
+                    st.rerun()
     with hdr_mid:
         st.download_button(
             ":material/download: Save Settings",
@@ -2226,8 +2293,8 @@ def dashboard_page():
         with ec3:
             st.metric("Good luck (p90)", f"${np.percentile(end_vals, 90):.1f}M")
 
-    # ---- Quick scenario comparison ----
-    with st.expander("Quick scenario comparison", expanded=False):
+    # ---- Quick market outlook comparison ----
+    with st.expander("Quick market outlook comparison", expanded=False):
         st.caption("See how your plan looks under different market outlooks (uses fewer simulations for speed).")
         comp_rows = []
         for sname, sparams in DEFAULT_SCENARIOS.items():
@@ -2240,7 +2307,7 @@ def dashboard_page():
             ra = o["ruin_age"]
             pct_ok = 100.0 - float((ra <= end_age_val).sum()) / len(ra) * 100
             comp_rows.append({
-                "Scenario": sname,
+                "Market Outlook": sname,
                 "Won't Run Out": f"{pct_ok:.0f}%",
                 "Median Liquid": f"${np.median(liq_end)/1e6:.1f}M",
                 "Median Net Worth": f"${np.median(nw_end)/1e6:.1f}M",
@@ -2789,7 +2856,7 @@ def plan_setup_page():
                  "Regime-switching: returns vary depending on whether we're in a Bull, Normal, or Bear market state.")
 
         if cfg["return_model"] == "regime":
-            st.info("When regime-switching is on, the scenario table is ignored. "
+            st.info("When regime-switching is on, the market outlook table is ignored. "
                     "Returns are drawn from state-specific distributions with Markov transitions between Bull, Normal, and Bear markets.")
             r_params = cfg.get("regime_params", dict(DEFAULT_REGIME_PARAMS))
             r_trans = cfg.get("regime_transition", [list(row) for row in DEFAULT_TRANSITION_MATRIX])
@@ -2843,13 +2910,13 @@ def plan_setup_page():
             cfg["regime_initial_probs"] = r_init
 
         else:
-            st.html('<div class="pro-section-title">Market Scenarios</div>')
+            st.html('<div class="pro-section-title">Market Outlooks</div>')
             tbl = scenario_table(DEFAULT_SCENARIOS).copy()
             for c in ["Eq mean","Eq vol","REIT mean","REIT vol","Bond mean","Bond vol","Alt mean","Alt vol","Cash mean"]:
                 tbl[c] = (tbl[c] * 100).round(2).astype(str) + "%"
             st.dataframe(tbl, use_container_width=True, hide_index=True)
 
-            cfg["scenario"] = st.selectbox("Select scenario",
+            cfg["scenario"] = st.selectbox("Select market outlook",
                 list(DEFAULT_SCENARIOS.keys()),
                 index=list(DEFAULT_SCENARIOS.keys()).index(cfg["scenario"]),
                 key="ps_scenario")
@@ -3502,6 +3569,387 @@ def deep_dive_page():
             st.markdown(f"- {b}")
 
 
+# ---- 8d: Compare Scenarios page ----
+
+# Keys to display in assumptions diff, with human-readable labels
+_DIFF_KEYS = [
+    ("start_age", "Start Age"), ("end_age", "End Age"), ("retire_age", "Retire Age"),
+    ("has_spouse", "Has Spouse"), ("spouse_age", "Spouse Age"),
+    ("spend_real", "Annual Spending"), ("spend_split_on", "Spending Split"),
+    ("spend_essential_real", "Essential Spending"), ("spend_discretionary_real", "Discretionary Spending"),
+    ("phase1_mult", "Go-Go Multiplier"), ("phase2_mult", "Slow-Go Multiplier"), ("phase3_mult", "No-Go Multiplier"),
+    ("gk_on", "Guardrails On"), ("gk_cut", "Guardrail Cut"), ("gk_raise", "Guardrail Raise"),
+    ("scenario", "Market Outlook"), ("manual_override", "Manual Override"),
+    ("return_model", "Return Model"),
+    ("infl_mu", "Inflation Mean"), ("infl_vol", "Inflation Vol"),
+    ("fed_ord", "Federal Ordinary Rate"), ("state_ord", "State Ordinary Rate"),
+    ("fed_capg", "Federal Cap Gains Rate"), ("basis_frac", "Cost Basis Fraction"),
+    ("wd_strategy", "Withdrawal Strategy"), ("rmd_start_age", "RMD Start Age"),
+    ("conv_on", "Roth Conversions"), ("conv_start", "Roth Conv Start"),
+    ("conv_end", "Roth Conv End"), ("conv_real", "Roth Conv Amount"),
+    ("conv_type", "Roth Conv Type"), ("conv_target_bracket", "Target Bracket"),
+    ("gain_harvest_on", "Gain Harvesting"), ("qcd_on", "QCDs"),
+    ("qcd_annual_real", "QCD Annual"), ("qcd_start_age", "QCD Start Age"),
+    ("glide_on", "Glide Path"), ("glide_tax_eq_start", "Glide Tax Eq Start"),
+    ("glide_tax_eq_end", "Glide Tax Eq End"),
+    ("ann1_on", "Annuity 1"), ("ann1_type", "Ann 1 Type"),
+    ("ann1_purchase_amount", "Ann 1 Purchase"), ("ann1_payout_rate", "Ann 1 Payout Rate"),
+    ("ann2_on", "Annuity 2"),
+    ("ss62_1", "SS Benefit (primary)"), ("claim1", "SS Claim Age (primary)"),
+    ("ss62_2", "SS Benefit (spouse)"), ("claim2", "SS Claim Age (spouse)"),
+    ("home_on", "Home"), ("home_value0", "Home Value"), ("mortgage_balance0", "Mortgage Balance"),
+    ("sale_on", "Home Sale"), ("sale_age", "Sale Age"),
+    ("inh_on", "Inheritance"), ("inh_mean", "Inheritance Mean"),
+    ("ltc_on", "LTC Risk"), ("ltc_cost_real", "LTC Annual Cost"),
+    ("hsa_on", "HSA"), ("hsa_balance0", "HSA Balance"),
+    ("contrib_on", "Pre-Ret Contributions"), ("contrib_ret_annual", "Contrib Annual"),
+    ("fee_tax", "Fee (Taxable)"), ("fee_ret", "Fee (Retirement)"),
+    ("irmaa_on", "IRMAA"), ("mort_on", "Mortality"),
+    ("crash_on", "Crash Overlay"), ("seq_on", "Sequence Stress"),
+    ("legacy_on", "Legacy"),
+]
+
+
+def _fmt_val(v):
+    """Format a config value for display in the diff table."""
+    if isinstance(v, bool):
+        return "Yes" if v else "No"
+    if isinstance(v, float):
+        if abs(v) >= 1000:
+            return f"${v:,.0f}"
+        if abs(v) < 1:
+            return f"{v:.1%}"
+        return f"{v:.2f}"
+    return str(v)
+
+
+def compare_page():
+    """Side-by-side scenario comparison page."""
+    st.html('<div style="font-size:1.8rem; font-weight:700; color:#1B2A4A; margin-bottom:0.5rem;">Compare Scenarios</div>')
+
+    saved = st.session_state["saved_scenarios"]
+    if len(saved) < 2:
+        st.info(
+            f"You have **{len(saved)}** saved scenario(s). Save at least **2** from the Results page "
+            "using the **:material/add_circle: Save as Scenario** button, then return here to compare."
+        )
+        if saved:
+            st.markdown("**Saved so far:**")
+            for i, s in enumerate(saved):
+                st.markdown(f"- {s['name']}")
+        return
+
+    # ---- Scenario selector (pick exactly 2) ----
+    names = [s["name"] for s in saved]
+    sel_col, load_col, del_col = st.columns([3, 1, 1])
+    with sel_col:
+        picked = st.multiselect("Select exactly 2 scenarios to compare", names, default=names[:2],
+                                max_selections=2, key="compare_pick")
+    with load_col:
+        st.markdown("")  # spacing
+        load_name = st.selectbox("Load into Results", ["—"] + names, key="compare_load",
+                                 help="Load a saved scenario's settings so you can edit and re-save it")
+        if load_name != "—":
+            sc_load = next(s for s in saved if s["name"] == load_name)
+            st.session_state["cfg"] = copy.deepcopy(sc_load["cfg"])
+            st.session_state["hold"] = copy.deepcopy(sc_load["hold"])
+            st.session_state["_active_scenario_name"] = load_name
+            st.rerun()
+    with del_col:
+        st.markdown("")  # spacing
+        del_name = st.selectbox("Delete a scenario", ["—"] + names, key="compare_del")
+        if del_name != "—":
+            st.session_state["saved_scenarios"] = [s for s in saved if s["name"] != del_name]
+            # Clear active name if we deleted the active one
+            if st.session_state.get("_active_scenario_name") == del_name:
+                st.session_state.pop("_active_scenario_name", None)
+            st.rerun()
+
+    if len(picked) != 2:
+        st.warning("Select exactly 2 scenarios to compare.")
+        return
+
+    sc_a = next(s for s in saved if s["name"] == picked[0])
+    sc_b = next(s for s in saved if s["name"] == picked[1])
+
+    # ---- Assumptions diff table ----
+    st.html('<div class="pro-section-title">Assumptions That Differ</div>')
+    diff_rows = []
+    for key, label in _DIFF_KEYS:
+        va = sc_a["cfg"].get(key)
+        vb = sc_b["cfg"].get(key)
+        if va != vb:
+            diff_rows.append({"Assumption": label, picked[0]: _fmt_val(va), picked[1]: _fmt_val(vb)})
+    # Also compare holdings
+    for hkey, hlabel in [("total_tax", "Taxable Balance"), ("total_ret", "Retirement Balance")]:
+        va = sc_a["hold"].get(hkey)
+        vb = sc_b["hold"].get(hkey)
+        if va != vb:
+            diff_rows.append({"Assumption": hlabel, picked[0]: _fmt_val(va), picked[1]: _fmt_val(vb)})
+
+    if diff_rows:
+        st.dataframe(pd.DataFrame(diff_rows), use_container_width=True, hide_index=True)
+    else:
+        st.success("These two scenarios have identical assumptions.")
+
+    # ---- Run both simulations ----
+    with st.spinner("Running simulations for both scenarios..."):
+        cfg_a = build_cfg_run(sc_a["cfg"])
+        cfg_b = build_cfg_run(sc_b["cfg"])
+        out_a = simulate(cfg_a, sc_a["hold"])
+        out_b = simulate(cfg_b, sc_b["hold"])
+
+    # ---- Side-by-side metric cards ----
+    st.html('<div class="pro-section-title">Key Metrics</div>')
+
+    def _compute_metrics(out, cfg):
+        """Compute standard metrics from simulation output."""
+        end_age_val = int(cfg["end_age"])
+        ruin_age = out["ruin_age"]
+        ran_out = (ruin_age <= end_age_val).sum()
+        pct_success = 100.0 - float(ran_out) / len(ruin_age) * 100
+        sL = summarize_end(out["liquid"])
+        sN = summarize_end(out["net_worth"])
+        sLr = summarize_end(out["liquid_real"])
+        sNr = summarize_end(out["net_worth_real"])
+        funded = out["funded_through_age"]
+        return {
+            "pct_success": pct_success,
+            "funded_through": funded,
+            "liq_p50": sL["p50"],
+            "nw_p50": sN["p50"],
+            "liq_real_p50": sLr["p50"],
+            "nw_real_p50": sNr["p50"],
+            "end_age": end_age_val,
+        }
+
+    met_a = _compute_metrics(out_a, sc_a["cfg"])
+    met_b = _compute_metrics(out_b, sc_b["cfg"])
+
+    col_a, col_b = st.columns(2, border=True)
+    for col, met, name in [(col_a, met_a, picked[0]), (col_b, met_b, picked[1])]:
+        with col:
+            st.markdown(f"**{name}**")
+            sr_color = "metric-green" if met["pct_success"] >= 90 else ("metric-amber" if met["pct_success"] >= 75 else "metric-coral")
+            st.html(_metric_card_html("Success Rate", f"{met['pct_success']:.0f}%",
+                                      f"of sims have money at {met['end_age']}", sr_color))
+            ft_str = f"{met['funded_through']}+" if met["funded_through"] >= met["end_age"] else str(met["funded_through"])
+            st.html(_metric_card_html("Funded Through Age", ft_str,
+                                      "in a bad (p10) scenario", "metric-navy"))
+            st.html(_metric_card_html(f"Liquid Assets at {met['end_age']}", f"${met['liq_p50']/1e6:.1f}M",
+                                      f"median nominal · real: ${met['liq_real_p50']/1e6:.1f}M", "metric-navy"))
+            st.html(_metric_card_html(f"Net Worth at {met['end_age']}", f"${met['nw_p50']/1e6:.1f}M",
+                                      f"median nominal · real: ${met['nw_real_p50']/1e6:.1f}M", "metric-navy"))
+
+    # ---- Success rate comparison bar ----
+    st.html('<div class="pro-section-title">Success Rate Comparison</div>')
+    bar_df = pd.DataFrame({
+        "Scenario": [picked[0], picked[1]],
+        "Success Rate (%)": [met_a["pct_success"], met_b["pct_success"]],
+    })
+    bar_chart = alt.Chart(bar_df).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+        x=alt.X("Scenario:N", title=None, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("Success Rate (%):Q", scale=alt.Scale(domain=[0, 100]), title="Success Rate (%)"),
+        color=alt.Color("Scenario:N", scale=alt.Scale(
+            domain=[picked[0], picked[1]], range=["#1B2A4A", "#00897B"]
+        ), legend=None),
+        tooltip=["Scenario:N", alt.Tooltip("Success Rate (%):Q", format=".1f")],
+    ).properties(height=250)
+    bar_text = alt.Chart(bar_df).mark_text(dy=-12, fontSize=16, fontWeight="bold").encode(
+        x="Scenario:N",
+        y="Success Rate (%):Q",
+        text=alt.Text("Success Rate (%):Q", format=".0f"),
+        color=alt.Color("Scenario:N", scale=alt.Scale(
+            domain=[picked[0], picked[1]], range=["#1B2A4A", "#00897B"]
+        ), legend=None),
+    )
+    st.altair_chart(bar_chart + bar_text, use_container_width=True)
+
+    # ---- Impact attribution: which differences matter most? ----
+    # Group related config keys so we attribute impact to logical changes, not individual knobs
+    _ATTRIB_GROUPS = [
+        ("Ages", ["start_age", "end_age", "retire_age"]),
+        ("Household", ["has_spouse", "spouse_age"]),
+        ("Spending", ["spend_real", "spend_split_on", "spend_essential_real", "spend_discretionary_real"]),
+        ("Spending Phases", ["phase1_end", "phase2_end", "phase1_mult", "phase2_mult", "phase3_mult"]),
+        ("Guardrails", ["gk_on", "gk_upper_pct", "gk_lower_pct", "gk_cut", "gk_raise"]),
+        ("Market Outlook", ["scenario", "manual_override", "override_params"]),
+        ("Return Model", ["return_model", "regime_params", "regime_transition", "regime_initial_probs"]),
+        ("Inflation", ["infl_mu", "infl_vol", "infl_min", "infl_max"]),
+        ("Tax Rates", ["fed_capg", "fed_div", "fed_ord", "state_capg", "state_ord"]),
+        ("Tax Strategy", ["basis_frac", "div_yield", "dist_yield", "tlh_on", "tlh_reduction",
+                          "wd_strategy", "rmd_on", "rmd_start_age", "roth_frac"]),
+        ("Roth Conversions", ["conv_on", "conv_start", "conv_end", "conv_real", "conv_type",
+                              "conv_target_bracket", "conv_irmaa_aware", "conv_irmaa_target_tier", "conv_filing_status"]),
+        ("Gain Harvesting", ["gain_harvest_on", "gain_harvest_filing"]),
+        ("QCDs", ["qcd_on", "qcd_annual_real", "qcd_start_age", "qcd_max_annual"]),
+        ("Glide Path", ["glide_on", "glide_tax_eq_start", "glide_tax_eq_end",
+                        "glide_tax_start_age", "glide_tax_end_age", "glide_ret_same",
+                        "glide_ret_eq_start", "glide_ret_eq_end", "glide_ret_start_age", "glide_ret_end_age"]),
+        ("Annuity 1", ["ann1_on", "ann1_type", "ann1_purchase_age", "ann1_income_start_age",
+                        "ann1_purchase_amount", "ann1_payout_rate", "ann1_cola_on", "ann1_cola_rate", "ann1_cola_match_inflation"]),
+        ("Annuity 2", ["ann2_on", "ann2_type", "ann2_purchase_age", "ann2_income_start_age",
+                        "ann2_purchase_amount", "ann2_payout_rate", "ann2_cola_on", "ann2_cola_rate", "ann2_cola_match_inflation"]),
+        ("Social Security", ["fra", "ss62_1", "ss62_2", "claim1", "claim2"]),
+        ("Mortality", ["mort_on", "spend_drop_after_death", "home_cost_drop_after_death",
+                       "q55_1", "q55_2", "mort_growth"]),
+        ("Health Care", ["pre65_health_on", "pre65_health_real", "medicare_age",
+                         "ltc_on", "ltc_start_age", "ltc_annual_prob", "ltc_cost_real", "ltc_duration_mean", "ltc_duration_sigma"]),
+        ("Home", ["home_on", "home_value0", "home_mu", "home_vol", "home_cost_pct",
+                  "mortgage_balance0", "mortgage_rate", "mortgage_term_years",
+                  "sale_on", "sale_age", "selling_cost_pct", "post_sale_mode", "downsize_fraction", "rent_real"]),
+        ("Inheritance", ["inh_on", "inh_min", "inh_mean", "inh_sigma", "inh_prob", "inh_horizon"]),
+        ("HSA", ["hsa_on", "hsa_balance0", "hsa_like_ret", "hsa_med_real", "hsa_allow_nonmed_65"]),
+        ("Contributions", ["contrib_on", "contrib_ret_annual", "contrib_match_annual"]),
+        ("Fees", ["fee_tax", "fee_ret"]),
+        ("IRMAA", ["irmaa_on", "irmaa_people", "irmaa_base", "irmaa_t1", "irmaa_p1", "irmaa_t2", "irmaa_p2", "irmaa_t3", "irmaa_p3"]),
+        ("Crash Overlay", ["crash_on", "crash_prob", "crash_eq_extra", "crash_reit_extra", "crash_alt_extra", "crash_home_extra"]),
+        ("Sequence Stress", ["seq_on", "seq_drop", "seq_years"]),
+        ("Allocation", []),  # placeholder — holdings checked separately
+    ]
+
+    # Find which groups actually differ
+    def _group_differs(group_keys, cfg_x, cfg_y):
+        for k in group_keys:
+            if cfg_x.get(k) != cfg_y.get(k):
+                return True
+        return False
+
+    def _hold_differs(hold_x, hold_y):
+        for k in ["total_tax", "total_ret", "w_tax", "w_ret"]:
+            if hold_x.get(k) != hold_y.get(k):
+                return True
+        return False
+
+    differing_groups = []
+    for gname, gkeys in _ATTRIB_GROUPS:
+        if gname == "Allocation":
+            if _hold_differs(sc_a["hold"], sc_b["hold"]):
+                differing_groups.append(("Allocation", []))
+        elif _group_differs(gkeys, sc_a["cfg"], sc_b["cfg"]):
+            differing_groups.append((gname, gkeys))
+
+    if differing_groups and len(differing_groups) <= 15:
+        with st.expander("Impact attribution — which differences matter most?", expanded=True):
+            st.caption(
+                f"Starting from **{picked[0]}**, each bar shows how much the success rate changes "
+                f"when switching that one group of assumptions to **{picked[1]}**'s values. "
+                "Uses 2,000 sims per test for speed."
+            )
+            base_success = met_a["pct_success"]
+            attrib_rows = []
+            # Build a fast version of cfg_a
+            cfg_a_fast = dict(cfg_a)
+            cfg_a_fast["n_sims"] = 2000
+            with st.spinner("Running attribution analysis..."):
+                for gname, gkeys in differing_groups:
+                    # Start from A, swap this group to B's values
+                    cfg_test = dict(cfg_a_fast)
+                    hold_test = copy.deepcopy(sc_a["hold"])
+                    if gname == "Allocation":
+                        hold_test = copy.deepcopy(sc_b["hold"])
+                    else:
+                        for k in gkeys:
+                            if k in sc_b["cfg"]:
+                                cfg_test[k] = copy.deepcopy(sc_b["cfg"][k])
+                        # Rebuild scenario_params if we changed market outlook keys
+                        if gname == "Market Outlook":
+                            cfg_test = build_cfg_run(cfg_test)
+                            cfg_test["n_sims"] = 2000
+                    out_test = simulate(cfg_test, hold_test)
+                    ra_test = out_test["ruin_age"]
+                    end_age_test = int(cfg_test.get("end_age", sc_a["cfg"]["end_age"]))
+                    pct_test = 100.0 - float((ra_test <= end_age_test).sum()) / len(ra_test) * 100
+                    delta = pct_test - base_success
+                    attrib_rows.append({"Assumption Group": gname, "Δ Success Rate (pp)": round(delta, 1)})
+
+            if attrib_rows:
+                att_df = pd.DataFrame(attrib_rows)
+                att_df["abs_delta"] = att_df["Δ Success Rate (pp)"].abs()
+                att_df = att_df.sort_values("abs_delta", ascending=False).drop(columns="abs_delta")
+                att_df = att_df[att_df["Δ Success Rate (pp)"] != 0.0].reset_index(drop=True)
+
+                if len(att_df) == 0:
+                    st.info("No single assumption group produces a measurable change in success rate (differences may be too small or offsetting).")
+                else:
+                    att_df["color"] = att_df["Δ Success Rate (pp)"].apply(lambda x: "Helps" if x > 0 else "Hurts")
+                    bar = alt.Chart(att_df).mark_bar(cornerRadius=4).encode(
+                        y=alt.Y("Assumption Group:N", sort=None, title=None,
+                                axis=alt.Axis(labelLimit=0, labelOverlap=False)),
+                        x=alt.X("Δ Success Rate (pp):Q", title=f"Change in success rate (pp) from {picked[0]} → {picked[1]}"),
+                        color=alt.Color("color:N", scale=alt.Scale(
+                            domain=["Helps", "Hurts"], range=["#00897B", "#E53935"]
+                        ), legend=alt.Legend(title=None, orient="top")),
+                        tooltip=["Assumption Group:N", alt.Tooltip("Δ Success Rate (pp):Q", format="+.1f")],
+                    ).properties(height=max(len(att_df) * 40, 150))
+                    zero_rule = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(
+                        color="#666", strokeDash=[4, 2]
+                    ).encode(x="x:Q")
+                    labels = alt.Chart(att_df).mark_text(
+                        align=alt.expr(alt.expr.if_(alt.datum["Δ Success Rate (pp)"] >= 0, "left", "right")),
+                        dx=alt.expr(alt.expr.if_(alt.datum["Δ Success Rate (pp)"] >= 0, 4, -4)),
+                        fontSize=12, fontWeight="bold",
+                    ).encode(
+                        y=alt.Y("Assumption Group:N", sort=None),
+                        x="Δ Success Rate (pp):Q",
+                        text=alt.Text("Δ Success Rate (pp):Q", format="+.1f"),
+                        color=alt.Color("color:N", scale=alt.Scale(
+                            domain=["Helps", "Hurts"], range=["#00897B", "#E53935"]
+                        ), legend=None),
+                    )
+                    st.altair_chart(bar + zero_rule + labels, use_container_width=True)
+
+                    st.caption("**Note:** Individual impacts may not sum to the total difference because assumptions can interact.")
+    elif len(differing_groups) > 15:
+        st.info("Too many assumption groups differ to run attribution analysis. Try comparing scenarios with fewer differences.")
+
+    # ---- Side-by-side fan charts (shared y-axis) ----
+    st.html('<div class="pro-section-title">Wealth Projections (Liquid Assets, Nominal)</div>')
+
+    # Compute shared y_max for wealth charts
+    p95_a = np.percentile(out_a["liquid"], 95, axis=0).max() / 1e6
+    p95_b = np.percentile(out_b["liquid"], 95, axis=0).max() / 1e6
+    wealth_y_max = max(p95_a, p95_b) * 1.05
+
+    fc_a, fc_b = st.columns(2)
+    with fc_a:
+        st.markdown(f"**{picked[0]}**")
+        render_wealth_fan_chart(out_a["liquid"], out_a["ages"],
+                                title_label="Liquid ($M)",
+                                retire_age=int(sc_a["cfg"]["retire_age"]),
+                                y_max=wealth_y_max)
+    with fc_b:
+        st.markdown(f"**{picked[1]}**")
+        render_wealth_fan_chart(out_b["liquid"], out_b["ages"],
+                                title_label="Liquid ($M)",
+                                retire_age=int(sc_b["cfg"]["retire_age"]),
+                                y_max=wealth_y_max)
+
+    # ---- Side-by-side spending fan charts ----
+    st.html('<div class="pro-section-title">Spending Projections (Real Dollars)</div>')
+
+    # Compute shared y_max for spending charts
+    def _spending_p90_max(out, cfg):
+        spend = out["decomp"]["spend_real_track"]
+        ridx = max(0, int(cfg["retire_age"]) - int(cfg["start_age"]))
+        post = spend[:, ridx:]
+        if post.shape[1] < 2:
+            return 0
+        return np.percentile(post, 90, axis=0).max() / 1e3
+
+    sp_max_a = _spending_p90_max(out_a, sc_a["cfg"])
+    sp_max_b = _spending_p90_max(out_b, sc_b["cfg"])
+    spend_y_max = max(sp_max_a, sp_max_b) * 1.10 if max(sp_max_a, sp_max_b) > 0 else None
+
+    sc_a_col, sc_b_col = st.columns(2)
+    with sc_a_col:
+        st.markdown(f"**{picked[0]}**")
+        render_spending_fan_chart(out_a, cfg_a, y_max=spend_y_max)
+    with sc_b_col:
+        st.markdown(f"**{picked[1]}**")
+        render_spending_fan_chart(out_b, cfg_b, y_max=spend_y_max)
+
+
 # ============================================================
 # SECTION 9: Navigation entrypoint
 # ============================================================
@@ -3513,6 +3961,7 @@ pg = st.navigation(
         st.Page(dashboard_page, title="Results", icon=":material/dashboard:", default=True),
         st.Page(plan_setup_page, title="Assumptions", icon=":material/tune:"),
         st.Page(deep_dive_page, title="Deep Dive", icon=":material/analytics:"),
+        st.Page(compare_page, title="Compare", icon=":material/compare_arrows:"),
     ],
     position="top",
 )
