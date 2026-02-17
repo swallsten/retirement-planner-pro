@@ -191,6 +191,180 @@ def irmaa_monthly_per_person(magi: np.ndarray, base: float, schedule: List[Tuple
         prem = np.where(magi >= thresh, monthly, prem)
     return prem
 
+
+# ---------- Tax Engine (Phase 1) ----------
+
+def _bracket_tax(taxable_income: np.ndarray, brackets: list,
+                 infl_factor: np.ndarray) -> np.ndarray:
+    """Compute tax on *taxable_income* using inflation-adjusted brackets.
+    All inputs are (n,) arrays. Returns (n,) tax owed."""
+    tax = np.zeros_like(taxable_income)
+    for i in range(len(brackets)):
+        thresh = brackets[i][0] * infl_factor
+        rate = brackets[i][1]
+        if i + 1 < len(brackets):
+            next_thresh = brackets[i + 1][0] * infl_factor
+        else:
+            next_thresh = np.full_like(taxable_income, 1e15)
+        bracket_income = np.clip(taxable_income - thresh, 0, next_thresh - thresh)
+        tax += bracket_income * rate
+    return tax
+
+
+def _bracket_tax_stacked(base_income: np.ndarray, investment_income: np.ndarray,
+                         brackets: list, infl_factor: np.ndarray) -> np.ndarray:
+    """Compute tax on *investment_income* that stacks on top of *base_income*.
+    Uses LTCG/QD bracket schedule. All (n,) arrays."""
+    # Tax on (base + investment) minus tax on base alone
+    total = base_income + investment_income
+    tax_total = _bracket_tax(total, brackets, infl_factor)
+    tax_base = _bracket_tax(base_income, brackets, infl_factor)
+    return tax_total - tax_base
+
+
+def _marginal_bracket(taxable_income: np.ndarray, brackets: list,
+                      infl_factor: np.ndarray) -> np.ndarray:
+    """Return the marginal ordinary tax rate for each simulation path."""
+    rate = np.full_like(taxable_income, brackets[0][1])
+    for thresh_base, r in brackets:
+        thresh = thresh_base * infl_factor
+        rate = np.where(taxable_income >= thresh, r, rate)
+    return rate
+
+
+def compute_ss_taxable(ss_gross: np.ndarray, other_income: np.ndarray,
+                       filing_status: str, infl_factor: np.ndarray) -> np.ndarray:
+    """Compute the taxable portion of Social Security benefits using
+    the provisional-income method. All inputs (n,) arrays."""
+    if filing_status == "mfj":
+        t1, t2 = SS_PROVISIONAL_MFJ
+    else:
+        t1, t2 = SS_PROVISIONAL_SINGLE
+    t1_adj = t1 * infl_factor
+    t2_adj = t2 * infl_factor
+
+    provisional = other_income + 0.5 * ss_gross
+
+    # Tier 1: 50% of excess above t1
+    tier1 = np.clip(provisional - t1_adj, 0, t2_adj - t1_adj) * 0.50
+    # Tier 2: 85% of excess above t2
+    tier2 = np.maximum(0.0, provisional - t2_adj) * 0.85
+    taxable = tier1 + tier2
+    # Cap at 85% of gross SS
+    return np.minimum(taxable, 0.85 * ss_gross)
+
+
+def compute_federal_tax(
+    ordinary_income: np.ndarray,     # wages, trad WD, RMD (taxable), conversions, annuity
+    qualified_dividends: np.ndarray, # qual divs from taxable account
+    ltcg_realized: np.ndarray,       # LTCG from taxable withdrawals + gain harvesting
+    ss_gross: np.ndarray,            # total SS received (before taxation calc)
+    filing_status: str,              # "mfj" or "single"
+    infl_factor: np.ndarray,         # inflation index for bracket adjustment
+    niit_on: bool,
+) -> dict:
+    """Vectorized federal tax computation. All array inputs are (n,).
+    Returns dict with component taxes and diagnostic fields."""
+    n = len(ordinary_income)
+
+    # 1. SS taxation via provisional income
+    other_for_provisional = ordinary_income + qualified_dividends + ltcg_realized
+    ss_taxable = compute_ss_taxable(ss_gross, other_for_provisional,
+                                     filing_status, infl_factor)
+
+    # 2. Total ordinary = ordinary_income + ss_taxable
+    ordinary_total = ordinary_income + ss_taxable
+
+    # 3. Standard deduction (inflation-adjusted)
+    if filing_status == "mfj":
+        std_ded = STANDARD_DEDUCTION_MFJ_2024 * infl_factor
+        brackets_ord = FED_BRACKETS_MFJ_2024
+        brackets_ltcg = LTCG_BRACKETS_MFJ_2024
+        niit_thresh = NIIT_THRESHOLD_MFJ
+    else:
+        std_ded = STANDARD_DEDUCTION_SINGLE_2024 * infl_factor
+        brackets_ord = FED_BRACKETS_SINGLE_2024
+        brackets_ltcg = LTCG_BRACKETS_SINGLE_2024
+        niit_thresh = NIIT_THRESHOLD_SINGLE
+
+    # 4. Taxable ordinary income
+    taxable_ordinary = np.maximum(0.0, ordinary_total - std_ded)
+
+    # 5. Federal ordinary income tax (brackets)
+    fed_ordinary_tax = _bracket_tax(taxable_ordinary, brackets_ord, infl_factor)
+
+    # 6. LTCG/QD tax — stacks on top of ordinary taxable income
+    investment_income = qualified_dividends + ltcg_realized
+    fed_ltcg_tax = _bracket_tax_stacked(taxable_ordinary, investment_income,
+                                         brackets_ltcg, infl_factor)
+
+    # 7. NIIT: 3.8% on net investment income above threshold
+    niit = np.zeros(n)
+    if niit_on:
+        magi = ordinary_total + qualified_dividends + ltcg_realized
+        niit_base = np.maximum(0.0, magi - niit_thresh * infl_factor)
+        niit = np.minimum(niit_base, investment_income) * NIIT_RATE
+
+    # 8. Total federal
+    fed_total = fed_ordinary_tax + fed_ltcg_tax + niit
+
+    # 9. MAGI for IRMAA / ACA purposes
+    magi = ordinary_total + qualified_dividends + ltcg_realized
+
+    # 10. Marginal bracket & effective rate
+    marginal = _marginal_bracket(taxable_ordinary, brackets_ord, infl_factor)
+    total_income = taxable_ordinary + investment_income
+    effective_rate = np.where(total_income > 0, fed_total / total_income, 0.0)
+
+    return {
+        "fed_ordinary_tax": fed_ordinary_tax,
+        "fed_ltcg_tax": fed_ltcg_tax,
+        "niit": niit,
+        "fed_total": fed_total,
+        "ss_taxable": ss_taxable,
+        "taxable_ordinary": taxable_ordinary,
+        "magi": magi,
+        "marginal_bracket": marginal,
+        "effective_rate": effective_rate,
+        "std_deduction": std_ded,
+    }
+
+
+def compute_aca_premium(
+    magi: np.ndarray, household_size: int,
+    benchmark_premium_real: float, infl_factor: np.ndarray,
+    subsidy_schedule: list,
+) -> dict:
+    """Compute ACA net premium using MAGI and FPL-based subsidy schedule.
+    All array inputs (n,). Returns dict with gross/subsidy/net arrays."""
+    fpl_base = float(FPL_2024.get(household_size, FPL_2024[2]))
+    fpl = fpl_base * infl_factor
+    fpl_pct = np.where(fpl > 0, magi / fpl, 9999.0)
+
+    # Interpolate contribution rate from schedule
+    contribution_rate = np.ones_like(magi)  # default: no subsidy
+    for i in range(len(subsidy_schedule) - 1):
+        lo_pct, lo_rate = subsidy_schedule[i]
+        hi_pct, hi_rate = subsidy_schedule[i + 1]
+        in_band = (fpl_pct >= lo_pct) & (fpl_pct < hi_pct)
+        if in_band.any():
+            frac = np.clip((fpl_pct - lo_pct) / max(0.001, hi_pct - lo_pct), 0, 1)
+            contribution_rate[in_band] = (lo_rate + frac * (hi_rate - lo_rate))[in_band]
+    # Below 100% FPL: Medicaid gap (no ACA subsidy in practice, treat as $0 premium)
+    contribution_rate = np.where(fpl_pct < 1.0, 0.0, contribution_rate)
+
+    household_contribution = contribution_rate * magi
+    benchmark_nom = benchmark_premium_real * infl_factor
+    subsidy = np.maximum(0.0, benchmark_nom - household_contribution)
+    net_premium = np.maximum(0.0, benchmark_nom - subsidy)
+
+    return {
+        "gross_premium": benchmark_nom,
+        "subsidy": subsidy,
+        "net_premium": net_premium,
+        "fpl_pct": fpl_pct,
+    }
+
 def gk_update(spend_real: np.ndarray,
               base_spend_real: float,
               port_real: np.ndarray,
@@ -234,6 +408,74 @@ def build_cov(eq_vol, reit_vol, bond_vol, alt_vol, infl_vol, home_vol,
     setc(6, 0, corr_home_eq)
 
     return np.diag(vol) @ corr @ np.diag(vol)
+
+def build_cov_granular(sub_vols: list, reit_vol, bond_vol, alt_vol, infl_vol, home_vol,
+                       sub_corr: dict, sub_classes: list,
+                       corr_eq_infl, corr_reit_infl, corr_bond_infl, corr_alt_infl,
+                       corr_home_infl, corr_home_eq) -> np.ndarray:
+    """Build expanded covariance matrix with 6 equity sub-buckets instead of 1.
+
+    Layout: [sub0, sub1, ..., sub5, REIT, Bond, Alt, Cash, Inflation, Home] = 12 assets.
+    """
+    nsub = len(sub_classes)
+    dim = nsub + 6  # 6 equity subs + REIT + Bond + Alt + Cash + Inflation + Home
+    vol = np.zeros(dim)
+    for i, v in enumerate(sub_vols):
+        vol[i] = v
+    vol[nsub]     = reit_vol   # REIT
+    vol[nsub + 1] = bond_vol   # Bond
+    vol[nsub + 2] = alt_vol    # Alt
+    vol[nsub + 3] = 0.002      # Cash
+    vol[nsub + 4] = infl_vol   # Inflation
+    vol[nsub + 5] = home_vol   # Home
+
+    corr = np.eye(dim, dtype=float)
+
+    def setc(i, j, v):
+        corr[i, j] = corr[j, i] = v
+
+    # Equity sub-bucket cross-correlations
+    for i in range(nsub):
+        for j in range(i + 1, nsub):
+            pair = (sub_classes[i], sub_classes[j])
+            rpair = (sub_classes[j], sub_classes[i])
+            c = sub_corr.get(pair, sub_corr.get(rpair, 0.5))
+            setc(i, j, c)
+
+    # Sub-buckets to REIT: each sub has ~same corr as aggregate Eq to REIT
+    eq_reit_corr = BASE_CORR[("Eq", "REIT")]
+    eq_bond_corr = BASE_CORR[("Eq", "Bond")]
+    eq_alt_corr  = BASE_CORR[("Eq", "Alt")]
+    for i in range(nsub):
+        setc(i, nsub,     eq_reit_corr)       # sub to REIT
+        setc(i, nsub + 1, eq_bond_corr)       # sub to Bond
+        setc(i, nsub + 2, eq_alt_corr)        # sub to Alt
+        setc(i, nsub + 4, corr_eq_infl)       # sub to Inflation
+        setc(i, nsub + 5, corr_home_eq)       # sub to Home
+
+    # REIT, Bond, Alt inter-correlations
+    setc(nsub, nsub + 1, BASE_CORR[("REIT", "Bond")])
+    setc(nsub, nsub + 2, BASE_CORR[("REIT", "Alt")])
+    setc(nsub + 1, nsub + 2, BASE_CORR[("Bond", "Alt")])
+
+    # REIT, Bond, Alt to Inflation
+    setc(nsub,     nsub + 4, corr_reit_infl)
+    setc(nsub + 1, nsub + 4, corr_bond_infl)
+    setc(nsub + 2, nsub + 4, corr_alt_infl)
+
+    # Home to Inflation, Home to REIT
+    setc(nsub + 5, nsub + 4, corr_home_infl)
+
+    # Ensure positive semi-definite via eigenvalue clipping
+    eigvals, eigvecs = np.linalg.eigh(corr)
+    eigvals = np.maximum(eigvals, 1e-8)
+    corr = eigvecs @ np.diag(eigvals) @ eigvecs.T
+    # Re-normalize to correlation matrix
+    d = np.sqrt(np.diag(corr))
+    corr = corr / np.outer(d, d)
+
+    return np.diag(vol) @ corr @ np.diag(vol)
+
 
 def draw_shocks(rng, n, cov, dist_type: str, t_df: int) -> np.ndarray:
     if dist_type == "t":
@@ -344,6 +586,88 @@ LTCG_0PCT_THRESHOLD_MFJ_2024 = 94050
 LTCG_0PCT_THRESHOLD_SINGLE_2024 = 47025
 STANDARD_DEDUCTION_MFJ_2024 = 29200
 STANDARD_DEDUCTION_SINGLE_2024 = 14600
+
+# ---------- Tax Engine Constants (Phase 1) ----------
+# LTCG / Qualified Dividend brackets (2024)
+LTCG_BRACKETS_MFJ_2024 = [(0, 0.00), (94050, 0.15), (583750, 0.20)]
+LTCG_BRACKETS_SINGLE_2024 = [(0, 0.00), (47025, 0.15), (518900, 0.20)]
+
+# Net Investment Income Tax (NIIT)
+NIIT_THRESHOLD_MFJ = 250000
+NIIT_THRESHOLD_SINGLE = 200000
+NIIT_RATE = 0.038
+
+# Social Security provisional income thresholds
+SS_PROVISIONAL_MFJ = (32000, 44000)    # (50% threshold, 85% threshold)
+SS_PROVISIONAL_SINGLE = (25000, 34000)
+
+# IRMAA Part B surcharges (monthly per person, 2024 MFJ)
+IRMAA_PART_B_2024_MFJ = [
+    (206000, 244.60), (258000, 349.40), (322000, 454.20),
+    (386000, 559.00), (750000, 594.00),
+]
+IRMAA_PART_B_2024_SINGLE = [
+    (103000, 244.60), (129000, 349.40), (161000, 454.20),
+    (193000, 559.00), (500000, 594.00),
+]
+# IRMAA Part D surcharges (monthly per person, 2024)
+IRMAA_PART_D_2024_MFJ = [
+    (206000, 12.90), (258000, 33.30), (322000, 53.80),
+    (386000, 74.20), (750000, 81.00),
+]
+IRMAA_PART_D_2024_SINGLE = [
+    (103000, 12.90), (129000, 33.30), (161000, 53.80),
+    (193000, 74.20), (500000, 81.00),
+]
+
+# ACA constants (2024)
+FPL_2024 = {1: 15060, 2: 20440, 3: 25820, 4: 31200}
+ACA_SUBSIDY_SCHEDULE_2024 = [
+    (1.00, 0.00),   # ≤100% FPL: Medicaid eligible
+    (1.50, 0.02),   # 100-150%: 0-2% of income
+    (2.00, 0.04),   # 150-200%: 2-4%
+    (2.50, 0.065),  # 200-250%: 4-6.5%
+    (3.00, 0.085),  # 250-300%: 6.5-8.5%
+    (4.00, 0.085),  # 300-400%: 8.5% (cap)
+    (9999, 1.00),   # >400% FPL: no subsidy
+]
+
+# Equity sub-bucket constants
+EQUITY_SUB_CLASSES = ["US Large Blend", "US Small", "Intl Developed", "Emerging", "US Value", "Tech/AI"]
+EQUITY_SUB_DEFAULTS = {
+    "US Large Blend": {"mu": 0.07, "vol": 0.16, "weight": 0.45},
+    "US Small":       {"mu": 0.08, "vol": 0.20, "weight": 0.10},
+    "Intl Developed": {"mu": 0.06, "vol": 0.17, "weight": 0.20},
+    "Emerging":       {"mu": 0.08, "vol": 0.24, "weight": 0.10},
+    "US Value":       {"mu": 0.075, "vol": 0.17, "weight": 0.10},
+    "Tech/AI":        {"mu": 0.10, "vol": 0.25, "weight": 0.05},
+}
+EQUITY_SUB_CORR = {
+    ("US Large Blend", "US Small"): 0.85,
+    ("US Large Blend", "Intl Developed"): 0.70,
+    ("US Large Blend", "Emerging"): 0.60,
+    ("US Large Blend", "US Value"): 0.80,
+    ("US Large Blend", "Tech/AI"): 0.85,
+    ("US Small", "Intl Developed"): 0.65,
+    ("US Small", "Emerging"): 0.55,
+    ("US Small", "US Value"): 0.80,
+    ("US Small", "Tech/AI"): 0.75,
+    ("Intl Developed", "Emerging"): 0.75,
+    ("Intl Developed", "US Value"): 0.65,
+    ("Intl Developed", "Tech/AI"): 0.60,
+    ("Emerging", "US Value"): 0.55,
+    ("Emerging", "Tech/AI"): 0.55,
+    ("US Value", "Tech/AI"): 0.60,
+}
+# Ticker heuristic mapping for CSV uploads
+TICKER_HEURISTICS = {
+    "VTI|VTSAX|SWTSX|ITOT|SPY|IVV|VOO": "US Large Blend",
+    "VB|VSMAX|SCHA|IJR|IWM": "US Small",
+    "VXUS|VTIAX|IXUS|EFA|IEFA": "Intl Developed",
+    "VWO|VEMAX|IEMG|EEM": "Emerging",
+    "VTV|VTRIX|VONV|IWD|VLUE": "US Value",
+    "QQQ|VGT|XLK|ARKK|SMH|SOXX": "Tech/AI",
+}
 
 
 def bracket_fill_conversion(ordinary_income: np.ndarray, trad_balance: np.ndarray,
@@ -490,6 +814,33 @@ def simulate(cfg: dict, hold: dict) -> dict:
                     float(cfg["corr_eq_infl"]), float(cfg["corr_reit_infl"]), float(cfg["corr_bond_infl"]), float(cfg["corr_alt_infl"]),
                     float(cfg["corr_home_infl"]), float(cfg["corr_home_eq"]))
 
+    # Equity sub-bucket granularity (Phase 5)
+    equity_granular = bool(cfg.get("equity_granular_on", False))
+    sub_weights_raw = cfg.get("equity_sub_weights", {k: v["weight"] for k, v in EQUITY_SUB_DEFAULTS.items()})
+    sub_mu_raw = cfg.get("equity_sub_mu", {k: v["mu"] for k, v in EQUITY_SUB_DEFAULTS.items()})
+    sub_vol_raw = cfg.get("equity_sub_vol", {k: v["vol"] for k, v in EQUITY_SUB_DEFAULTS.items()})
+    tech_bubble_on = bool(cfg.get("tech_bubble_on", False)) and equity_granular
+    tech_bubble_prob = float(cfg.get("tech_bubble_prob", 0.03))
+    tech_bubble_extra = float(cfg.get("tech_bubble_extra_drop", -0.50))
+
+    if equity_granular:
+        nsub = len(EQUITY_SUB_CLASSES)
+        sub_weights = np.array([float(sub_weights_raw.get(c, 0.0)) for c in EQUITY_SUB_CLASSES])
+        wsum = sub_weights.sum()
+        if wsum > 0:
+            sub_weights = sub_weights / wsum  # normalize to 1
+        sub_mus = np.array([float(sub_mu_raw.get(c, 0.07)) for c in EQUITY_SUB_CLASSES])
+        sub_vols_arr = [float(sub_vol_raw.get(c, 0.16)) for c in EQUITY_SUB_CLASSES]
+        cov_granular = build_cov_granular(
+            sub_vols_arr, reit_vol, bond_vol, alt_vol, infl_vol, home_vol,
+            EQUITY_SUB_CORR, EQUITY_SUB_CLASSES,
+            float(cfg["corr_eq_infl"]), float(cfg["corr_reit_infl"]),
+            float(cfg["corr_bond_infl"]), float(cfg["corr_alt_infl"]),
+            float(cfg["corr_home_infl"]), float(cfg["corr_home_eq"]))
+
+        # Weighted-average mu for the blended equity return (used by the rest of the engine)
+        eq_mu_blended = float(np.dot(sub_weights, sub_mus))
+
     # Regime-switching model setup
     use_regime = str(cfg.get("return_model", "standard")) == "regime"
     regime_states = None
@@ -515,7 +866,20 @@ def simulate(cfg: dict, hold: dict) -> dict:
             ])
     regime_track = np.zeros((n, T+1), dtype=int)  # track which regime
 
-    # taxes
+    # taxes — tax engine or legacy flat rates
+    use_tax_engine = bool(cfg.get("tax_engine_on", True))
+    filing_status = str(cfg.get("filing_status", "mfj"))
+    niit_on = bool(cfg.get("niit_on", False))
+    state_rate_ord = float(cfg.get("state_rate_ordinary", float(cfg.get("state_ord", 0.05))))
+    state_rate_cg = float(cfg.get("state_rate_capgains", float(cfg.get("state_capg", 0.05))))
+
+    # ACA
+    aca_mode = str(cfg.get("aca_mode", "simple"))
+    aca_household_size = int(cfg.get("aca_household_size", 2))
+    aca_benchmark = float(cfg.get("aca_benchmark_premium_real", 20000.0))
+    aca_schedule = cfg.get("aca_subsidy_schedule", list(ACA_SUBSIDY_SCHEDULE_2024))
+
+    # Legacy flat rates (fallback when tax engine off)
     eff_capg = min(0.95, max(0.0, float(cfg["fed_capg"]) + float(cfg["state_capg"])))
     eff_div = min(0.95, max(0.0, float(cfg["fed_div"]) + float(cfg["state_capg"])))
     eff_ord = min(0.95, max(0.0, float(cfg["fed_ord"]) + float(cfg["state_ord"])))
@@ -571,7 +935,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
     conv_target_bracket = float(cfg.get("conv_target_bracket", 0.24))
     conv_irmaa_aware = bool(cfg.get("conv_irmaa_aware", True))
     conv_irmaa_target_tier = int(cfg.get("conv_irmaa_target_tier", 0))
-    conv_filing_status = str(cfg.get("conv_filing_status", "mfj"))
+    conv_filing_status = filing_status if use_tax_engine else str(cfg.get("conv_filing_status", "mfj"))
     if conv_filing_status == "mfj":
         conv_brackets = FED_BRACKETS_MFJ_2024
         conv_irmaa_tiers = IRMAA_MAGI_TIERS_MFJ_2024
@@ -592,7 +956,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
 
     # Gain harvesting
     gain_harvest_on = bool(cfg.get("gain_harvest_on", False))
-    gain_harvest_filing = str(cfg.get("gain_harvest_filing", "mfj"))
+    gain_harvest_filing = filing_status if use_tax_engine else str(cfg.get("gain_harvest_filing", "mfj"))
     if gain_harvest_filing == "mfj":
         ltcg_0pct_threshold = LTCG_0PCT_THRESHOLD_MFJ_2024
         std_deduction = STANDARD_DEDUCTION_MFJ_2024
@@ -725,6 +1089,25 @@ def simulate(cfg: dict, hold: dict) -> dict:
     discretionary_spend_track = np.zeros((n, T+1))
     essential_funded_track = np.zeros((n, T+1))
 
+    # Tax engine trackers
+    fed_tax_track = np.zeros((n, T+1))
+    state_tax_track = np.zeros((n, T+1))
+    niit_track = np.zeros((n, T+1))
+    ss_taxable_track = np.zeros((n, T+1))
+    effective_rate_track = np.zeros((n, T+1))
+    marginal_bracket_track = np.zeros((n, T+1))
+    ltcg_realized_track = np.zeros((n, T+1))
+    qual_div_track = np.zeros((n, T+1))
+
+    # ACA trackers
+    aca_gross_track = np.zeros((n, T+1))
+    aca_subsidy_track = np.zeros((n, T+1))
+    aca_net_track = np.zeros((n, T+1))
+
+    # IRMAA Part B/D trackers
+    irmaa_part_b_track = np.zeros((n, T+1))
+    irmaa_part_d_track = np.zeros((n, T+1))
+
     for t in range(1, T+1):
         age = int(ages[t-1])
         years_left = int(end_age - age)
@@ -735,7 +1118,32 @@ def simulate(cfg: dict, hold: dict) -> dict:
         one_alive = alive1 ^ alive2
         none_alive = ~(alive1 | alive2)
 
-        if use_regime and t <= regime_states.shape[1]:
+        if equity_granular and not (use_regime and t <= regime_states.shape[1]):
+            # Equity sub-bucket model: draw from expanded covariance matrix
+            g_shocks = draw_shocks(rng, n, cov_granular, str(cfg["dist_type"]), int(cfg["t_df"]))
+            # g_shocks layout: [sub0..sub5, REIT, Bond, Alt, Cash, Inflation, Home]
+            sub_returns = np.zeros((n, nsub))
+            for si_idx in range(nsub):
+                sub_returns[:, si_idx] = sub_mus[si_idx] + g_shocks[:, si_idx]
+            r_eq = np.dot(sub_returns, sub_weights)  # weighted-average equity return
+            r_reit = reit_mu + g_shocks[:, nsub]
+            r_bond = bond_mu + g_shocks[:, nsub + 1]
+            r_alt = alt_mu + g_shocks[:, nsub + 2]
+            r_cash = cash_mu + g_shocks[:, nsub + 3]
+            infl = np.clip(infl_mu + g_shocks[:, nsub + 4], infl_min, infl_max)
+            home_app = home_mu + g_shocks[:, nsub + 5]
+
+            # Tech/AI bubble stress overlay
+            if tech_bubble_on:
+                tech_idx = EQUITY_SUB_CLASSES.index("Tech/AI")
+                tech_crash = rng.uniform(size=n) < tech_bubble_prob
+                if tech_crash.any():
+                    sub_returns[tech_crash, tech_idx] = np.clip(
+                        sub_returns[tech_crash, tech_idx] + tech_bubble_extra, -0.95, 2.0)
+                    # Recompute blended equity return for affected paths
+                    r_eq[tech_crash] = np.dot(sub_returns[tech_crash], sub_weights)
+
+        elif use_regime and t <= regime_states.shape[1]:
             # Regime-switching: draw shocks per-state, combine
             r_eq = np.zeros(n)
             r_reit = np.zeros(n)
@@ -1052,19 +1460,14 @@ def simulate(cfg: dict, hold: dict) -> dict:
                 conv_gross[one_alive] *= 0.60
                 conv_gross[none_alive] = 0.0
             conv_gross = np.minimum(conv_gross, trad_prev)
-            conv_tax = conv_gross * eff_ord
-            pay_from_tax = np.minimum(tax_prev, conv_tax)
-            tax_prev -= pay_from_tax
-            remaining = conv_tax - pay_from_tax
-            trad_prev = np.maximum(0.0, trad_prev - remaining)
+            # Conversion: move from trad to roth. Tax paid separately below.
             trad_prev = np.maximum(0.0, trad_prev - conv_gross)
             roth_prev = roth_prev + conv_gross
         conv_gross_track[:, t] = conv_gross
 
-        inflows_nom = ss_real * infl_index[:, t-1]
-        ss_nom_track[:, t] = inflows_nom
-        # Add annuity income to inflows
-        inflows_nom = inflows_nom + ann_income_this_year
+        ss_nom = ss_real * infl_index[:, t-1]
+        ss_nom_track[:, t] = ss_nom
+        inflows_nom = ss_nom + ann_income_this_year
 
         need_before = np.maximum(0.0, outflow_nom - inflows_nom)
         if mort_on:
@@ -1086,98 +1489,241 @@ def simulate(cfg: dict, hold: dict) -> dict:
                 qcd_amount[none_alive] = 0.0
         qcd_track[:, t] = qcd_amount
         taxable_rmd = gross_rmd - qcd_amount
-
-        net_rmd_cash = taxable_rmd * (1 - eff_ord)
-        used_rmd = np.minimum(net_rmd_cash, need_before)
-        need = np.maximum(0.0, need_before - used_rmd)
-        excess = np.maximum(0.0, net_rmd_cash - used_rmd)
-        tax_prev += excess
-        bas_prev += excess
         trad_prev = np.maximum(0.0, trad_prev - gross_rmd)
+
+        # Compute income components for tax engine
+        div_yield_val = float(cfg["div_yield"])
+        dist_yield_val = float(cfg["dist_yield"])
+        qual_divs = tax_prev * div_yield_val           # qualified dividends
+        infl_factor_t = infl_index[:, t-1]
 
         # Gain harvesting: step up basis when in 0% LTCG bracket
         gain_harvested = np.zeros(n)
         if gain_harvest_on and age >= retire_age:
-            # Estimate taxable ordinary income
-            ss_for_tax = 0.85 * ss_real * infl_index[:, t-1]
-            div_inc = tax_prev * (float(cfg["div_yield"]) + float(cfg["dist_yield"]))
+            ss_for_tax = 0.85 * ss_nom
+            div_inc = tax_prev * (div_yield_val + dist_yield_val)
             ordinary_income_est = ss_for_tax + taxable_rmd + conv_gross + ann_income_this_year + div_inc
-            # Subtract inflation-adjusted standard deduction
-            std_ded_adj = std_deduction * infl_index[:, t-1]
+            std_ded_adj = std_deduction * infl_factor_t
             taxable_income_est = np.maximum(0.0, ordinary_income_est - std_ded_adj)
-            # Room in 0% LTCG bracket
-            ltcg_threshold_adj = ltcg_0pct_threshold * infl_index[:, t-1]
+            ltcg_threshold_adj = ltcg_0pct_threshold * infl_factor_t
             room = np.maximum(0.0, ltcg_threshold_adj - taxable_income_est)
-            # Harvest: step up basis (no balance change, no cash)
             unrealized_gain = np.maximum(0.0, tax_prev - bas_prev)
             gain_harvested = np.minimum(room, unrealized_gain)
-            bas_prev += gain_harvested  # step up basis
+            bas_prev += gain_harvested
             if mort_on:
                 gain_harvested[none_alive] = 0.0
         gain_harvest_track[:, t] = gain_harvested
 
-        # IRMAA
-        if irmaa_on and age >= medicare_age:
-            magi = taxable_rmd + conv_gross + ann_income_this_year + tax_prev * (float(cfg["div_yield"]) + float(cfg["dist_yield"]))
-            magi_track[:, t] = magi
-            prem = irmaa_monthly_per_person(magi, irmaa_base, irmaa_schedule)
-            irmaa_nom = prem * 12.0 * irmaa_people
-            if mort_on:
-                irmaa_nom[one_alive] *= 0.60
-                irmaa_nom[none_alive] = 0.0
-            need += irmaa_nom
-            irmaa_paid_track[:, t] = irmaa_nom
-            tier = np.zeros(n)
-            for i, (th, _) in enumerate(irmaa_schedule, start=1):
-                tier = np.where(magi >= th, i, tier)
-            tier_track[:, t] = tier
+        # ================================================================
+        # TAX ENGINE: compute taxes, then determine net RMD, IRMAA, and withdrawals
+        # ================================================================
+        # Phase 1 estimate (before knowing withdrawal amounts): use RMD + conversion income
+        ordinary_income_pre = taxable_rmd + conv_gross + ann_income_this_year
+        ltcg_pre = tax_prev * dist_yield_val  # cap gains distributions (not yet withdrawal gains)
 
         # Optional: allow non-medical HSA withdrawals after 65
         gross_hsa_nonmed = np.zeros(n)
         if hsa_on and hsa_allow_nonmed_65 and age >= 65:
             pass
 
-        # withdrawals (taxable/trad/roth)
-        gain = np.maximum(0.0, tax_prev - bas_prev)
-        gain_frac = np.where(tax_prev > 0, np.minimum(1.0, gain / tax_prev), 0.0)
-        denom_tax = np.maximum(1e-6, 1 - gain_frac * eff_capg_wd)
-        denom_trad = np.maximum(1e-6, 1 - eff_ord)
+        if use_tax_engine and age >= retire_age:
+            # --- Pass 1: estimate taxes before withdrawal ---
+            tax_result_1 = compute_federal_tax(
+                ordinary_income_pre, qual_divs, ltcg_pre, ss_nom,
+                filing_status, infl_factor_t, niit_on)
+            state_tax_1 = state_rate_ord * np.maximum(0.0, tax_result_1["magi"] - tax_result_1["std_deduction"])
+            total_tax_1 = tax_result_1["fed_total"] + state_tax_1
+            magi_1 = tax_result_1["magi"]
+            magi_track[:, t] = magi_1
 
-        gross_tax = np.zeros(n)
-        gross_trad = np.zeros(n)
-        gross_roth = np.zeros(n)
+            # Estimate effective tax on pre-withdrawal income using marginal rate
+            marg_1 = tax_result_1["marginal_bracket"]
+            eff_ord_est = marg_1 + state_rate_ord
 
-        if cfg["wd_strategy"] == "taxable_first":
-            take_tax = np.minimum(tax_prev, need / denom_tax)
-            gross_tax += take_tax
-            need2 = np.maximum(0.0, need - take_tax * denom_tax)
+            # Conversion tax: deduct from taxable account or absorb from trad
+            conv_tax = conv_gross * eff_ord_est
+            pay_from_tax = np.minimum(tax_prev, conv_tax)
+            tax_prev -= pay_from_tax
+            remaining_conv_tax = conv_tax - pay_from_tax
+            trad_prev = np.maximum(0.0, trad_prev - remaining_conv_tax)
 
-            take_trad = np.minimum(trad_prev, need2 / denom_trad)
-            gross_trad += take_trad
-            need3 = np.maximum(0.0, need2 - take_trad * denom_trad)
+            # Net RMD cash (after tax at marginal rate)
+            rmd_tax_est = taxable_rmd * eff_ord_est
+            net_rmd_cash = np.maximum(0.0, taxable_rmd - rmd_tax_est)
+            used_rmd = np.minimum(net_rmd_cash, need_before)
+            need = np.maximum(0.0, need_before - used_rmd)
+            excess = np.maximum(0.0, net_rmd_cash - used_rmd)
+            tax_prev += excess
+            bas_prev += excess
 
-            take_roth = np.minimum(roth_prev, need3)
-            gross_roth += take_roth
+            # IRMAA (using MAGI from tax engine, 2-year lookback)
+            if irmaa_on and age >= medicare_age:
+                lookback_magi = magi_track[:, max(0, t-2)]  # 2-year lookback
+                irmaa_part_b_sched = cfg.get("irmaa_part_b_schedule", IRMAA_PART_B_2024_MFJ)
+                irmaa_part_d_sched = cfg.get("irmaa_part_d_schedule", IRMAA_PART_D_2024_MFJ)
+                prem_b = irmaa_monthly_per_person(lookback_magi, irmaa_base, irmaa_part_b_sched)
+                prem_d = irmaa_monthly_per_person(lookback_magi, 0.0, irmaa_part_d_sched)
+                irmaa_nom = (prem_b + prem_d) * 12.0 * irmaa_people
+                if mort_on:
+                    irmaa_nom[one_alive] *= 0.60
+                    irmaa_nom[none_alive] = 0.0
+                need += irmaa_nom
+                irmaa_paid_track[:, t] = irmaa_nom
+                irmaa_part_b_track[:, t] = prem_b * 12.0 * irmaa_people
+                irmaa_part_d_track[:, t] = prem_d * 12.0 * irmaa_people
+                tier = np.zeros(n)
+                for i, (th, _) in enumerate(irmaa_part_b_sched, start=1):
+                    tier = np.where(lookback_magi >= th * infl_factor_t, i, tier)
+                tier_track[:, t] = tier
+
+            # ACA: replace flat health premium with subsidy-based for pre-65
+            if aca_mode == "aca" and age >= retire_age and age < medicare_age:
+                aca_result = compute_aca_premium(magi_1, aca_household_size,
+                    aca_benchmark, infl_factor_t, aca_schedule)
+                # Replace health_nom with ACA net premium
+                aca_net = aca_result["net_premium"]
+                if mort_on:
+                    aca_net[one_alive] *= 0.60
+                    aca_net[none_alive] = 0.0
+                # Adjust need: remove old health_nom, add ACA net
+                need = need - health_nom + aca_net
+                aca_gross_track[:, t] = aca_result["gross_premium"]
+                aca_subsidy_track[:, t] = aca_result["subsidy"]
+                aca_net_track[:, t] = aca_net
+                health_track[:, t] = aca_net  # overwrite
+
+            # --- Withdrawals using estimated marginal tax rates ---
+            gain = np.maximum(0.0, tax_prev - bas_prev)
+            gain_frac = np.where(tax_prev > 0, np.minimum(1.0, gain / tax_prev), 0.0)
+            # Estimate marginal rates for withdrawal tax
+            marg_rate = tax_result_1["marginal_bracket"]
+            ltcg_thresh = (LTCG_0PCT_THRESHOLD_MFJ_2024 if filing_status == "mfj"
+                          else LTCG_0PCT_THRESHOLD_SINGLE_2024) * infl_factor_t
+            est_capg_rate = np.where(tax_result_1["taxable_ordinary"] < ltcg_thresh,
+                                     0.0, 0.15) + state_rate_cg
+            est_ord_rate = marg_rate + state_rate_ord
+            if bool(cfg["tlh_on"]):
+                est_capg_rate = est_capg_rate * (1 - float(cfg["tlh_reduction"]))
+            denom_tax_wd = np.maximum(1e-6, 1 - gain_frac * est_capg_rate)
+            denom_trad_wd = np.maximum(1e-6, 1 - est_ord_rate)
+
+            gross_tax = np.zeros(n)
+            gross_trad = np.zeros(n)
+            gross_roth = np.zeros(n)
+
+            if cfg["wd_strategy"] == "taxable_first":
+                take_tax = np.minimum(tax_prev, need / denom_tax_wd)
+                gross_tax += take_tax
+                need2 = np.maximum(0.0, need - take_tax * denom_tax_wd)
+                take_trad = np.minimum(trad_prev, need2 / denom_trad_wd)
+                gross_trad += take_trad
+                need3 = np.maximum(0.0, need2 - take_trad * denom_trad_wd)
+                take_roth = np.minimum(roth_prev, need3)
+                gross_roth += take_roth
+            else:
+                total_avail = tax_prev + trad_prev + roth_prev
+                share_tax = np.where(total_avail > 0, tax_prev / total_avail, 0.0)
+                share_trad = np.where(total_avail > 0, trad_prev / total_avail, 0.0)
+                share_roth = 1 - share_tax - share_trad
+                take_tax = np.minimum(tax_prev, (need * share_tax) / denom_tax_wd)
+                take_trad = np.minimum(trad_prev, (need * share_trad) / denom_trad_wd)
+                take_roth = np.minimum(roth_prev, (need * share_roth))
+                gross_tax += take_tax
+                gross_trad += take_trad
+                gross_roth += take_roth
+
+            # --- Pass 2: recompute tax with actual withdrawal income ---
+            ltcg_from_wd = gross_tax * gain_frac
+            ordinary_income_final = taxable_rmd + conv_gross + ann_income_this_year + gross_trad
+            ltcg_final = ltcg_from_wd + ltcg_pre
+            tax_result_2 = compute_federal_tax(
+                ordinary_income_final, qual_divs, ltcg_final, ss_nom,
+                filing_status, infl_factor_t, niit_on)
+            state_tax_2 = state_rate_ord * np.maximum(0.0,
+                tax_result_2["taxable_ordinary"]) + state_rate_cg * ltcg_final
+            total_tax_2 = tax_result_2["fed_total"] + state_tax_2
+
+            # Record final tax engine outputs
+            fed_tax_track[:, t] = tax_result_2["fed_total"]
+            state_tax_track[:, t] = state_tax_2
+            niit_track[:, t] = tax_result_2["niit"]
+            ss_taxable_track[:, t] = tax_result_2["ss_taxable"]
+            effective_rate_track[:, t] = tax_result_2["effective_rate"]
+            marginal_bracket_track[:, t] = tax_result_2["marginal_bracket"]
+            magi_track[:, t] = tax_result_2["magi"]
+            ltcg_realized_track[:, t] = ltcg_final
+            qual_div_track[:, t] = qual_divs
+            taxes_paid_track[:, t] = total_tax_2
+
         else:
-            total_avail = tax_prev + trad_prev + roth_prev
-            share_tax = np.where(total_avail > 0, tax_prev / total_avail, 0.0)
-            share_trad = np.where(total_avail > 0, trad_prev / total_avail, 0.0)
-            share_roth = 1 - share_tax - share_trad
+            # Legacy flat-rate tax path (pre-retirement or tax_engine_on=False)
+            # Conversion tax (flat rate)
+            conv_tax = conv_gross * eff_ord
+            pay_from_tax = np.minimum(tax_prev, conv_tax)
+            tax_prev -= pay_from_tax
+            remaining_conv_tax = conv_tax - pay_from_tax
+            trad_prev = np.maximum(0.0, trad_prev - remaining_conv_tax)
 
-            take_tax = np.minimum(tax_prev, (need * share_tax) / denom_tax)
-            take_trad = np.minimum(trad_prev, (need * share_trad) / denom_trad)
-            take_roth = np.minimum(roth_prev, (need * share_roth))
+            net_rmd_cash = taxable_rmd * (1 - eff_ord)
+            used_rmd = np.minimum(net_rmd_cash, need_before)
+            need = np.maximum(0.0, need_before - used_rmd)
+            excess = np.maximum(0.0, net_rmd_cash - used_rmd)
+            tax_prev += excess
+            bas_prev += excess
 
-            gross_tax += take_tax
-            gross_trad += take_trad
-            gross_roth += take_roth
+            # IRMAA (legacy)
+            if irmaa_on and age >= medicare_age:
+                magi_est = taxable_rmd + conv_gross + ann_income_this_year + tax_prev * (div_yield_val + dist_yield_val)
+                magi_track[:, t] = magi_est
+                prem = irmaa_monthly_per_person(magi_est, irmaa_base, irmaa_schedule)
+                irmaa_nom = prem * 12.0 * irmaa_people
+                if mort_on:
+                    irmaa_nom[one_alive] *= 0.60
+                    irmaa_nom[none_alive] = 0.0
+                need += irmaa_nom
+                irmaa_paid_track[:, t] = irmaa_nom
+                tier = np.zeros(n)
+                for i, (th, _) in enumerate(irmaa_schedule, start=1):
+                    tier = np.where(magi_est >= th, i, tier)
+                tier_track[:, t] = tier
 
+            gain = np.maximum(0.0, tax_prev - bas_prev)
+            gain_frac = np.where(tax_prev > 0, np.minimum(1.0, gain / tax_prev), 0.0)
+            denom_tax_wd = np.maximum(1e-6, 1 - gain_frac * eff_capg_wd)
+            denom_trad_wd = np.maximum(1e-6, 1 - eff_ord)
+
+            gross_tax = np.zeros(n)
+            gross_trad = np.zeros(n)
+            gross_roth = np.zeros(n)
+
+            if cfg["wd_strategy"] == "taxable_first":
+                take_tax = np.minimum(tax_prev, need / denom_tax_wd)
+                gross_tax += take_tax
+                need2 = np.maximum(0.0, need - take_tax * denom_tax_wd)
+                take_trad = np.minimum(trad_prev, need2 / denom_trad_wd)
+                gross_trad += take_trad
+                need3 = np.maximum(0.0, need2 - take_trad * denom_trad_wd)
+                take_roth = np.minimum(roth_prev, need3)
+                gross_roth += take_roth
+            else:
+                total_avail = tax_prev + trad_prev + roth_prev
+                share_tax = np.where(total_avail > 0, tax_prev / total_avail, 0.0)
+                share_trad = np.where(total_avail > 0, trad_prev / total_avail, 0.0)
+                share_roth = 1 - share_tax - share_trad
+                take_tax = np.minimum(tax_prev, (need * share_tax) / denom_tax_wd)
+                take_trad = np.minimum(trad_prev, (need * share_trad) / denom_trad_wd)
+                take_roth = np.minimum(roth_prev, (need * share_roth))
+                gross_tax += take_tax
+                gross_trad += take_trad
+                gross_roth += take_roth
+
+            taxes_paid_track[:, t] = (gross_tax * gain_frac * eff_capg_wd) + (gross_trad * eff_ord) + (gross_hsa_nonmed * eff_ord)
+
+        # --- Common post-withdrawal accounting ---
         gross_tax_wd_track[:, t] = gross_tax
         gross_trad_wd_track[:, t] = gross_trad
         gross_roth_wd_track[:, t] = gross_roth
         gross_hsa_wd_track[:, t] = gross_hsa_nonmed
-
-        taxes_paid_track[:, t] = (gross_tax * gain_frac * eff_capg_wd) + (gross_trad * eff_ord) + (gross_hsa_nonmed * eff_ord)
 
         tax_before = np.maximum(0.0, tax_prev - gross_tax)
         trad_before = np.maximum(0.0, trad_prev - gross_trad)
@@ -1301,6 +1847,19 @@ def simulate(cfg: dict, hold: dict) -> dict:
             "essential_spend": essential_spend_track,
             "discretionary_spend": discretionary_spend_track,
             "essential_funded": essential_funded_track,
+            "fed_tax": fed_tax_track,
+            "state_tax": state_tax_track,
+            "niit": niit_track,
+            "ss_taxable": ss_taxable_track,
+            "effective_rate": effective_rate_track,
+            "marginal_bracket": marginal_bracket_track,
+            "ltcg_realized": ltcg_realized_track,
+            "qual_divs": qual_div_track,
+            "aca_gross": aca_gross_track,
+            "aca_subsidy": aca_subsidy_track,
+            "aca_net": aca_net_track,
+            "irmaa_part_b": irmaa_part_b_track,
+            "irmaa_part_d": irmaa_part_d_track,
         },
         "infl_index": infl_index,
         "regime_states": regime_track,
@@ -1315,6 +1874,109 @@ def summarize_end(paths: np.ndarray) -> dict:
         "p50": float(np.percentile(end, 50)),
         "p90": float(np.percentile(end, 90)),
     }
+
+# ============================================================
+# SECTION 3b: Policy Optimizer
+# ============================================================
+
+OPTIMIZER_CONV_LEVELS = [0, 25000, 50000, 75000, 100000, 150000, 200000]
+OPTIMIZER_CONV_LABELS = ["$0", "$25k", "$50k", "$75k", "$100k", "$150k", "$200k"]
+OPTIMIZER_WD_STRATEGIES = ["taxable_first", "pro_rata"]
+OPTIMIZER_WD_LABELS = {"taxable_first": "Taxable first", "pro_rata": "Pro rata"}
+OPTIMIZER_OBJECTIVES = {
+    "Minimize ruin probability": "ruin",
+    "Minimize spending volatility": "spend_vol",
+    "Maximize expected legacy": "legacy",
+    "Minimize lifetime taxes": "taxes",
+}
+
+
+def run_optimizer(cfg: dict, hold: dict, objective: str) -> dict:
+    """Grid search over conversion and withdrawal policies, validate with MC.
+
+    Returns dict with:
+      - best: (conv_level, wd_strategy, score)
+      - candidates: list of (conv_level, wd_strategy, mc_results) sorted by objective
+      - baseline: MC result for current settings
+    """
+    import time
+    t0 = time.time()
+    n_fast = 2000  # simulations per candidate
+
+    # Run baseline
+    cfg_base = dict(cfg)
+    cfg_base["n_sims"] = n_fast
+    out_base = simulate(cfg_base, hold)
+    base_score = _eval_objective(out_base, cfg_base, objective)
+
+    # Grid search: conversion levels × withdrawal strategies
+    candidates = []
+    for conv_level in OPTIMIZER_CONV_LEVELS:
+        for wd_strat in OPTIMIZER_WD_STRATEGIES:
+            cfg_trial = dict(cfg)
+            cfg_trial["n_sims"] = n_fast
+            cfg_trial["wd_strategy"] = wd_strat
+            if conv_level == 0:
+                cfg_trial["conv_on"] = False
+            else:
+                cfg_trial["conv_on"] = True
+                cfg_trial["conv_type"] = "fixed"
+                cfg_trial["conv_real"] = float(conv_level)
+            # Each combo gets a different seed to reduce noise
+            cfg_trial["seed"] = int(cfg.get("seed", 42)) + hash((conv_level, wd_strat)) % 10000
+            out_trial = simulate(cfg_trial, hold)
+            score = _eval_objective(out_trial, cfg_trial, objective)
+            candidates.append({
+                "conv_level": conv_level,
+                "wd_strategy": wd_strat,
+                "score": score,
+                "success_rate": _success_rate(out_trial, cfg_trial),
+                "median_legacy": float(np.median(out_trial["legacy"])),
+                "median_tax": float(np.median(out_trial["decomp"]["taxes_paid"].sum(axis=1))),
+                "spend_vol": float(np.std(out_trial["decomp"]["core_adjusted"][:, -1] /
+                                          np.maximum(out_trial["infl_index"][:, -1], 1e-9))),
+            })
+
+    # Sort by objective (lower is better for ruin/vol/taxes, higher for legacy)
+    reverse = objective == "legacy"
+    candidates.sort(key=lambda c: c["score"], reverse=reverse)
+
+    elapsed = time.time() - t0
+    return {
+        "candidates": candidates,
+        "baseline": {
+            "score": base_score,
+            "success_rate": _success_rate(out_base, cfg_base),
+            "median_legacy": float(np.median(out_base["legacy"])),
+            "median_tax": float(np.median(out_base["decomp"]["taxes_paid"].sum(axis=1))),
+        },
+        "elapsed": elapsed,
+        "objective": objective,
+    }
+
+
+def _success_rate(out: dict, cfg: dict) -> float:
+    end_age = int(cfg["end_age"])
+    ra = out["ruin_age"]
+    return 100.0 - float((ra <= end_age).sum()) / len(ra) * 100
+
+
+def _eval_objective(out: dict, cfg: dict, objective: str) -> float:
+    if objective == "ruin":
+        # Lower is better: ruin probability
+        return 100.0 - _success_rate(out, cfg)
+    elif objective == "spend_vol":
+        # Lower is better: std dev of real spending at end
+        real_spend = out["decomp"]["core_adjusted"] / np.maximum(out["infl_index"], 1e-9)
+        return float(np.std(real_spend[:, -1]))
+    elif objective == "legacy":
+        # Higher is better: median legacy
+        return float(np.median(out["legacy"]))
+    elif objective == "taxes":
+        # Lower is better: median lifetime taxes
+        return float(np.median(out["decomp"]["taxes_paid"].sum(axis=1)))
+    return 0.0
+
 
 # ============================================================
 # SECTION 4: CSS / Theme
@@ -1855,7 +2517,14 @@ def init_defaults():
     _d("seq_drop", -0.25)
     _d("seq_years", 2)
 
-    # Taxes
+    # Taxes — tax engine
+    _d("tax_engine_on", True)
+    _d("filing_status", "mfj")
+    _d("niit_on", False)
+    _d("state_rate_ordinary", 0.05)
+    _d("state_rate_capgains", 0.05)
+
+    # Taxes — legacy flat rates (used when tax_engine_on is False)
     _d("fed_capg", 0.20)
     _d("fed_div", 0.20)
     _d("fed_ord", 0.28)
@@ -1885,6 +2554,12 @@ def init_defaults():
     # Gain harvesting (0% LTCG bracket)
     _d("gain_harvest_on", False)
     _d("gain_harvest_filing", "mfj")
+
+    # ACA / pre-65 healthcare
+    _d("aca_mode", "simple")           # "simple" or "aca"
+    _d("aca_household_size", 2)
+    _d("aca_benchmark_premium_real", 20000.0)
+    _d("aca_subsidy_schedule", list(ACA_SUBSIDY_SCHEDULE_2024))
 
     # Qualified Charitable Distributions
     _d("qcd_on", False)
@@ -1987,6 +2662,9 @@ def init_defaults():
     _d("irmaa_p2", 400.0)
     _d("irmaa_t3", 400000.0)
     _d("irmaa_p3", 560.0)
+    # Phase 3 IRMAA Part B/D schedules
+    _d("irmaa_part_b_schedule", list(IRMAA_PART_B_2024_MFJ))
+    _d("irmaa_part_d_schedule", list(IRMAA_PART_D_2024_MFJ))
 
     # LTC
     _d("ltc_on", False)
@@ -2009,6 +2687,15 @@ def init_defaults():
     _d("contrib_match_annual", 11750.0)
     _d("contrib_taxable_annual", 0.0)
     _d("contrib_hsa_annual", 4300.0)
+
+    # Equity sub-buckets (Phase 5)
+    _d("equity_granular_on", False)
+    _d("equity_sub_weights", {k: v["weight"] for k, v in EQUITY_SUB_DEFAULTS.items()})
+    _d("equity_sub_mu", {k: v["mu"] for k, v in EQUITY_SUB_DEFAULTS.items()})
+    _d("equity_sub_vol", {k: v["vol"] for k, v in EQUITY_SUB_DEFAULTS.items()})
+    _d("tech_bubble_on", False)
+    _d("tech_bubble_prob", 0.03)
+    _d("tech_bubble_extra_drop", -0.50)
 
     st.session_state["cfg"] = cfg
 
@@ -2674,8 +3361,34 @@ def plan_setup_page():
             hh1, hh2 = st.columns(2, border=True)
             with hh1:
                 cfg["medicare_age"] = st.number_input("Medicare starts at age", value=int(cfg["medicare_age"]), step=1, key="ps_medicare_age")
+                aca_modes = ["simple", "aca"]
+                cfg["aca_mode"] = st.selectbox("Premium model",
+                    aca_modes,
+                    index=aca_modes.index(str(cfg.get("aca_mode", "simple"))),
+                    format_func=lambda x: "Simple (flat annual premium)" if x == "simple" else "ACA (MAGI-based subsidy)",
+                    key="ps_aca_mode",
+                    help="Simple: flat annual premium you enter. ACA: dynamically computes your premium subsidy "
+                         "based on MAGI vs Federal Poverty Level. Requires the tax engine to be enabled.")
+                if cfg["aca_mode"] == "aca" and not cfg.get("tax_engine_on", True):
+                    st.warning("ACA mode requires the tax engine. Enable it in the Taxes section.")
+                    cfg["aca_mode"] = "simple"
             with hh2:
-                cfg["pre65_health_real"] = st.number_input("Annual health insurance cost", value=float(cfg["pre65_health_real"]), step=1000.0, key="ps_pre65_cost")
+                if cfg.get("aca_mode", "simple") == "simple":
+                    cfg["pre65_health_real"] = st.number_input("Annual health insurance cost",
+                        value=float(cfg["pre65_health_real"]), step=1000.0, key="ps_pre65_cost")
+                else:
+                    cfg["aca_benchmark_premium_real"] = st.number_input(
+                        "Benchmark Silver plan premium (annual, today's $)",
+                        value=float(cfg.get("aca_benchmark_premium_real", 20000.0)),
+                        step=1000.0, key="ps_aca_bench",
+                        help="The second-lowest-cost Silver plan on your exchange. "
+                             "This is used to calculate your subsidy amount.")
+                    cfg["aca_household_size"] = st.number_input("ACA household size",
+                        value=int(cfg.get("aca_household_size", 2)),
+                        min_value=1, max_value=4, step=1, key="ps_aca_hh",
+                        help="Number of people in your ACA household (determines the FPL threshold).")
+                    _fpl = FPL_2024.get(int(cfg["aca_household_size"]), FPL_2024[2])
+                    st.info(f"Federal Poverty Level ({cfg['aca_household_size']}-person household): **${_fpl:,}** (inflation-adjusted)")
 
         st.html('<div class="pro-section-title">Health Savings Account (HSA)</div>')
         cfg["hsa_on"] = st.toggle("Include HSA", value=bool(cfg["hsa_on"]), key="ps_hsa_on",
@@ -2712,17 +3425,50 @@ def plan_setup_page():
     # TAXES
     # ================================================================
     elif section == "Taxes":
-        st.html('<div class="pro-section-title">Tax Rates</div>')
-        tc1, tc2 = st.columns(2, border=True)
-        with tc1:
-            st.markdown("**Federal**")
-            cfg["fed_capg"] = st.number_input("Capital gains rate", value=float(cfg["fed_capg"]), step=0.01, format="%.2f", key="ps_fed_capg")
-            cfg["fed_div"] = st.number_input("Dividend rate", value=float(cfg["fed_div"]), step=0.01, format="%.2f", key="ps_fed_div")
-            cfg["fed_ord"] = st.number_input("Ordinary income rate", value=float(cfg["fed_ord"]), step=0.01, format="%.2f", key="ps_fed_ord")
-        with tc2:
-            st.markdown("**State**")
-            cfg["state_capg"] = st.number_input("Cap gains / dividend rate", value=float(cfg["state_capg"]), step=0.005, format="%.3f", key="ps_state_capg")
-            cfg["state_ord"] = st.number_input("Ordinary income rate", value=float(cfg["state_ord"]), step=0.005, format="%.3f", key="ps_state_ord")
+        st.html('<div class="pro-section-title">Tax Engine</div>')
+
+        cfg["tax_engine_on"] = st.toggle("Full tax engine (bracketed federal taxes, SS taxation, LTCG brackets)",
+            value=bool(cfg.get("tax_engine_on", True)), key="ps_tax_engine_on",
+            help="When enabled, uses actual federal tax brackets, Social Security provisional income taxation, "
+                 "LTCG/qualified dividend brackets, and optional NIIT. When disabled, falls back to flat effective rates.")
+
+        if cfg["tax_engine_on"]:
+            te1, te2 = st.columns(2, border=True)
+            with te1:
+                cfg["filing_status"] = st.selectbox("Filing status",
+                    ["mfj", "single"],
+                    index=["mfj", "single"].index(str(cfg.get("filing_status", "mfj"))),
+                    format_func=lambda x: "Married Filing Jointly" if x == "mfj" else "Single",
+                    key="ps_filing_status",
+                    help="Used for all tax calculations: federal brackets, LTCG brackets, standard deduction, IRMAA, ACA, and gain harvesting.")
+                _fs = cfg["filing_status"]
+                _std_ded = STANDARD_DEDUCTION_MFJ_2024 if _fs == "mfj" else STANDARD_DEDUCTION_SINGLE_2024
+                st.info(f"Standard deduction ({_fs.upper()}): **${_std_ded:,}** (inflation-adjusted each year)")
+            with te2:
+                cfg["niit_on"] = st.toggle("Include NIIT (3.8% Net Investment Income Tax)",
+                    value=bool(cfg.get("niit_on", False)), key="ps_niit_on",
+                    help=f"Applies 3.8% surtax on net investment income when MAGI exceeds "
+                         f"${NIIT_THRESHOLD_MFJ:,} (MFJ) or ${NIIT_THRESHOLD_SINGLE:,} (Single).")
+                st.markdown("**State tax rates (flat)**")
+                cfg["state_rate_ordinary"] = st.number_input("State ordinary income rate",
+                    value=float(cfg.get("state_rate_ordinary", 0.05)), step=0.005, format="%.3f", key="ps_state_ord_new")
+                cfg["state_rate_capgains"] = st.number_input("State capital gains rate",
+                    value=float(cfg.get("state_rate_capgains", 0.05)), step=0.005, format="%.3f", key="ps_state_cg_new")
+                # Keep legacy keys in sync
+                cfg["state_ord"] = cfg["state_rate_ordinary"]
+                cfg["state_capg"] = cfg["state_rate_capgains"]
+        else:
+            st.caption("Using flat effective tax rates (legacy mode).")
+            tc1, tc2 = st.columns(2, border=True)
+            with tc1:
+                st.markdown("**Federal**")
+                cfg["fed_capg"] = st.number_input("Capital gains rate", value=float(cfg["fed_capg"]), step=0.01, format="%.2f", key="ps_fed_capg")
+                cfg["fed_div"] = st.number_input("Dividend rate", value=float(cfg["fed_div"]), step=0.01, format="%.2f", key="ps_fed_div")
+                cfg["fed_ord"] = st.number_input("Ordinary income rate", value=float(cfg["fed_ord"]), step=0.01, format="%.2f", key="ps_fed_ord")
+            with tc2:
+                st.markdown("**State**")
+                cfg["state_capg"] = st.number_input("Cap gains / dividend rate", value=float(cfg["state_capg"]), step=0.005, format="%.3f", key="ps_state_capg")
+                cfg["state_ord"] = st.number_input("Ordinary income rate", value=float(cfg["state_ord"]), step=0.005, format="%.3f", key="ps_state_ord")
 
         st.html('<div class="pro-section-title">Withdrawal Strategy</div>')
         ws1, ws2 = st.columns(2, border=True)
@@ -2752,13 +3498,13 @@ def plan_setup_page():
                 value=bool(cfg["gain_harvest_on"]), key="ps_gh_on",
                 help="When taxable income is low enough to qualify for the 0% long-term capital gains rate, "
                      "sell and immediately rebuy assets to step up cost basis — no tax owed.")
-            if cfg["gain_harvest_on"]:
+            if not cfg["tax_engine_on"] and cfg["gain_harvest_on"]:
                 cfg["gain_harvest_filing"] = st.selectbox("Filing status for LTCG brackets",
                     ["mfj", "single"],
                     index=["mfj", "single"].index(str(cfg["gain_harvest_filing"])),
                     format_func=lambda x: "Married Filing Jointly" if x == "mfj" else "Single",
                     key="ps_gh_filing")
-            else:
+            elif not cfg["gain_harvest_on"]:
                 st.caption("Toggle on to automatically harvest capital gains when they fall in the 0% LTCG bracket.")
         with gh2:
             cfg["qcd_on"] = st.toggle("Qualified Charitable Distributions (QCDs)",
@@ -2807,11 +3553,14 @@ def plan_setup_page():
                         format_func=lambda x: bracket_options[x],
                         key="ps_conv_bracket",
                         help="Convert enough each year to fill ordinary income up to the top of this bracket.")
-                    cfg["conv_filing_status"] = st.selectbox("Filing status",
-                        ["mfj", "single"],
-                        index=["mfj", "single"].index(str(cfg["conv_filing_status"])),
-                        format_func=lambda x: "Married Filing Jointly" if x == "mfj" else "Single",
-                        key="ps_conv_filing")
+                    if not cfg.get("tax_engine_on", True):
+                        cfg["conv_filing_status"] = st.selectbox("Filing status",
+                            ["mfj", "single"],
+                            index=["mfj", "single"].index(str(cfg["conv_filing_status"])),
+                            format_func=lambda x: "Married Filing Jointly" if x == "mfj" else "Single",
+                            key="ps_conv_filing")
+                    else:
+                        st.caption(f"Using global filing status: {'MFJ' if cfg.get('filing_status', 'mfj') == 'mfj' else 'Single'}")
                     cfg["conv_irmaa_aware"] = st.toggle("Cap conversions to avoid IRMAA",
                         value=bool(cfg["conv_irmaa_aware"]), key="ps_conv_irmaa",
                         help="Limit conversions so total MAGI stays below the lowest IRMAA threshold.")
@@ -2991,6 +3740,88 @@ def plan_setup_page():
                         value=float(cfg["glide_ret_eq_end"]), step=0.05, format="%.2f", key="ps_glide_ret_end")
                     cfg["glide_ret_end_age"] = st.number_input("Glide end age", value=int(cfg["glide_ret_end_age"]), step=1, key="ps_glide_ret_eage")
 
+        # Equity sub-bucket granularity
+        st.html('<div class="pro-section-title">Equity Sub-Bucket Granularity</div>')
+        cfg["equity_granular_on"] = st.toggle("Enable equity sub-bucket detail", value=bool(cfg.get("equity_granular_on", False)), key="ps_eq_granular",
+            help="Break the single 'Equities' asset class into 6 sub-buckets with independent return/vol/correlation parameters. "
+                 "When off, equities use the single return and volatility from your market outlook.")
+        if not cfg["equity_granular_on"]:
+            st.caption("Toggle on to model US Large, US Small, Intl Developed, Emerging, US Value, and Tech/AI as separate asset classes with distinct correlations.")
+        if cfg["equity_granular_on"]:
+            if str(cfg.get("return_model", "standard")) == "regime":
+                st.warning("⚠️ Equity sub-buckets use the standard model (not regime-switching). Regime model will be overridden for equity returns.")
+            sub_w = dict(cfg.get("equity_sub_weights", {k: v["weight"] for k, v in EQUITY_SUB_DEFAULTS.items()}))
+            sub_m = dict(cfg.get("equity_sub_mu", {k: v["mu"] for k, v in EQUITY_SUB_DEFAULTS.items()}))
+            sub_v = dict(cfg.get("equity_sub_vol", {k: v["vol"] for k, v in EQUITY_SUB_DEFAULTS.items()}))
+
+            # Build editable table
+            sub_rows = []
+            for cls in EQUITY_SUB_CLASSES:
+                sub_rows.append({
+                    "Sub-Class": cls,
+                    "Weight": float(sub_w.get(cls, EQUITY_SUB_DEFAULTS[cls]["weight"])),
+                    "Return (μ)": float(sub_m.get(cls, EQUITY_SUB_DEFAULTS[cls]["mu"])),
+                    "Volatility (σ)": float(sub_v.get(cls, EQUITY_SUB_DEFAULTS[cls]["vol"])),
+                })
+            sub_df = pd.DataFrame(sub_rows)
+            edited_sub = st.data_editor(sub_df, use_container_width=True, hide_index=True, key="ps_eq_sub_table",
+                column_config={
+                    "Sub-Class": st.column_config.TextColumn(disabled=True),
+                    "Weight": st.column_config.NumberColumn(format="%.2f", min_value=0.0, max_value=1.0, step=0.05),
+                    "Return (μ)": st.column_config.NumberColumn(format="%.3f", min_value=-0.10, max_value=0.30, step=0.005),
+                    "Volatility (σ)": st.column_config.NumberColumn(format="%.3f", min_value=0.01, max_value=0.60, step=0.01),
+                })
+            # Read back edited values
+            for _, row in edited_sub.iterrows():
+                cls = row["Sub-Class"]
+                sub_w[cls] = float(row["Weight"])
+                sub_m[cls] = float(row["Return (μ)"])
+                sub_v[cls] = float(row["Volatility (σ)"])
+            cfg["equity_sub_weights"] = sub_w
+            cfg["equity_sub_mu"] = sub_m
+            cfg["equity_sub_vol"] = sub_v
+
+            # Show weight summary
+            total_w = sum(sub_w.values())
+            if abs(total_w - 1.0) > 0.01:
+                st.warning(f"⚠️ Weights sum to {total_w:.2f} — they will be normalized to 1.0 in the simulation.")
+            else:
+                st.success(f"Weights sum to {total_w:.2f}")
+
+            # Concentration metric
+            w_arr = np.array([sub_w.get(c, 0) for c in EQUITY_SUB_CLASSES])
+            if w_arr.sum() > 0:
+                w_norm = w_arr / w_arr.sum()
+                hhi = float(np.sum(w_norm ** 2))
+                n_eff = 1.0 / hhi if hhi > 0 else len(EQUITY_SUB_CLASSES)
+                st.caption(f"📊 Concentration: HHI = {hhi:.2f} | Effective # of sub-buckets = {n_eff:.1f}")
+
+            # Blended return/vol display
+            w_n = w_arr / w_arr.sum() if w_arr.sum() > 0 else w_arr
+            blended_mu = sum(w_n[i] * sub_m.get(EQUITY_SUB_CLASSES[i], 0.07) for i in range(len(EQUITY_SUB_CLASSES)))
+            blended_vol = np.sqrt(sum(
+                w_n[i] * w_n[j] * sub_v.get(EQUITY_SUB_CLASSES[i], 0.16) * sub_v.get(EQUITY_SUB_CLASSES[j], 0.16) *
+                (1.0 if i == j else EQUITY_SUB_CORR.get((EQUITY_SUB_CLASSES[i], EQUITY_SUB_CLASSES[j]),
+                 EQUITY_SUB_CORR.get((EQUITY_SUB_CLASSES[j], EQUITY_SUB_CLASSES[i]), 0.5)))
+                for i in range(len(EQUITY_SUB_CLASSES)) for j in range(len(EQUITY_SUB_CLASSES))
+            ))
+            st.info(f"📈 **Blended equity**: μ = {blended_mu:.3f}, σ ≈ {blended_vol:.3f}")
+
+            # Tech/AI bubble stress
+            st.html('<div class="pro-section-title">Tech/AI Bubble Stress</div>')
+            cfg["tech_bubble_on"] = st.toggle("Enable Tech/AI bubble risk", value=bool(cfg.get("tech_bubble_on", False)), key="ps_tech_bubble",
+                help="Each year, there's a small probability of a Tech/AI-specific crash that adds an extra drawdown to the Tech/AI sub-bucket only.")
+            if cfg["tech_bubble_on"]:
+                tb1, tb2 = st.columns(2, border=True)
+                with tb1:
+                    cfg["tech_bubble_prob"] = st.number_input("Annual bubble probability", value=float(cfg.get("tech_bubble_prob", 0.03)),
+                        min_value=0.0, max_value=0.20, step=0.01, format="%.2f", key="ps_tech_prob",
+                        help="Probability that a Tech/AI bubble bursts in any given year.")
+                with tb2:
+                    cfg["tech_bubble_extra_drop"] = st.number_input("Extra Tech/AI drop", value=float(cfg.get("tech_bubble_extra_drop", -0.50)),
+                        min_value=-0.90, max_value=0.0, step=0.05, format="%.2f", key="ps_tech_drop",
+                        help="Additional return shock applied to Tech/AI sub-bucket when the bubble bursts (e.g., -0.50 = extra -50%).")
+
     # ================================================================
     # STRESS TESTS
     # ================================================================
@@ -3108,7 +3939,7 @@ def deep_dive_page():
 
     analysis = st.segmented_control(
         "Analysis",
-        ["Cashflows", "Sensitivity", "IRMAA", "Legacy", "Annuity", "Roth Strategy", "Tax Brackets", "Regimes", "Reallocation"],
+        ["Cashflows", "Sensitivity", "IRMAA", "Legacy", "Annuity", "Roth Strategy", "Tax Brackets", "ACA", "Optimizer", "Regimes", "Reallocation"],
         default="Cashflows", key="dd_analysis"
     )
 
@@ -3381,13 +4212,48 @@ def deep_dive_page():
     # ================================================================
     elif analysis == "Tax Brackets":
         st.html('<div class="pro-section-title">Tax Bracket Projection</div>')
-        st.caption("Estimated income sources, deductions, and marginal bracket by age. Median values across simulations.")
-
         de = out["decomp"]
         infl_idx = out.get("infl_index", None)
+        _tax_engine_was_on = bool(cfg_run.get("tax_engine_on", True))
+
         if infl_idx is None:
             st.info("Run the simulation again to see tax bracket projections.")
+        elif _tax_engine_was_on:
+            st.caption("Actual tax engine output (median across simulations). Federal taxes are computed with real brackets, "
+                       "SS provisional income, and LTCG/QD stacking.")
+            retire_age = int(cfg_run["retire_age"])
+            tb_rows = []
+            for idx, age in enumerate(ages):
+                if age < retire_age:
+                    continue
+                tb_rows.append({
+                    "Age": int(age),
+                    "SS Gross": float(np.median(de["ss_inflow"][:, idx])),
+                    "SS Taxable": float(np.median(de["ss_taxable"][:, idx])),
+                    "Conversions": float(np.median(de["conv_gross"][:, idx])),
+                    "Trad WD": float(np.median(de["gross_trad_wd"][:, idx])),
+                    "Qual Divs": float(np.median(de["qual_divs"][:, idx])),
+                    "LTCG": float(np.median(de["ltcg_realized"][:, idx])),
+                    "Fed Ordinary": float(np.median(de["fed_tax"][:, idx]) - np.median(de.get("niit", np.zeros_like(de["fed_tax"]))[:, idx])),
+                    "Fed LTCG": float(np.median(de["fed_tax"][:, idx])) - float(np.median(de["fed_tax"][:, idx]) - np.median(de.get("niit", np.zeros_like(de["fed_tax"]))[:, idx])),
+                    "NIIT": float(np.median(de["niit"][:, idx])),
+                    "State Tax": float(np.median(de["state_tax"][:, idx])),
+                    "Total Tax": float(np.median(de["taxes_paid"][:, idx])),
+                    "Marginal": f"{float(np.median(de['marginal_bracket'][:, idx])):.0%}",
+                    "Eff Rate": f"{float(np.median(de['effective_rate'][:, idx])):.1%}",
+                    "MAGI": float(np.median(out["magi"][:, idx])),
+                })
+            if tb_rows:
+                tb_df = pd.DataFrame(tb_rows)
+                dollar_cols = [c for c in tb_df.columns if c not in ("Age", "Marginal", "Eff Rate")]
+                for c in dollar_cols:
+                    tb_df[c] = tb_df[c].apply(fmt_dollars)
+                st.dataframe(tb_df, use_container_width=True, hide_index=True, height=500)
+            else:
+                st.info("No retirement-age data to display.")
         else:
+            # Legacy mode: approximate brackets
+            st.caption("Estimated income sources and marginal bracket (legacy flat-rate mode). Median values across simulations.")
             retire_age = int(cfg_run["retire_age"])
             filing = str(cfg_run.get("conv_filing_status", cfg_run.get("gain_harvest_filing", "mfj")))
             if filing == "mfj":
@@ -3403,63 +4269,183 @@ def deep_dive_page():
                     continue
                 med_infl = float(np.median(infl_idx[:, idx]))
                 ss_inc = float(np.percentile(de["ss_inflow"][:, idx], 50))
-                # Approximate taxable SS as 85%
                 ss_taxable = 0.85 * ss_inc
-                rmd_inc = float(np.percentile(de["gross_trad_wd"][:, idx], 50))  # approx
+                rmd_inc = float(np.percentile(de["gross_trad_wd"][:, idx], 50))
                 conv_inc = float(np.percentile(de["conv_gross"][:, idx], 50))
                 ann_inc = float(np.percentile(de["annuity_income"][:, idx], 50))
                 qcd_inc = float(np.percentile(de["qcd"][:, idx], 50))
-
                 total_ordinary = ss_taxable + rmd_inc + conv_inc + ann_inc - qcd_inc
                 std_ded_adj = std_ded_base * med_infl
                 taxable_income = max(0.0, total_ordinary - std_ded_adj)
-
-                # Find marginal bracket
                 marginal_rate = 0.10
                 for i in range(len(brackets) - 1, -1, -1):
                     thresh, rate = brackets[i]
                     if taxable_income >= thresh * med_infl:
                         marginal_rate = rate
                         break
-
-                # Effective rate estimate
                 tax_est = 0.0
                 for i in range(len(brackets)):
                     thresh, rate = brackets[i]
                     adj_thresh = thresh * med_infl
-                    if i + 1 < len(brackets):
-                        next_thresh = brackets[i + 1][0] * med_infl
-                    else:
-                        next_thresh = 1e12
+                    next_thresh = brackets[i + 1][0] * med_infl if i + 1 < len(brackets) else 1e12
                     if taxable_income > adj_thresh:
-                        bracket_income = min(taxable_income, next_thresh) - adj_thresh
-                        tax_est += bracket_income * rate
+                        tax_est += (min(taxable_income, next_thresh) - adj_thresh) * rate
                 eff_rate = tax_est / max(1.0, taxable_income)
-
                 tb_rows.append({
-                    "Age": int(age),
-                    "SS (taxable)": ss_taxable,
-                    "RMD/Trad WD": rmd_inc,
-                    "Conversions": conv_inc,
-                    "Annuity": ann_inc,
-                    "QCD": qcd_inc,
-                    "Total Ordinary": total_ordinary,
-                    "Std Deduction": std_ded_adj,
+                    "Age": int(age), "SS (taxable)": ss_taxable, "RMD/Trad WD": rmd_inc,
+                    "Conversions": conv_inc, "Annuity": ann_inc, "QCD": qcd_inc,
+                    "Total Ordinary": total_ordinary, "Std Deduction": std_ded_adj,
                     "Taxable Income": taxable_income,
                     "Marginal Bracket": f"{marginal_rate:.0%}",
                     "Est. Effective Rate": f"{eff_rate:.1%}",
                 })
-
             if tb_rows:
                 tb_df = pd.DataFrame(tb_rows)
-                # Format dollar columns
-                dollar_cols = ["SS (taxable)", "RMD/Trad WD", "Conversions", "Annuity", "QCD",
-                               "Total Ordinary", "Std Deduction", "Taxable Income"]
-                for c in dollar_cols:
+                for c in ["SS (taxable)", "RMD/Trad WD", "Conversions", "Annuity", "QCD",
+                           "Total Ordinary", "Std Deduction", "Taxable Income"]:
                     tb_df[c] = tb_df[c].apply(fmt_dollars)
                 st.dataframe(tb_df, use_container_width=True, hide_index=True, height=500)
             else:
                 st.info("No retirement-age data to display.")
+
+    # ================================================================
+    # ACA
+    # ================================================================
+    elif analysis == "ACA":
+        st.html('<div class="pro-section-title">ACA Premium & Subsidy Projection</div>')
+        de = out["decomp"]
+        _aca_mode_run = str(cfg_run.get("aca_mode", "simple"))
+        if _aca_mode_run != "aca":
+            st.info("ACA mode is not enabled. Enable it in Plan Setup > Health to see subsidy projections. "
+                    "The tax engine must also be enabled.")
+        else:
+            retire_age_val = int(cfg_run["retire_age"])
+            medicare_age_val = int(cfg_run.get("medicare_age", 65))
+            aca_rows = []
+            for idx, age in enumerate(ages):
+                if age < retire_age_val or age >= medicare_age_val:
+                    continue
+                aca_rows.append({
+                    "Age": int(age),
+                    "MAGI": float(np.median(out["magi"][:, idx])),
+                    "FPL %": f"{float(np.median(de['aca_gross'][:, idx])) / max(1, float(np.median(de['aca_gross'][:, idx]))) * 100:.0f}%" if de["aca_gross"][:, idx].any() else "—",
+                    "Gross Premium": float(np.median(de["aca_gross"][:, idx])),
+                    "Subsidy": float(np.median(de["aca_subsidy"][:, idx])),
+                    "Net Premium": float(np.median(de["aca_net"][:, idx])),
+                })
+            if aca_rows:
+                aca_df = pd.DataFrame(aca_rows)
+                for c in ["MAGI", "Gross Premium", "Subsidy", "Net Premium"]:
+                    aca_df[c] = aca_df[c].apply(fmt_dollars)
+                st.dataframe(aca_df, use_container_width=True, hide_index=True)
+
+                # Line chart: net premium by age
+                chart_data = pd.DataFrame([{
+                    "Age": r["Age"],
+                    "Net Premium": float(np.median(de["aca_net"][:, ages.tolist().index(r["Age"])])),
+                    "Subsidy": float(np.median(de["aca_subsidy"][:, ages.tolist().index(r["Age"])])),
+                } for r in aca_rows if isinstance(r["Age"], int)])
+                if not chart_data.empty:
+                    chart_melt = chart_data.melt("Age", var_name="Component", value_name="Amount")
+                    ch = alt.Chart(chart_melt).mark_bar().encode(
+                        x=alt.X("Age:O"),
+                        y=alt.Y("Amount:Q", title="Annual ($)"),
+                        color=alt.Color("Component:N", scale=alt.Scale(
+                            domain=["Net Premium", "Subsidy"],
+                            range=["#E53935", "#00897B"])),
+                    ).properties(height=300, title="ACA Costs by Age (Median)")
+                    st.altair_chart(ch, use_container_width=True)
+            else:
+                st.info("No ACA-eligible ages in the simulation.")
+
+    # ================================================================
+    # OPTIMIZER
+    # ================================================================
+    elif analysis == "Optimizer":
+        st.html('<div class="pro-section-title">Policy Optimizer</div>')
+        st.caption("Grid-searches over Roth conversion amounts and withdrawal strategies to find the best policy "
+                   "for your chosen objective. Each candidate runs 2,000 simulations — this takes 15-30 seconds.")
+
+        obj_label = st.selectbox("Optimization objective",
+            list(OPTIMIZER_OBJECTIVES.keys()),
+            index=0, key="dd_opt_objective")
+        obj_key = OPTIMIZER_OBJECTIVES[obj_label]
+
+        if st.button("Run Optimizer", key="dd_opt_run", type="primary"):
+            with st.spinner("Running policy optimizer..."):
+                opt_result = run_optimizer(cfg_run, hold, obj_key)
+            st.session_state["_opt_result"] = opt_result
+            st.session_state["_opt_objective_label"] = obj_label
+
+        opt_result = st.session_state.get("_opt_result")
+        if opt_result:
+            obj_label_saved = st.session_state.get("_opt_objective_label", obj_label)
+            elapsed = opt_result["elapsed"]
+            baseline = opt_result["baseline"]
+            candidates = opt_result["candidates"]
+
+            st.success(f"Evaluated {len(candidates)} policies in {elapsed:.0f}s")
+
+            # Best candidate
+            best = candidates[0]
+            conv_lbl = f"${best['conv_level']:,}/yr" if best["conv_level"] > 0 else "No conversions"
+            wd_lbl = OPTIMIZER_WD_LABELS.get(best["wd_strategy"], best["wd_strategy"])
+
+            st.markdown(f"### Recommended: {conv_lbl}, {wd_lbl}")
+
+            # Comparison metrics: baseline vs best
+            mc1, mc2, mc3, mc4 = st.columns(4, border=True)
+            with mc1:
+                delta_sr = best["success_rate"] - baseline["success_rate"]
+                st.metric("Success Rate", f"{best['success_rate']:.1f}%",
+                          delta=f"{delta_sr:+.1f}pp" if abs(delta_sr) > 0.1 else "same")
+            with mc2:
+                st.metric("Median Legacy", f"${best['median_legacy']/1e6:.2f}M",
+                          delta=f"${(best['median_legacy'] - baseline['median_legacy'])/1e6:+.2f}M")
+            with mc3:
+                st.metric("Lifetime Taxes", f"${best['median_tax']/1e6:.2f}M",
+                          delta=f"${(best['median_tax'] - baseline['median_tax'])/1e6:+.2f}M",
+                          delta_color="inverse")
+            with mc4:
+                st.metric("Spending Vol", f"${best['spend_vol']:,.0f}",
+                          delta=f"${best['spend_vol'] - candidates[-1]['spend_vol']:+,.0f}" if len(candidates) > 1 else "")
+
+            # Comparison table — top 10
+            st.markdown("### All Policies Ranked")
+            rows = []
+            for c in candidates[:10]:
+                rows.append({
+                    "Conv Amount": f"${c['conv_level']:,}/yr" if c["conv_level"] > 0 else "None",
+                    "Withdrawal": OPTIMIZER_WD_LABELS.get(c["wd_strategy"], c["wd_strategy"]),
+                    "Success %": f"{c['success_rate']:.1f}%",
+                    "Median Legacy": fmt_dollars(c["median_legacy"]),
+                    "Lifetime Tax": fmt_dollars(c["median_tax"]),
+                    "Rank": "⭐" if c is best else "",
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+            # Bar chart: success rate by conversion level
+            sr_data = []
+            for c in candidates:
+                sr_data.append({
+                    "Conv Level": f"${c['conv_level']//1000}k" if c['conv_level'] > 0 else "$0",
+                    "Strategy": OPTIMIZER_WD_LABELS.get(c["wd_strategy"], c["wd_strategy"]),
+                    "Success Rate": c["success_rate"],
+                })
+            sr_df = pd.DataFrame(sr_data)
+            sr_chart = alt.Chart(sr_df).mark_bar().encode(
+                x=alt.X("Conv Level:N", sort=None, title="Roth Conversion Amount"),
+                y=alt.Y("Success Rate:Q", title="Success Rate (%)"),
+                color=alt.Color("Strategy:N"),
+                xOffset="Strategy:N",
+            ).properties(height=350, title="Success Rate by Policy")
+            st.altair_chart(sr_chart, use_container_width=True)
+
+            # Baseline comparison
+            with st.expander("Baseline (your current settings)"):
+                st.write(f"Success rate: **{baseline['success_rate']:.1f}%**")
+                st.write(f"Median legacy: **{fmt_dollars(baseline['median_legacy'])}**")
+                st.write(f"Median lifetime taxes: **{fmt_dollars(baseline['median_tax'])}**")
 
     # ================================================================
     # REGIMES
@@ -3582,6 +4568,10 @@ _DIFF_KEYS = [
     ("scenario", "Market Outlook"), ("manual_override", "Manual Override"),
     ("return_model", "Return Model"),
     ("infl_mu", "Inflation Mean"), ("infl_vol", "Inflation Vol"),
+    ("tax_engine_on", "Tax Engine"), ("filing_status", "Filing Status"),
+    ("niit_on", "NIIT"), ("state_rate_ordinary", "State Ordinary Rate"),
+    ("state_rate_capgains", "State Cap Gains Rate"),
+    ("aca_mode", "ACA Mode"), ("aca_benchmark_premium_real", "ACA Benchmark Premium"),
     ("fed_ord", "Federal Ordinary Rate"), ("state_ord", "State Ordinary Rate"),
     ("fed_capg", "Federal Cap Gains Rate"), ("basis_frac", "Cost Basis Fraction"),
     ("wd_strategy", "Withdrawal Strategy"), ("rmd_start_age", "RMD Start Age"),
@@ -3607,6 +4597,7 @@ _DIFF_KEYS = [
     ("irmaa_on", "IRMAA"), ("mort_on", "Mortality"),
     ("crash_on", "Crash Overlay"), ("seq_on", "Sequence Stress"),
     ("legacy_on", "Legacy"),
+    ("equity_granular_on", "Equity Sub-Buckets"), ("tech_bubble_on", "Tech/AI Bubble"),
 ]
 
 
@@ -3776,6 +4767,8 @@ def compare_page():
         ("Market Outlook", ["scenario", "manual_override", "override_params"]),
         ("Return Model", ["return_model", "regime_params", "regime_transition", "regime_initial_probs"]),
         ("Inflation", ["infl_mu", "infl_vol", "infl_min", "infl_max"]),
+        ("Tax Engine", ["tax_engine_on", "filing_status", "niit_on",
+                        "state_rate_ordinary", "state_rate_capgains"]),
         ("Tax Rates", ["fed_capg", "fed_div", "fed_ord", "state_capg", "state_ord"]),
         ("Tax Strategy", ["basis_frac", "div_yield", "dist_yield", "tlh_on", "tlh_reduction",
                           "wd_strategy", "rmd_on", "rmd_start_age", "roth_frac"]),
@@ -3794,6 +4787,7 @@ def compare_page():
         ("Mortality", ["mort_on", "spend_drop_after_death", "home_cost_drop_after_death",
                        "q55_1", "q55_2", "mort_growth"]),
         ("Health Care", ["pre65_health_on", "pre65_health_real", "medicare_age",
+                         "aca_mode", "aca_benchmark_premium_real", "aca_household_size",
                          "ltc_on", "ltc_start_age", "ltc_annual_prob", "ltc_cost_real", "ltc_duration_mean", "ltc_duration_sigma"]),
         ("Home", ["home_on", "home_value0", "home_mu", "home_vol", "home_cost_pct",
                   "mortgage_balance0", "mortgage_rate", "mortgage_term_years",
@@ -3805,6 +4799,8 @@ def compare_page():
         ("IRMAA", ["irmaa_on", "irmaa_people", "irmaa_base", "irmaa_t1", "irmaa_p1", "irmaa_t2", "irmaa_p2", "irmaa_t3", "irmaa_p3"]),
         ("Crash Overlay", ["crash_on", "crash_prob", "crash_eq_extra", "crash_reit_extra", "crash_alt_extra", "crash_home_extra"]),
         ("Sequence Stress", ["seq_on", "seq_drop", "seq_years"]),
+        ("Equity Sub-Buckets", ["equity_granular_on", "equity_sub_weights", "equity_sub_mu",
+                                "equity_sub_vol", "tech_bubble_on", "tech_bubble_prob", "tech_bubble_extra_drop"]),
         ("Allocation", []),  # placeholder — holdings checked separately
     ]
 
