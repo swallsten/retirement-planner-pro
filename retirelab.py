@@ -1880,34 +1880,23 @@ def simulate(cfg: dict, hold: dict) -> dict:
             # (Roth 401k is post-tax, so not deducted)
             taxable_wages = np.maximum(0.0, gross_income_nom - trad_401k_nom - match_nom - hsa_contrib_nom)
 
-            # Standard deduction (inflation-adjusted)
-            if filing_status == "mfj":
-                std_deduction = 30000.0 * ci  # ~$30k for MFJ in 2024
-            else:
-                std_deduction = 15000.0 * ci  # ~$15k for single
-            agi = np.maximum(0.0, taxable_wages - std_deduction)
-
-            # Estimate federal + state tax on working income (simplified brackets)
+            # Estimate federal + state tax on working income
             if use_tax_engine:
-                # Use the full tax engine for working-year taxes
-                pre_ret_tax_result = compute_taxes_vectorized(
+                # compute_federal_tax handles standard deduction internally
+                pre_ret_tax_result = compute_federal_tax(
                     ordinary_income=taxable_wages,
-                    trad_withdrawals=np.zeros(n),
-                    roth_withdrawals=np.zeros(n),
-                    conversions=np.zeros(n),
-                    ss_income=np.zeros(n),
-                    ltcg=np.zeros(n),
-                    qualified_divs=np.zeros(n),
-                    state_rate_ordinary=state_rate_ord,
-                    state_rate_capgains=state_rate_cg,
+                    qualified_dividends=np.zeros(n),
+                    ltcg_realized=np.zeros(n),
+                    ss_gross=np.zeros(n),
                     filing_status=filing_status,
                     infl_factor=ci,
                     niit_on=False,
-                    magi_override=None,
                 )
-                pre_ret_taxes = pre_ret_tax_result["fed_total"] + pre_ret_tax_result["state_tax"]
+                fed_tax_working = pre_ret_tax_result["fed_total"]
+                state_tax_working = taxable_wages * state_rate_ord
+                pre_ret_taxes = fed_tax_working + state_tax_working
             else:
-                pre_ret_taxes = agi * eff_ord  # Flat effective rate fallback
+                pre_ret_taxes = taxable_wages * eff_ord  # Flat effective rate fallback
             # Also subtract Roth 401k and FICA (~7.65%) from take-home
             fica = gross_income_nom * 0.0765
             pre_ret_taxes = pre_ret_taxes + fica
