@@ -718,7 +718,6 @@ def simulate(cfg: dict, hold: dict) -> dict:
     hsa0 = float(cfg["hsa_balance0"]) if hsa_on else 0.0
     hsa_like_ret = bool(cfg["hsa_like_ret"])
     hsa_med_real = float(cfg["hsa_med_real"]) if hsa_on else 0.0
-    hsa_allow_nonmed_65 = bool(cfg["hsa_allow_nonmed_65"])
 
     taxable = np.zeros((n, T+1)); taxable[:, 0] = start_tax
     trad = np.zeros((n, T+1)); trad[:, 0] = trad0
@@ -1080,7 +1079,6 @@ def simulate(cfg: dict, hold: dict) -> dict:
     gross_tax_wd_track = np.zeros((n, T+1))
     gross_trad_wd_track = np.zeros((n, T+1))
     gross_roth_wd_track = np.zeros((n, T+1))
-    gross_hsa_wd_track = np.zeros((n, T+1))
     taxes_paid_track = np.zeros((n, T+1))
     conv_gross_track = np.zeros((n, T+1))
     qcd_track = np.zeros((n, T+1))
@@ -1521,11 +1519,6 @@ def simulate(cfg: dict, hold: dict) -> dict:
         ordinary_income_pre = taxable_rmd + conv_gross + ann_income_this_year
         ltcg_pre = tax_prev * dist_yield_val  # cap gains distributions (not yet withdrawal gains)
 
-        # Optional: allow non-medical HSA withdrawals after 65
-        gross_hsa_nonmed = np.zeros(n)
-        if hsa_on and hsa_allow_nonmed_65 and age >= 65:
-            pass
-
         if use_tax_engine and age >= retire_age:
             # --- Pass 1: estimate taxes before withdrawal ---
             tax_result_1 = compute_federal_tax(
@@ -1717,13 +1710,12 @@ def simulate(cfg: dict, hold: dict) -> dict:
                 gross_trad += take_trad
                 gross_roth += take_roth
 
-            taxes_paid_track[:, t] = (gross_tax * gain_frac * eff_capg_wd) + (gross_trad * eff_ord) + (gross_hsa_nonmed * eff_ord)
+            taxes_paid_track[:, t] = (gross_tax * gain_frac * eff_capg_wd) + (gross_trad * eff_ord)
 
         # --- Common post-withdrawal accounting ---
         gross_tax_wd_track[:, t] = gross_tax
         gross_trad_wd_track[:, t] = gross_trad
         gross_roth_wd_track[:, t] = gross_roth
-        gross_hsa_wd_track[:, t] = gross_hsa_nonmed
 
         tax_before = np.maximum(0.0, tax_prev - gross_tax)
         trad_before = np.maximum(0.0, trad_prev - gross_trad)
@@ -2679,8 +2671,6 @@ def init_defaults():
     _d("hsa_balance0", 34000.0)
     _d("hsa_like_ret", True)
     _d("hsa_med_real", 9000.0)
-    _d("hsa_allow_nonmed_65", False)
-
     # Pre-retirement contributions
     _d("contrib_on", True)
     _d("contrib_ret_annual", 23500.0)
@@ -2931,12 +2921,12 @@ def dashboard_page():
     with m3:
         st.html(_metric_card_html(
             f"Liquid Assets at {end_age_val}", f"${sL['p50']/1e6:.1f}M",
-            f"median nominal · real: ${sLr['p50']/1e6:.1f}M", "metric-navy"
+            f"nominal (real: ${sLr['p50']/1e6:.1f}M)", "metric-navy"
         ))
     with m4:
         st.html(_metric_card_html(
             f"Net Worth at {end_age_val}", f"${sN['p50']/1e6:.1f}M",
-            f"median nominal · real: ${sNr['p50']/1e6:.1f}M", "metric-navy"
+            f"nominal (real: ${sNr['p50']/1e6:.1f}M)", "metric-navy"
         ))
 
     st.markdown("")
@@ -3150,11 +3140,11 @@ def plan_setup_page():
         if cfg["contrib_on"]:
             cc1, cc2 = st.columns(2, border=True)
             with cc1:
-                cfg["contrib_ret_annual"] = st.number_input("Annual 401k/IRA contributions", value=float(cfg["contrib_ret_annual"]), step=1000.0, key="ps_contrib_ret")
-                cfg["contrib_match_annual"] = st.number_input("Employer match (annual)", value=float(cfg["contrib_match_annual"]), step=1000.0, key="ps_contrib_match")
+                cfg["contrib_ret_annual"] = st.number_input("Annual 401k/IRA contributions (today's $)", value=float(cfg["contrib_ret_annual"]), step=1000.0, key="ps_contrib_ret")
+                cfg["contrib_match_annual"] = st.number_input("Employer match (today's $)", value=float(cfg["contrib_match_annual"]), step=1000.0, key="ps_contrib_match")
             with cc2:
-                cfg["contrib_taxable_annual"] = st.number_input("Extra taxable savings", value=float(cfg["contrib_taxable_annual"]), step=1000.0, key="ps_contrib_tax")
-                cfg["contrib_hsa_annual"] = st.number_input("Annual HSA contributions", value=float(cfg["contrib_hsa_annual"]), step=500.0, key="ps_contrib_hsa")
+                cfg["contrib_taxable_annual"] = st.number_input("Extra taxable savings (today's $)", value=float(cfg["contrib_taxable_annual"]), step=1000.0, key="ps_contrib_tax")
+                cfg["contrib_hsa_annual"] = st.number_input("Annual HSA contributions (today's $)", value=float(cfg["contrib_hsa_annual"]), step=500.0, key="ps_contrib_hsa")
 
     # ================================================================
     # INCOME
@@ -3166,12 +3156,12 @@ def plan_setup_page():
         sc1, sc2 = st.columns(2, border=True)
         with sc1:
             st.markdown("**Spouse 1**")
-            cfg["ss62_1"] = st.number_input("Monthly benefit at 62", value=float(cfg["ss62_1"]), step=50.0, key="ps_ss62_1")
+            cfg["ss62_1"] = st.number_input("Monthly benefit at 62 (today's $)", value=float(cfg["ss62_1"]), step=50.0, key="ps_ss62_1")
             cfg["claim1"] = st.number_input("Claim age", value=int(cfg["claim1"]), step=1, key="ps_claim1")
         with sc2:
             if cfg["has_spouse"]:
                 st.markdown("**Spouse 2**")
-                cfg["ss62_2"] = st.number_input("Monthly benefit at 62", value=float(cfg["ss62_2"]), step=50.0, key="ps_ss62_2")
+                cfg["ss62_2"] = st.number_input("Monthly benefit at 62 (today's $)", value=float(cfg["ss62_2"]), step=50.0, key="ps_ss62_2")
                 cfg["claim2"] = st.number_input("Claim age", value=int(cfg["claim2"]), step=1, key="ps_claim2")
             else:
                 st.info("Single-person plan - no Spouse 2 inputs.")
@@ -3187,8 +3177,8 @@ def plan_setup_page():
                 cfg["inh_prob"] = st.number_input("Probability", min_value=0.0, max_value=1.0, value=float(cfg["inh_prob"]), step=0.05, format="%.2f", key="ps_inh_prob")
                 cfg["inh_horizon"] = st.number_input("Could arrive within (years)", value=int(cfg["inh_horizon"]), step=1, key="ps_inh_horizon")
             with ic2:
-                cfg["inh_mean"] = st.number_input("Expected amount", value=float(cfg["inh_mean"]), step=100000.0, key="ps_inh_mean")
-                cfg["inh_min"] = st.number_input("Minimum amount", value=float(cfg["inh_min"]), step=100000.0, key="ps_inh_min")
+                cfg["inh_mean"] = st.number_input("Expected amount (today's $)", value=float(cfg["inh_mean"]), step=100000.0, key="ps_inh_mean")
+                cfg["inh_min"] = st.number_input("Minimum amount (today's $)", value=float(cfg["inh_min"]), step=100000.0, key="ps_inh_min")
             cfg["inh_sigma"] = st.number_input("Uncertainty (sigma)", min_value=0.05, max_value=0.80, value=float(cfg["inh_sigma"]), step=0.05, format="%.2f", key="ps_inh_sigma")
 
         # ---- Annuity 1 (SPIA) ----
@@ -3374,7 +3364,7 @@ def plan_setup_page():
                     cfg["aca_mode"] = "simple"
             with hh2:
                 if cfg.get("aca_mode", "simple") == "simple":
-                    cfg["pre65_health_real"] = st.number_input("Annual health insurance cost",
+                    cfg["pre65_health_real"] = st.number_input("Annual health insurance cost (today's $)",
                         value=float(cfg["pre65_health_real"]), step=1000.0, key="ps_pre65_cost")
                 else:
                     cfg["aca_benchmark_premium_real"] = st.number_input(
@@ -3399,10 +3389,9 @@ def plan_setup_page():
             hs1, hs2 = st.columns(2, border=True)
             with hs1:
                 cfg["hsa_balance0"] = st.number_input("Current HSA balance", value=float(cfg["hsa_balance0"]), step=1000.0, key="ps_hsa_bal")
-                cfg["hsa_med_real"] = st.number_input("Annual medical spending", value=float(cfg["hsa_med_real"]), step=500.0, key="ps_hsa_med")
+                cfg["hsa_med_real"] = st.number_input("Annual medical spending (today's $)", value=float(cfg["hsa_med_real"]), step=500.0, key="ps_hsa_med")
             with hs2:
                 cfg["hsa_like_ret"] = st.toggle("Invest HSA like retirement", value=bool(cfg["hsa_like_ret"]), key="ps_hsa_invest")
-                cfg["hsa_allow_nonmed_65"] = st.toggle("Allow non-medical HSA after 65", value=bool(cfg["hsa_allow_nonmed_65"]), key="ps_hsa_nonmed")
 
         st.html('<div class="pro-section-title">Long-Term Care Risk</div>')
         cfg["ltc_on"] = st.toggle("Model LTC risk", value=bool(cfg["ltc_on"]), key="ps_ltc_on",
@@ -3417,7 +3406,7 @@ def plan_setup_page():
                 cfg["ltc_start_age"] = st.number_input("LTC risk starts at age", value=int(cfg["ltc_start_age"]), step=1, key="ps_ltc_age")
                 cfg["ltc_annual_prob"] = st.number_input("Annual probability", min_value=0.0, max_value=0.15, value=float(cfg["ltc_annual_prob"]), step=0.005, format="%.3f", key="ps_ltc_prob")
             with lt2:
-                cfg["ltc_cost_real"] = st.number_input("Annual LTC cost", value=float(cfg["ltc_cost_real"]), step=10000.0, key="ps_ltc_cost")
+                cfg["ltc_cost_real"] = st.number_input("Annual LTC cost (today's $)", value=float(cfg["ltc_cost_real"]), step=10000.0, key="ps_ltc_cost")
                 cfg["ltc_duration_mean"] = st.number_input("Average years of care", value=float(cfg["ltc_duration_mean"]), step=0.5, format="%.1f", key="ps_ltc_dur")
                 cfg["ltc_duration_sigma"] = st.number_input("Duration uncertainty", value=float(cfg["ltc_duration_sigma"]), step=0.5, format="%.1f", key="ps_ltc_sig")
 
@@ -3518,7 +3507,7 @@ def plan_setup_page():
                 cfg["qcd_start_age"] = st.number_input("QCD start age",
                     value=int(cfg["qcd_start_age"]), min_value=70, step=1, key="ps_qcd_age",
                     help="QCDs are available starting at age 70½.")
-                cfg["qcd_max_annual"] = st.number_input("IRS annual QCD limit",
+                cfg["qcd_max_annual"] = st.number_input("IRS annual QCD limit (today's $)",
                     value=float(cfg["qcd_max_annual"]), step=5000.0, key="ps_qcd_max",
                     help="Current IRS maximum per person per year.")
             else:
@@ -4018,17 +4007,69 @@ def deep_dive_page():
     # IRMAA
     # ================================================================
     elif analysis == "IRMAA":
-        st.html('<div class="pro-section-title">Medicare Surcharge Tiers</div>')
+        st.html('<div class="pro-section-title">Medicare IRMAA Surcharges (Part B + Part D)</div>')
         if not bool(cfg_run.get("irmaa_on", False)):
             st.info("IRMAA tracking is off. Enable it in Plan Setup > Taxes to see this analysis.")
         else:
-            st.caption("Median simulated income and resulting IRMAA tier at each age.")
-            magi_med = np.percentile(out["magi"], 50, axis=0)
-            tier_med = np.percentile(out["irmaa_tier"], 50, axis=0)
-            df = pd.DataFrame({"Age": ages, "Estimated MAGI": magi_med, "IRMAA Tier": tier_med})
-            df = df[df["Age"] >= int(cfg_run.get("medicare_age", 65))].copy()
-            df["Estimated MAGI"] = df["Estimated MAGI"].apply(fmt_dollars)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.caption("IRMAA uses MAGI from **2 years prior** to determine surcharge tiers. "
+                       "Median values across simulations, nominal $.")
+            de = out["decomp"]
+            medicare_age = int(cfg_run.get("medicare_age", 65))
+            irmaa_rows = []
+            for idx, age in enumerate(ages):
+                if age < medicare_age:
+                    continue
+                # Lookback MAGI (2 years prior)
+                lb_idx = max(0, idx - 2)
+                lookback_magi = float(np.median(out["magi"][:, lb_idx]))
+                current_magi = float(np.median(out["magi"][:, idx]))
+                part_b = float(np.median(de["irmaa_part_b"][:, idx]))
+                part_d = float(np.median(de["irmaa_part_d"][:, idx]))
+                total_irmaa = float(np.median(de["irmaa_part_b"][:, idx] + de["irmaa_part_d"][:, idx]))
+                tier = float(np.median(out["irmaa_tier"][:, idx]))
+                irmaa_rows.append({
+                    "Age": int(age),
+                    "Lookback MAGI (age−2)": lookback_magi,
+                    "Current MAGI": current_magi,
+                    "Tier": f"{tier:.0f}",
+                    "Part B Surcharge": part_b,
+                    "Part D Surcharge": part_d,
+                    "Total IRMAA": total_irmaa,
+                })
+            if irmaa_rows:
+                irmaa_df = pd.DataFrame(irmaa_rows)
+                for c in ["Lookback MAGI (age−2)", "Current MAGI", "Part B Surcharge", "Part D Surcharge", "Total IRMAA"]:
+                    irmaa_df[c] = irmaa_df[c].apply(fmt_dollars)
+                st.dataframe(irmaa_df, use_container_width=True, hide_index=True, height=500)
+
+                # Stacked bar chart: Part B vs Part D surcharges by age
+                chart_rows = []
+                for idx, age in enumerate(ages):
+                    if age < medicare_age:
+                        continue
+                    chart_rows.append({"Age": int(age), "Component": "Part B",
+                                       "Surcharge": float(np.median(de["irmaa_part_b"][:, idx]))})
+                    chart_rows.append({"Age": int(age), "Component": "Part D",
+                                       "Surcharge": float(np.median(de["irmaa_part_d"][:, idx]))})
+                chart_df = pd.DataFrame(chart_rows)
+                if not chart_df.empty and chart_df["Surcharge"].sum() > 0:
+                    irmaa_chart = alt.Chart(chart_df).mark_bar().encode(
+                        x=alt.X("Age:O", title="Age"),
+                        y=alt.Y("Surcharge:Q", title="Annual IRMAA Surcharge ($)", stack="zero"),
+                        color=alt.Color("Component:N", scale=alt.Scale(
+                            domain=["Part B", "Part D"],
+                            range=["#1B2A4A", "#00897B"])),
+                        tooltip=[
+                            alt.Tooltip("Age:O"),
+                            alt.Tooltip("Component:N"),
+                            alt.Tooltip("Surcharge:Q", format="$,.0f"),
+                        ],
+                    ).properties(height=300, title="IRMAA Surcharges by Age (Median)")
+                    st.altair_chart(irmaa_chart, use_container_width=True)
+                else:
+                    st.success("No IRMAA surcharges triggered in the median simulation path.")
+            else:
+                st.info("No Medicare-eligible ages in the simulation.")
 
     # ================================================================
     # LEGACY
@@ -4038,7 +4079,7 @@ def deep_dive_page():
         if not bool(cfg_run.get("legacy_on", True)):
             st.info("Legacy analysis is off. Enable it in Plan Setup > Advanced.")
         else:
-            st.caption("Estimated estate value at second death (includes home equity). Assumes stepped-up cost basis.")
+            st.caption("Estimated estate value at second death, nominal $. Includes home equity. Assumes stepped-up cost basis.")
             legacy = out["legacy"]
             lc1, lc2, lc3 = st.columns(3, border=True)
             with lc1:
@@ -4219,8 +4260,8 @@ def deep_dive_page():
         if infl_idx is None:
             st.info("Run the simulation again to see tax bracket projections.")
         elif _tax_engine_was_on:
-            st.caption("Actual tax engine output (median across simulations). Federal taxes are computed with real brackets, "
-                       "SS provisional income, and LTCG/QD stacking.")
+            st.caption("Actual tax engine output (median across simulations, nominal dollars). Federal brackets are inflation-adjusted each year, "
+                       "with SS provisional income and LTCG/QD stacking.")
             retire_age = int(cfg_run["retire_age"])
             tb_rows = []
             for idx, age in enumerate(ages):
@@ -4253,7 +4294,7 @@ def deep_dive_page():
                 st.info("No retirement-age data to display.")
         else:
             # Legacy mode: approximate brackets
-            st.caption("Estimated income sources and marginal bracket (legacy flat-rate mode). Median values across simulations.")
+            st.caption("Estimated income sources and marginal bracket (legacy flat-rate mode). Median values across simulations, nominal $.")
             retire_age = int(cfg_run["retire_age"])
             filing = str(cfg_run.get("conv_filing_status", cfg_run.get("gain_harvest_filing", "mfj")))
             if filing == "mfj":
@@ -4312,7 +4353,7 @@ def deep_dive_page():
     # ACA
     # ================================================================
     elif analysis == "ACA":
-        st.html('<div class="pro-section-title">ACA Premium & Subsidy Projection</div>')
+        st.html('<div class="pro-section-title">ACA Premium & Subsidy Projection (Nominal $)</div>')
         de = out["decomp"]
         _aca_mode_run = str(cfg_run.get("aca_mode", "simple"))
         if _aca_mode_run != "aca":
@@ -4793,7 +4834,7 @@ def compare_page():
                   "mortgage_balance0", "mortgage_rate", "mortgage_term_years",
                   "sale_on", "sale_age", "selling_cost_pct", "post_sale_mode", "downsize_fraction", "rent_real"]),
         ("Inheritance", ["inh_on", "inh_min", "inh_mean", "inh_sigma", "inh_prob", "inh_horizon"]),
-        ("HSA", ["hsa_on", "hsa_balance0", "hsa_like_ret", "hsa_med_real", "hsa_allow_nonmed_65"]),
+        ("HSA", ["hsa_on", "hsa_balance0", "hsa_like_ret", "hsa_med_real"]),
         ("Contributions", ["contrib_on", "contrib_ret_annual", "contrib_match_annual"]),
         ("Fees", ["fee_tax", "fee_ret"]),
         ("IRMAA", ["irmaa_on", "irmaa_people", "irmaa_base", "irmaa_t1", "irmaa_p1", "irmaa_t2", "irmaa_p2", "irmaa_t3", "irmaa_p3"]),
