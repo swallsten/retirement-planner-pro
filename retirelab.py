@@ -977,6 +977,8 @@ def simulate(cfg: dict, hold: dict) -> dict:
     seq_on = bool(cfg["seq_on"])
     seq_drop = float(cfg["seq_drop"])
     seq_years = int(cfg["seq_years"])
+    seq_start_age_raw = int(cfg.get("seq_start_age", 0))
+    seq_start_age = seq_start_age_raw if seq_start_age_raw > 0 else retire_age
 
     # spending + GK
     spend_split_on = bool(cfg.get("spend_split_on", False))
@@ -1280,7 +1282,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
             r_alt[crash] = np.clip(r_alt[crash] + crash_alt_extra, -0.95, 2.0)
             home_app[crash] = np.clip(home_app[crash] + crash_home_extra, -0.95, 2.0)
 
-        if seq_on and age >= retire_age and age < retire_age + seq_years:
+        if seq_on and age >= seq_start_age and age < seq_start_age + seq_years:
             r_eq = np.clip(r_eq + seq_drop, -0.95, 2.0)
             r_reit = np.clip(r_reit + seq_drop, -0.95, 2.0)
             r_alt = np.clip(r_alt + 0.5 * seq_drop, -0.95, 2.0)
@@ -2599,17 +2601,25 @@ def open_crash_dialog():
         st.rerun()
 
 
-@st.dialog("Early-Retirement Bad-Luck Shock", width="large")
+@st.dialog("Market Downturn Stress Test", width="large")
 def open_sequence_dialog():
     cfg = st.session_state["cfg"]
-    st.markdown("What if the market crashes right when you retire? Force a downturn in the first years of retirement to see if your plan survives.")
-    cfg["seq_on"] = st.toggle("Test a bad market right after you retire", value=bool(cfg["seq_on"]), key="dlg_seq_on")
+    st.markdown("Force a market downturn at any age to test your plan's resilience. "
+                "Every simulation gets hit — it's not random.")
+    cfg["seq_on"] = st.toggle("Force a market downturn at a specific age", value=bool(cfg["seq_on"]), key="dlg_seq_on")
     if cfg["seq_on"]:
+        _seq_start_val = int(cfg.get("seq_start_age", 0))
+        _seq_default = int(cfg.get("retire_age", 65)) if _seq_start_val <= 0 else _seq_start_val
+        cfg["seq_start_age"] = st.number_input(
+            "Downturn starts at age",
+            min_value=int(cfg.get("start_age", 55)), max_value=int(cfg.get("end_age", 100)),
+            value=_seq_default, step=1, key="dlg_seq_start_age")
         cfg["seq_drop"] = st.number_input(
             "Annual return penalty during stress period",
+            min_value=-0.50, max_value=0.0,
             value=float(cfg["seq_drop"]), step=0.01, format="%.2f", key="dlg_seq_drop")
         cfg["seq_years"] = st.number_input(
-            "How many years the bad period lasts",
+            "How many years the bad period lasts", min_value=1, max_value=10,
             value=int(cfg["seq_years"]), step=1, key="dlg_seq_years")
     if st.button("Save", key="dlg_seq_save", type="primary"):
         st.session_state["cfg"] = cfg
@@ -2697,10 +2707,11 @@ def init_defaults():
     _d("crash_alt_extra", -0.10)
     _d("crash_home_extra", -0.20)
 
-    # Sequence stress
+    # Sequence / market-downturn stress
     _d("seq_on", False)
     _d("seq_drop", -0.25)
     _d("seq_years", 2)
+    _d("seq_start_age", 0)  # 0 = start at retirement age (default); any other value = that specific age
 
     # Taxes — tax engine
     _d("tax_engine_on", True)
@@ -3415,16 +3426,15 @@ def plan_setup_page():
                 else:
                     cfg["pretax_income_2"] = 0.0
                     st.info("Single-person plan — no Spouse 2 income.")
-            ig1, ig2 = st.columns(2, border=True)
-            with ig1:
-                cfg["income_growth_real"] = st.number_input("Real wage growth (above inflation)", value=float(cfg["income_growth_real"]),
-                    min_value=-0.05, max_value=0.10, step=0.005, format="%.3f", key="ps_income_growth",
-                    help="Annual real (above-inflation) salary growth rate. 0.01 = 1% real raises per year.")
-            with ig2:
-                cfg["pre_ret_spend_real"] = st.number_input("Pre-retirement spending (today's $)", value=float(cfg["pre_ret_spend_real"]),
-                    step=5000.0, key="ps_pre_ret_spend",
-                    help="Annual spending while working. Set to 0 to use your post-retirement spending amount. "
-                         "Typically higher than retirement spending due to commuting, childcare, etc.")
+            cfg["income_growth_real"] = st.number_input("Real wage growth (above inflation)", value=float(cfg["income_growth_real"]),
+                min_value=-0.05, max_value=0.10, step=0.005, format="%.3f", key="ps_income_growth",
+                help="Annual real (above-inflation) salary growth rate. 0.01 = 1% real raises per year.")
+            pre_ret_sp = float(cfg.get("pre_ret_spend_real", 0.0))
+            if pre_ret_sp > 0:
+                st.info(f"Pre-retirement spending: **${pre_ret_sp:,.0f}**/yr (set in the **Spending** tab)")
+            else:
+                post_sp = float(cfg.get("spend_real", 120000.0))
+                st.info(f"Pre-retirement spending: **${post_sp:,.0f}**/yr (same as retirement spending — change in the **Spending** tab)")
 
             st.html('<div class="pro-section-title">Retirement Contributions</div>')
             cc1, cc2 = st.columns(2, border=True)
@@ -3559,7 +3569,8 @@ def plan_setup_page():
     # SPENDING
     # ================================================================
     elif section == "Spending":
-        st.html('<div class="pro-section-title">Annual Core Spending</div>')
+        st.html('<div class="pro-section-title">Retirement Spending</div>')
+        st.caption("How much you plan to spend each year **after** you retire. Housing, health insurance, and medical costs are tracked separately.")
         cfg["spend_split_on"] = st.toggle("Split into essential vs. discretionary",
             value=bool(cfg.get("spend_split_on", False)), key="ps_split_on",
             help="Separate must-have expenses (food, utilities, insurance) from nice-to-have (travel, dining out). "
@@ -3580,11 +3591,23 @@ def plan_setup_page():
                     "Housing, health insurance, and medical costs are tracked separately.")
         else:
             cfg["spend_real"] = st.number_input(
-                "Annual core living expenses (today's dollars)", value=float(cfg["spend_real"]), step=10000.0, key="ps_spend_real",
-                help="Everyday costs only. Housing, health insurance, and medical are entered separately."
+                "Annual retirement spending (today's dollars)", value=float(cfg["spend_real"]), step=10000.0, key="ps_spend_real",
+                help="Everyday costs in retirement. Housing, health insurance, and medical are entered separately."
             )
-            st.info("This covers groceries, dining, utilities, transportation, travel, entertainment, etc. "
+            st.info("Groceries, dining, utilities, transportation, travel, entertainment, etc. "
                     "Housing, health insurance, and medical costs are tracked separately.")
+
+        # Pre-retirement spending (only relevant if still working)
+        if cfg.get("contrib_on", False):
+            st.html('<div class="pro-section-title">Pre-Retirement Spending</div>')
+            st.caption("How much you spend each year **before** you retire. Often higher than retirement spending "
+                       "due to commuting, childcare, work clothes, etc. Set to 0 to use your retirement spending amount.")
+            cfg["pre_ret_spend_real"] = st.number_input("Pre-retirement spending (today's $)", value=float(cfg.get("pre_ret_spend_real", 0.0)),
+                step=5000.0, key="ps_pre_ret_spend",
+                help="Annual spending while still working. Set to 0 to use the same amount as your retirement spending above. "
+                     "The surplus (income minus spending, taxes, and contributions) is auto-saved to your taxable account.")
+            if float(cfg.get("pre_ret_spend_real", 0.0)) <= 0:
+                st.caption(f"Using retirement spending of **${float(cfg['spend_real']):,.0f}** for pre-retirement years too.")
 
         st.html('<div class="pro-section-title">Spending Phases</div>')
         pc1, pc2, pc3 = st.columns(3, border=True)
@@ -4160,25 +4183,44 @@ def plan_setup_page():
                 cfg["crash_home_extra"] = st.number_input("Home value: extra drop", min_value=-0.80, max_value=0.0,
                     value=float(cfg["crash_home_extra"]), step=0.05, format="%.2f", key="ps_crash_home")
 
-        st.html('<div class="pro-section-title">Early-Retirement Bad-Luck Shock</div>')
-        st.caption("What if the market tanks right when you retire? This is the most dangerous scenario for retirees — "
-                   "withdrawing from a shrinking portfolio in year one can permanently damage your plan.")
-        cfg["seq_on"] = st.toggle("Test a bad market right after you retire", value=bool(cfg["seq_on"]), key="ps_seq_on",
-            help="Forces a market downturn in the first N years of retirement. Every simulation gets hit with this shock — "
-                 "it's not random. This tests whether your plan can survive the worst-case timing.")
+        st.html('<div class="pro-section-title">Market Downturn Stress Test</div>')
+        st.caption("Force a market downturn at a specific age to test your plan's resilience. "
+                   "This applies to **every** simulation — it's not random. A downturn right before or at retirement "
+                   "is the classic danger, but you can test any year.")
+        cfg["seq_on"] = st.toggle("Force a market downturn at a specific age", value=bool(cfg["seq_on"]), key="ps_seq_on",
+            help="Every simulation gets hit with this shock at the specified age. "
+                 "Use this to test whether your plan can survive bad timing.")
         if not cfg["seq_on"]:
-            st.caption("Toggle on to force a market drop in the first years of retirement and see if your plan survives.")
+            st.caption("Toggle on to force a market drop at a chosen age and see if your plan survives.")
         if cfg["seq_on"]:
-            sq1, sq2 = st.columns(2, border=True)
+            sq1, sq2, sq3 = st.columns(3, border=True)
             with sq1:
-                cfg["seq_drop"] = st.number_input("Annual return penalty during shock", min_value=-0.50, max_value=0.0,
+                _seq_start_val = int(cfg.get("seq_start_age", 0))
+                _seq_default = int(cfg.get("retire_age", 65)) if _seq_start_val <= 0 else _seq_start_val
+                cfg["seq_start_age"] = st.number_input("Downturn starts at age",
+                    min_value=int(cfg.get("start_age", 55)), max_value=int(cfg.get("end_age", 100)),
+                    value=_seq_default, step=1, key="ps_seq_start_age",
+                    help="The age when the forced market downturn begins. Can be before, at, or after retirement age.")
+            with sq2:
+                cfg["seq_drop"] = st.number_input("Annual return penalty", min_value=-0.50, max_value=0.0,
                     value=float(cfg["seq_drop"]), step=0.05, format="%.2f", key="ps_seq_drop",
                     help="Extra negative return added to stocks and REITs each year during the shock window. "
                          "E.g. -0.25 = an additional 25% loss per year on top of normal randomness.")
-            with sq2:
-                cfg["seq_years"] = st.number_input("How many years the bad period lasts", min_value=1, max_value=10,
+            with sq3:
+                cfg["seq_years"] = st.number_input("Duration (years)", min_value=1, max_value=10,
                     value=int(cfg["seq_years"]), step=1, key="ps_seq_years",
-                    help="Number of years after retirement that the forced downturn applies.")
+                    help="How many consecutive years the forced downturn lasts.")
+            _seq_sa = int(cfg["seq_start_age"]) if int(cfg.get("seq_start_age", 0)) > 0 else int(cfg.get("retire_age", 65))
+            _seq_ea = _seq_sa + int(cfg["seq_years"]) - 1
+            _ret_a = int(cfg.get("retire_age", 65))
+            if _seq_sa < _ret_a:
+                st.info(f"Downturn hits ages **{_seq_sa}–{_seq_ea}** (starts **{_ret_a - _seq_sa} years before retirement**). "
+                        "This tests the impact on your savings and contributions during working years.")
+            elif _seq_sa == _ret_a:
+                st.info(f"Downturn hits ages **{_seq_sa}–{_seq_ea}** (right at retirement). "
+                        "This is the classic sequence-of-returns risk scenario.")
+            else:
+                st.info(f"Downturn hits ages **{_seq_sa}–{_seq_ea}** ({_seq_sa - _ret_a} years into retirement).")
 
     # ================================================================
     # ADVANCED
@@ -4960,7 +5002,7 @@ _DIFF_KEYS = [
     ("contrib_ret_annual", "Contrib Annual"), ("contrib_roth_401k_frac", "Roth 401k %"),
     ("fee_tax", "Fee (Taxable)"), ("fee_ret", "Fee (Retirement)"),
     ("irmaa_on", "IRMAA"), ("mort_on", "Mortality"),
-    ("crash_on", "Crash Overlay"), ("seq_on", "Sequence Stress"),
+    ("crash_on", "Crash Overlay"), ("seq_on", "Sequence Stress"), ("seq_start_age", "Shock Start Age"),
     ("legacy_on", "Legacy"),
     ("equity_granular_on", "Equity Sub-Buckets"), ("tech_bubble_on", "Tech/AI Bubble"),
 ]
@@ -5165,7 +5207,7 @@ def compare_page():
         ("Fees", ["fee_tax", "fee_ret"]),
         ("IRMAA", ["irmaa_on", "irmaa_people", "irmaa_base", "irmaa_t1", "irmaa_p1", "irmaa_t2", "irmaa_p2", "irmaa_t3", "irmaa_p3"]),
         ("Crash Overlay", ["crash_on", "crash_prob", "crash_eq_extra", "crash_reit_extra", "crash_alt_extra", "crash_home_extra"]),
-        ("Sequence Stress", ["seq_on", "seq_drop", "seq_years"]),
+        ("Sequence Stress", ["seq_on", "seq_drop", "seq_years", "seq_start_age"]),
         ("Equity Sub-Buckets", ["equity_granular_on", "equity_sub_weights", "equity_sub_mu",
                                 "equity_sub_vol", "tech_bubble_on", "tech_bubble_prob", "tech_bubble_extra_drop"]),
         ("Allocation", []),  # placeholder — holdings checked separately
