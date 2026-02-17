@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -124,6 +125,86 @@ def classify_asset(row: pd.Series) -> str:
     if any(k in text for k in ["managed futures", "commodity", "commodities", "trend", "buffer", "defined outcome", "vix", "long volatility", "alternative"]):
         return "Alternatives"
     return "Equities"
+
+def _detect_ticker(row: pd.Series) -> str:
+    """Try to extract a ticker symbol from a row. Looks for columns named symbol/ticker first, then
+    falls back to scanning short uppercase tokens in all columns."""
+    for c in row.index:
+        cn = _norm(c)
+        if cn in ("symbol", "ticker", "sym"):
+            val = str(row[c]).strip().upper()
+            if val and val not in ("NAN", "NONE", ""):
+                return val
+    # Fallback: scan all columns for a short uppercase token that looks like a ticker
+    for c in row.index:
+        val = str(row[c]).strip()
+        if 1 <= len(val) <= 6 and val.isalpha() and val == val.upper():
+            return val
+    return ""
+
+def classify_equity_sub(row: pd.Series) -> str:
+    """Classify an equity holding into one of EQUITY_SUB_CLASSES using TICKER_HEURISTICS.
+    Returns the sub-class name, or 'US Large Blend' as default for unrecognized tickers."""
+    ticker = _detect_ticker(row)
+    if ticker:
+        for pattern, sub_class in TICKER_HEURISTICS.items():
+            if re.search(r"(?:^|(?<=\|))(" + pattern + r")(?:$|(?=\|))", ticker):
+                return sub_class
+    # Also try name-based heuristics from the row text
+    text = " ".join(str(row.get(c, "")) for c in row.index).lower()
+    if any(k in text for k in ["small cap", "small-cap", "russell 2000", "smallcap"]):
+        return "US Small"
+    if any(k in text for k in ["international", "intl", "foreign", "developed market", "ex-us", "ex us", "ftse dev"]):
+        return "Intl Developed"
+    if any(k in text for k in ["emerging", "em market"]):
+        return "Emerging"
+    if any(k in text for k in ["value", "dividend", "high div"]):
+        return "US Value"
+    if any(k in text for k in ["tech", "nasdaq", "semiconductor", "ai ", "artificial intelligence", "innovation"]):
+        return "Tech/AI"
+    return "US Large Blend"
+
+def equity_sub_from_holdings(df: pd.DataFrame, valcol: str) -> Tuple[Dict[str, float], pd.DataFrame]:
+    """Given a holdings DataFrame, classify each equity holding into a sub-bucket and compute weights.
+    Returns (sub_weights_dict, classification_df_for_display).
+    The classification_df has columns: Ticker, Name, Value, Sub-Class for user review."""
+    tmp = df.copy()
+    tmp["_class"] = tmp.apply(classify_asset, axis=1)
+    eq_df = tmp[tmp["_class"] == "Equities"].copy()
+    if eq_df.empty:
+        return {c: EQUITY_SUB_DEFAULTS[c]["weight"] for c in EQUITY_SUB_CLASSES}, pd.DataFrame()
+
+    eq_df["_sub_class"] = eq_df.apply(classify_equity_sub, axis=1)
+    eq_df["_ticker"] = eq_df.apply(_detect_ticker, axis=1)
+
+    # Compute dollar totals per sub-class
+    by_sub = eq_df.groupby("_sub_class")[valcol].sum()
+    eq_total = float(by_sub.sum())
+    if eq_total <= 0:
+        return {c: EQUITY_SUB_DEFAULTS[c]["weight"] for c in EQUITY_SUB_CLASSES}, pd.DataFrame()
+
+    sub_weights = {}
+    for c in EQUITY_SUB_CLASSES:
+        sub_weights[c] = float(by_sub.get(c, 0.0)) / eq_total
+
+    # Build display DataFrame for user review
+    # Try to find a name/description column
+    name_col = None
+    for c in eq_df.columns:
+        cn = _norm(c)
+        if cn in ("name", "description", "desc", "holdingname", "securityname", "security", "secname", "securitydescription"):
+            name_col = c
+            break
+    display_rows = []
+    for _, r in eq_df.iterrows():
+        display_rows.append({
+            "Ticker": r["_ticker"] if r["_ticker"] else "—",
+            "Name": str(r[name_col])[:50] if name_col and pd.notna(r.get(name_col)) else "—",
+            "Value": float(r[valcol]),
+            "Sub-Class": r["_sub_class"],
+        })
+    display_df = pd.DataFrame(display_rows)
+    return sub_weights, display_df
 
 def load_snapshot(uploaded_file):
     df = pd.read_csv(uploaded_file)
@@ -2257,20 +2338,40 @@ def _run_sensitivity_tests(cfg_run: dict, hold: dict, n_fast: int = 3000) -> pd.
     base = simulate(cfg_fast, hold)
     base_med = float(np.percentile(base["net_worth"], 50, axis=0)[-1])
 
+    # Build stock return patches that work for both standard and granular modes
+    eq_mu_base = float(cfg_fast["scenario_params"]["eq_mu"])
+    _return_bump = 0.02  # ±2 percentage points
+
+    # Standard model: patch scenario_params.eq_mu
+    # Granular model: also patch every sub-bucket mu proportionally
+    def _build_return_patch(delta: float) -> dict:
+        patch = {"scenario_params": dict(cfg_fast["scenario_params"], eq_mu=eq_mu_base + delta)}
+        if cfg_fast.get("equity_granular_on", False):
+            base_sub_mu = dict(cfg_fast.get("equity_sub_mu", {k: v["mu"] for k, v in EQUITY_SUB_DEFAULTS.items()}))
+            patch["equity_sub_mu"] = {k: float(v) + delta for k, v in base_sub_mu.items()}
+        return patch
+
+    # Spending perturbation: proportional to current spending, capped at ±10%
+    spend_base = float(cfg_fast["spend_real"])
+    spend_bump = min(25000.0, round(spend_base * 0.10, -3))  # 10% of spending, max $25k, round to nearest $1k
+    spend_bump = max(5000.0, spend_bump)  # at least $5k
+
+    # Retirement age: skip if already retired (start_age >= retire_age)
+    start_a = int(cfg_fast["start_age"])
+    retire_a = int(cfg_fast["retire_age"])
+    can_test_retire_age = retire_a > start_a + 2  # need room to move earlier
+
     # Paired tests: (variable_label, up_label, up_patch, down_label, down_patch)
     paired_tests = [
-        ("Annual Spending ±$50k",
-         "Spend $50k more", {"spend_real": float(cfg_fast["spend_real"]) + 50000.0},
-         "Spend $50k less", {"spend_real": max(50000.0, float(cfg_fast["spend_real"]) - 50000.0)}),
-        ("Retirement Age ±2 yrs",
-         "Retire 2 yrs later", {"retire_age": int(cfg_fast["retire_age"]) + 2},
-         "Retire 2 yrs earlier", {"retire_age": max(int(cfg_fast["start_age"]) + 1, int(cfg_fast["retire_age"]) - 2)}),
+        (f"Annual Spending ±${spend_bump/1000:.0f}k",
+         f"Spend ${spend_bump/1000:.0f}k more", {"spend_real": spend_base + spend_bump},
+         f"Spend ${spend_bump/1000:.0f}k less", {"spend_real": max(30000.0, spend_base - spend_bump)}),
         ("SS Claim Age (Spouse 1)",
          "Claim at 70", {"claim1": 70},
          "Claim at 67", {"claim1": 67}),
         ("Stock Returns ±2%",
-         "Returns +2%", {"scenario_params": dict(cfg_fast["scenario_params"], eq_mu=float(cfg_fast["scenario_params"]["eq_mu"]) + 0.02)},
-         "Returns −2%", {"scenario_params": dict(cfg_fast["scenario_params"], eq_mu=float(cfg_fast["scenario_params"]["eq_mu"]) - 0.02)}),
+         "Returns +2%", _build_return_patch(+_return_bump),
+         "Returns −2%", _build_return_patch(-_return_bump)),
         ("Inflation ±1%",
          "Inflation +1%", {"infl_mu": float(cfg_fast["infl_mu"]) + 0.01},
          "Inflation −1%", {"infl_mu": float(cfg_fast["infl_mu"]) - 0.01}),
@@ -2290,15 +2391,6 @@ def _run_sensitivity_tests(cfg_run: dict, hold: dict, n_fast: int = 3000) -> pd.
          "Fill to 24%", {"conv_on": True, "conv_type": "bracket_fill", "conv_target_bracket": 0.24,
                           "conv_start": 62, "conv_end": 72, "conv_irmaa_aware": True, "conv_filing_status": "mfj"},
          "No conversions", {"conv_on": False}),
-        ("Discretionary Spending ±$50k",
-         "Discretionary +$50k", {"spend_split_on": True,
-                                  "spend_essential_real": float(cfg_fast.get("spend_essential_real", 180000.0)),
-                                  "spend_discretionary_real": float(cfg_fast.get("spend_discretionary_real", 120000.0)) + 50000.0,
-                                  "spend_real": float(cfg_fast["spend_real"]) + 50000.0},
-         "Discretionary −$50k", {"spend_split_on": True,
-                                  "spend_essential_real": float(cfg_fast.get("spend_essential_real", 180000.0)),
-                                  "spend_discretionary_real": max(10000.0, float(cfg_fast.get("spend_discretionary_real", 120000.0)) - 50000.0),
-                                  "spend_real": max(float(cfg_fast.get("spend_essential_real", 180000.0)) + 10000.0, float(cfg_fast["spend_real"]) - 50000.0)}),
         ("0% LTCG Gain Harvesting",
          "Harvest 0% gains", {"gain_harvest_on": True, "gain_harvest_filing": "mfj"},
          "No harvesting", {"gain_harvest_on": False}),
@@ -2306,6 +2398,28 @@ def _run_sensitivity_tests(cfg_run: dict, hold: dict, n_fast: int = 3000) -> pd.
          "$30k QCD", {"qcd_on": True, "qcd_annual_real": 30000.0, "qcd_start_age": 70, "rmd_on": True},
          "No QCD", {"qcd_on": False}),
     ]
+
+    # Only add retirement age test if there's room to move in both directions
+    if can_test_retire_age:
+        paired_tests.insert(1, ("Retirement Age ±2 yrs",
+            "Retire 2 yrs later", {"retire_age": retire_a + 2},
+            "Retire 2 yrs earlier", {"retire_age": retire_a - 2}))
+
+    # Add discretionary spending test only if spend_split is already on
+    if bool(cfg_fast.get("spend_split_on", False)):
+        disc_base = float(cfg_fast.get("spend_discretionary_real", 0.0))
+        ess_base = float(cfg_fast.get("spend_essential_real", 0.0))
+        disc_bump = min(15000.0, round(disc_base * 0.15, -3))
+        disc_bump = max(5000.0, disc_bump)
+        paired_tests.append(
+            (f"Discretionary ±${disc_bump/1000:.0f}k",
+             f"Disc. +${disc_bump/1000:.0f}k", {
+                 "spend_discretionary_real": disc_base + disc_bump,
+                 "spend_real": ess_base + disc_base + disc_bump},
+             f"Disc. −${disc_bump/1000:.0f}k", {
+                 "spend_discretionary_real": max(5000.0, disc_base - disc_bump),
+                 "spend_real": ess_base + max(5000.0, disc_base - disc_bump)})
+        )
 
     rows = []
     for var_label, up_name, up_patch, down_name, down_patch in paired_tests:
@@ -3058,10 +3172,15 @@ def plan_setup_page():
             w_tax_u, w_ret_u = {}, {}
             total_tax_u, total_ret_u = 0.0, 0.0
 
+            # Also track raw DataFrames for sub-bucket classification
+            tax_df_raw, tax_val_raw = None, None
+            ret_df_raw, ret_val_raw = None, None
+
             if tax_file:
                 try:
                     tax_df, tax_val = load_snapshot(tax_file)
                     w_tax_u, total_tax_u, dollars_tax_u = weights_and_dollars(tax_df, tax_val)
+                    tax_df_raw, tax_val_raw = tax_df, tax_val
                     tax_ok = True
                 except Exception as e:
                     st.error(f"Error parsing taxable CSV: {e}")
@@ -3070,6 +3189,7 @@ def plan_setup_page():
                 try:
                     ret_df, ret_val = load_snapshot(ret_file)
                     w_ret_u, total_ret_u, dollars_ret_u = weights_and_dollars(ret_df, ret_val)
+                    ret_df_raw, ret_val_raw = ret_df, ret_val
                     ret_ok = True
                 except Exception as e:
                     st.error(f"Error parsing retirement CSV: {e}")
@@ -3101,6 +3221,61 @@ def plan_setup_page():
                 st.success(f"Taxable: {fmt_dollars(final_hold['total_tax'])} | "
                            f"Retirement: {fmt_dollars(final_hold['total_ret'])} | "
                            f"Combined: {fmt_dollars(final_hold['total_tax'] + final_hold['total_ret'])}")
+
+                # --- Equity sub-bucket auto-classification from CSV holdings ---
+                all_sub_display = []
+                combined_sub_weights = {c: 0.0 for c in EQUITY_SUB_CLASSES}
+                combined_eq_total = 0.0
+
+                if tax_ok and tax_df_raw is not None:
+                    sub_w_tax, disp_tax = equity_sub_from_holdings(tax_df_raw, tax_val_raw)
+                    eq_tax_total = float(dollars_tax_u.get("Equities", 0.0))
+                    if not disp_tax.empty:
+                        disp_tax.insert(0, "Account", "Taxable")
+                        all_sub_display.append(disp_tax)
+                    for c in EQUITY_SUB_CLASSES:
+                        combined_sub_weights[c] += sub_w_tax.get(c, 0.0) * eq_tax_total
+                    combined_eq_total += eq_tax_total
+
+                if ret_ok and ret_df_raw is not None:
+                    sub_w_ret, disp_ret = equity_sub_from_holdings(ret_df_raw, ret_val_raw)
+                    eq_ret_total = float(dollars_ret_u.get("Equities", 0.0))
+                    if not disp_ret.empty:
+                        disp_ret.insert(0, "Account", "Retirement")
+                        all_sub_display.append(disp_ret)
+                    for c in EQUITY_SUB_CLASSES:
+                        combined_sub_weights[c] += sub_w_ret.get(c, 0.0) * eq_ret_total
+                    combined_eq_total += eq_ret_total
+
+                # Normalize combined weights
+                if combined_eq_total > 0:
+                    for c in EQUITY_SUB_CLASSES:
+                        combined_sub_weights[c] /= combined_eq_total
+
+                    # Show classification review
+                    with st.expander("🔍 Equity sub-bucket classification from holdings", expanded=False):
+                        st.caption("Each equity holding was classified into a sub-bucket using ticker symbols and description keywords. "
+                                   "Review the mapping below — you can adjust weights in the Allocation section.")
+                        if all_sub_display:
+                            review_df = pd.concat(all_sub_display, ignore_index=True)
+                            review_df["Value"] = review_df["Value"].apply(lambda v: fmt_dollars(v))
+                            st.dataframe(review_df, use_container_width=True, hide_index=True)
+
+                        # Show computed sub-bucket weight summary
+                        sw_df = pd.DataFrame({
+                            "Sub-Class": EQUITY_SUB_CLASSES,
+                            "Weight from CSV": [f"{combined_sub_weights[c]:.1%}" for c in EQUITY_SUB_CLASSES],
+                            "Dollar Amount": [fmt_dollars(combined_sub_weights[c] * combined_eq_total) for c in EQUITY_SUB_CLASSES],
+                        })
+                        st.dataframe(sw_df, use_container_width=True, hide_index=True)
+                        st.info(f"Total equities classified: {fmt_dollars(combined_eq_total)}")
+
+                    # Auto-populate sub-bucket weights in config
+                    cfg["equity_sub_weights"] = combined_sub_weights
+                    # Auto-enable granular mode when we have CSV-derived sub-bucket data
+                    if not cfg.get("equity_granular_on", False):
+                        cfg["equity_granular_on"] = True
+                        st.toast("📊 Equity sub-bucket detail auto-enabled from CSV holdings", icon="📊")
             elif not tax_file and not ret_file:
                 st.info("Upload one or both CSV files above. You can also use Manual entry.")
         else:
