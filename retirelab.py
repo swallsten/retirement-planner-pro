@@ -1133,12 +1133,19 @@ def simulate(cfg: dict, hold: dict) -> dict:
                     dur = np.full(int(triggers.sum()), max(1.0, ltc_dur_mean))
                 ltc_end_age[triggers] = a + np.ceil(dur).astype(int)
 
-    # Pre-retirement contributions
+    # Pre-retirement income & contributions
     contrib_on = bool(cfg.get("contrib_on", False)) and (start_age < retire_age)
+    pretax_income_1 = float(cfg.get("pretax_income_1", 0.0)) if contrib_on else 0.0
+    pretax_income_2 = float(cfg.get("pretax_income_2", 0.0)) if contrib_on else 0.0
+    income_growth_real = float(cfg.get("income_growth_real", 0.01))
     contrib_ret = float(cfg.get("contrib_ret_annual", 0.0)) if contrib_on else 0.0
+    contrib_roth_401k_frac = float(cfg.get("contrib_roth_401k_frac", 0.0))
     contrib_match = float(cfg.get("contrib_match_annual", 0.0)) if contrib_on else 0.0
     contrib_taxable = float(cfg.get("contrib_taxable_annual", 0.0)) if contrib_on else 0.0
     contrib_hsa = float(cfg.get("contrib_hsa_annual", 0.0)) if (contrib_on and hsa_on) else 0.0
+    pre_ret_spend = float(cfg.get("pre_ret_spend_real", 0.0))
+    if pre_ret_spend <= 0 and contrib_on:
+        pre_ret_spend = float(cfg.get("spend_real", 120000.0))  # default to post-retirement spend
 
     # -------- Decomposition trackers (nominal) --------
     ltc_cost_track = np.zeros((n, T+1))
@@ -1186,6 +1193,11 @@ def simulate(cfg: dict, hold: dict) -> dict:
     # IRMAA Part B/D trackers
     irmaa_part_b_track = np.zeros((n, T+1))
     irmaa_part_d_track = np.zeros((n, T+1))
+
+    # Pre-retirement income trackers
+    earned_income_track = np.zeros((n, T+1))
+    pre_ret_tax_track = np.zeros((n, T+1))
+    pre_ret_savings_track = np.zeros((n, T+1))
 
     for t in range(1, T+1):
         age = int(ages[t-1])
@@ -1838,17 +1850,88 @@ def simulate(cfg: dict, hold: dict) -> dict:
         else:
             hsa[:, t] = 0.0
 
-        # Pre-retirement contributions
+        # Pre-retirement income, taxes, contributions, and surplus savings
         if contrib_on and age < retire_age:
             ci = infl_index[:, t]
-            total_ret_contrib = (contrib_ret + contrib_match) * ci
-            trad[:, t] += total_ret_contrib * (1 - roth_frac)
-            roth[:, t] += total_ret_contrib * roth_frac
-            if contrib_taxable > 0:
-                taxable[:, t] += contrib_taxable * ci
-                basis[:, t] += contrib_taxable * ci
+            # Real wage growth on top of inflation
+            years_worked = age - start_age
+            real_growth_factor = (1 + income_growth_real) ** years_worked
+            gross_income_nom = (pretax_income_1 + pretax_income_2) * ci * real_growth_factor
+            earned_income_track[:, t] = gross_income_nom
+
+            # Employee 401k contributions (today's $ scaled by inflation)
+            employee_401k_nom = contrib_ret * ci
+            # Split employee contribution: Roth 401k vs Traditional 401k
+            roth_401k_nom = employee_401k_nom * contrib_roth_401k_frac
+            trad_401k_nom = employee_401k_nom * (1 - contrib_roth_401k_frac)
+            # Employer match is always pre-tax traditional
+            match_nom = contrib_match * ci
+
+            trad[:, t] += trad_401k_nom + match_nom
+            roth[:, t] += roth_401k_nom
+
+            # HSA contributions (pre-tax)
+            hsa_contrib_nom = np.zeros(n)
             if hsa_on and contrib_hsa > 0:
-                hsa[:, t] += contrib_hsa * ci
+                hsa_contrib_nom = np.full(n, contrib_hsa * ci)
+                hsa[:, t] += hsa_contrib_nom
+
+            # Taxable income for working years: gross - traditional 401k - HSA
+            # (Roth 401k is post-tax, so not deducted)
+            taxable_wages = np.maximum(0.0, gross_income_nom - trad_401k_nom - match_nom - hsa_contrib_nom)
+
+            # Standard deduction (inflation-adjusted)
+            if filing_status == "mfj":
+                std_deduction = 30000.0 * ci  # ~$30k for MFJ in 2024
+            else:
+                std_deduction = 15000.0 * ci  # ~$15k for single
+            agi = np.maximum(0.0, taxable_wages - std_deduction)
+
+            # Estimate federal + state tax on working income (simplified brackets)
+            if use_tax_engine:
+                # Use the full tax engine for working-year taxes
+                pre_ret_tax_result = compute_taxes_vectorized(
+                    ordinary_income=taxable_wages,
+                    trad_withdrawals=np.zeros(n),
+                    roth_withdrawals=np.zeros(n),
+                    conversions=np.zeros(n),
+                    ss_income=np.zeros(n),
+                    ltcg=np.zeros(n),
+                    qualified_divs=np.zeros(n),
+                    state_rate_ordinary=state_rate_ord,
+                    state_rate_capgains=state_rate_cg,
+                    filing_status=filing_status,
+                    infl_factor=ci,
+                    niit_on=False,
+                    magi_override=None,
+                )
+                pre_ret_taxes = pre_ret_tax_result["fed_total"] + pre_ret_tax_result["state_tax"]
+            else:
+                pre_ret_taxes = agi * eff_ord  # Flat effective rate fallback
+            # Also subtract Roth 401k and FICA (~7.65%) from take-home
+            fica = gross_income_nom * 0.0765
+            pre_ret_taxes = pre_ret_taxes + fica
+            pre_ret_tax_track[:, t] = pre_ret_taxes
+
+            # Pre-retirement spending (nominal)
+            pre_ret_spend_nom = pre_ret_spend * ci
+
+            # After-tax take-home: gross - 401k employee - HSA - taxes
+            take_home = gross_income_nom - employee_401k_nom - hsa_contrib_nom - pre_ret_taxes
+
+            # Surplus after spending → saved to taxable account
+            surplus = np.maximum(0.0, take_home - pre_ret_spend_nom)
+            # Explicit extra taxable savings (if user specified additional amount)
+            explicit_taxable = contrib_taxable * ci
+            total_new_taxable = surplus + explicit_taxable
+            taxable[:, t] += total_new_taxable
+            basis[:, t] += total_new_taxable
+            pre_ret_savings_track[:, t] = total_new_taxable
+
+            # Track spending and MAGI during working years
+            core_spend_track[:, t] = pre_ret_spend_nom
+            magi_track[:, t] = gross_income_nom  # MAGI ≈ gross income for working years (simplified)
+            taxes_paid_track[:, t] = pre_ret_taxes
 
     liquid = taxable + trad + roth + hsa
     home_equity = np.maximum(0.0, home_value - mortgage)
@@ -1937,6 +2020,9 @@ def simulate(cfg: dict, hold: dict) -> dict:
             "aca_net": _f32(aca_net_track),
             "irmaa_part_b": _f32(irmaa_part_b_track),
             "irmaa_part_d": _f32(irmaa_part_d_track),
+            "earned_income": _f32(earned_income_track),
+            "pre_ret_tax": _f32(pre_ret_tax_track),
+            "pre_ret_savings": _f32(pre_ret_savings_track),
         },
         "infl_index": _f32(infl_index),
         "regime_states": regime_track,
@@ -2789,12 +2875,17 @@ def init_defaults():
     _d("hsa_balance0", 34000.0)
     _d("hsa_like_ret", True)
     _d("hsa_med_real", 9000.0)
-    # Pre-retirement contributions
+    # Pre-retirement income & contributions
     _d("contrib_on", True)
-    _d("contrib_ret_annual", 23500.0)
-    _d("contrib_match_annual", 11750.0)
-    _d("contrib_taxable_annual", 0.0)
+    _d("pretax_income_1", 200000.0)    # Spouse 1 gross salary (today's $)
+    _d("pretax_income_2", 0.0)         # Spouse 2 gross salary (today's $)
+    _d("income_growth_real", 0.01)     # Real wage growth above inflation
+    _d("contrib_ret_annual", 23500.0)  # Employee 401k/IRA contribution (today's $)
+    _d("contrib_roth_401k_frac", 0.0)  # Fraction of 401k that goes Roth (0 = all traditional)
+    _d("contrib_match_annual", 11750.0)  # Employer match (always pre-tax)
+    _d("contrib_taxable_annual", 0.0)  # Extra after-tax savings to taxable
     _d("contrib_hsa_annual", 4300.0)
+    _d("pre_ret_spend_real", 0.0)      # Pre-retirement annual spending (today's $); 0 = use post-ret spend_real
 
     # Equity sub-buckets (Phase 5)
     _d("equity_granular_on", False)
@@ -3314,19 +3405,80 @@ def plan_setup_page():
                 "dollars_ret": {k: manual_ret * w_ret_m[k] for k in ASSET_CLASSES},
             }
 
-        st.html('<div class="pro-section-title">Pre-Retirement Savings</div>')
-        cfg["contrib_on"] = st.toggle("Still saving before retirement", value=bool(cfg["contrib_on"]), key="ps_contrib_on",
-            help="If you haven't retired yet, the model adds your annual savings contributions to your accounts each year until retirement.")
+        st.html('<div class="pro-section-title">Pre-Retirement Income & Savings</div>')
+        cfg["contrib_on"] = st.toggle("Still working before retirement", value=bool(cfg["contrib_on"]), key="ps_contrib_on",
+            help="If you haven't retired yet, the model uses your earned income to pay taxes, fund spending, make retirement contributions, and save any surplus.")
         if not cfg["contrib_on"]:
-            st.caption("Toggle on if you're still working and contributing to 401(k), IRA, taxable, or HSA accounts.")
+            st.caption("Toggle on if you're still working. The model will track your income, taxes, contributions, and surplus savings until retirement.")
         if cfg["contrib_on"]:
+            st.html('<div style="font-weight:600; color:#1B2A4A; font-size:0.95rem; margin:0.5rem 0 0.3rem;">Earned Income</div>')
+            inc1, inc2 = st.columns(2, border=True)
+            with inc1:
+                cfg["pretax_income_1"] = st.number_input("Spouse 1 gross salary (today's $)", value=float(cfg["pretax_income_1"]), step=10000.0, key="ps_income_1",
+                    help="Annual gross salary before taxes and deductions. Grows with inflation plus real wage growth.")
+            with inc2:
+                if cfg["has_spouse"]:
+                    cfg["pretax_income_2"] = st.number_input("Spouse 2 gross salary (today's $)", value=float(cfg["pretax_income_2"]), step=10000.0, key="ps_income_2",
+                        help="Spouse 2's annual gross salary. Set to 0 if not working.")
+                else:
+                    cfg["pretax_income_2"] = 0.0
+                    st.info("Single-person plan — no Spouse 2 income.")
+            ig1, ig2 = st.columns(2, border=True)
+            with ig1:
+                cfg["income_growth_real"] = st.number_input("Real wage growth (above inflation)", value=float(cfg["income_growth_real"]),
+                    min_value=-0.05, max_value=0.10, step=0.005, format="%.3f", key="ps_income_growth",
+                    help="Annual real (above-inflation) salary growth rate. 0.01 = 1% real raises per year.")
+            with ig2:
+                cfg["pre_ret_spend_real"] = st.number_input("Pre-retirement spending (today's $)", value=float(cfg["pre_ret_spend_real"]),
+                    step=5000.0, key="ps_pre_ret_spend",
+                    help="Annual spending while working. Set to 0 to use your post-retirement spending amount. "
+                         "Typically higher than retirement spending due to commuting, childcare, etc.")
+
+            st.html('<div style="font-weight:600; color:#1B2A4A; font-size:0.95rem; margin:0.5rem 0 0.3rem;">Retirement Contributions</div>')
             cc1, cc2 = st.columns(2, border=True)
             with cc1:
-                cfg["contrib_ret_annual"] = st.number_input("Annual 401k/IRA contributions (today's $)", value=float(cfg["contrib_ret_annual"]), step=1000.0, key="ps_contrib_ret")
-                cfg["contrib_match_annual"] = st.number_input("Employer match (today's $)", value=float(cfg["contrib_match_annual"]), step=1000.0, key="ps_contrib_match")
+                cfg["contrib_ret_annual"] = st.number_input("Employee 401k/IRA (today's $)", value=float(cfg["contrib_ret_annual"]), step=1000.0, key="ps_contrib_ret",
+                    help="Your annual 401(k) or IRA contribution. The 2024 limit is $23,500 ($31,000 if 50+).")
+                cfg["contrib_roth_401k_frac"] = st.number_input("Roth 401k fraction", value=float(cfg["contrib_roth_401k_frac"]),
+                    min_value=0.0, max_value=1.0, step=0.1, format="%.1f", key="ps_roth_401k_frac",
+                    help="What fraction of your 401k contribution goes to Roth (post-tax). 0 = all traditional, 1 = all Roth 401k.")
             with cc2:
-                cfg["contrib_taxable_annual"] = st.number_input("Extra taxable savings (today's $)", value=float(cfg["contrib_taxable_annual"]), step=1000.0, key="ps_contrib_tax")
-                cfg["contrib_hsa_annual"] = st.number_input("Annual HSA contributions (today's $)", value=float(cfg["contrib_hsa_annual"]), step=500.0, key="ps_contrib_hsa")
+                cfg["contrib_match_annual"] = st.number_input("Employer match (today's $)", value=float(cfg["contrib_match_annual"]), step=1000.0, key="ps_contrib_match",
+                    help="Employer matching contribution. Always goes to traditional (pre-tax) 401k.")
+                cfg["contrib_hsa_annual"] = st.number_input("HSA contributions (today's $)", value=float(cfg["contrib_hsa_annual"]), step=500.0, key="ps_contrib_hsa",
+                    help="Pre-tax HSA contributions. 2024 family limit is $8,300.")
+
+            cfg["contrib_taxable_annual"] = st.number_input("Extra taxable savings on top of surplus (today's $)", value=float(cfg["contrib_taxable_annual"]), step=1000.0, key="ps_contrib_tax",
+                help="Additional fixed amount saved to taxable brokerage beyond the automatic surplus (income minus taxes, spending, and contributions). Usually 0 — the model auto-saves your surplus.")
+
+            # Show estimated pre-retirement cash flow summary
+            gross = float(cfg["pretax_income_1"]) + float(cfg["pretax_income_2"])
+            emp_401k = float(cfg["contrib_ret_annual"])
+            hsa_c = float(cfg["contrib_hsa_annual"])
+            match_c = float(cfg["contrib_match_annual"])
+            roth_401k_f = float(cfg["contrib_roth_401k_frac"])
+            trad_deductions = emp_401k * (1 - roth_401k_f) + match_c + hsa_c
+            pre_spend = float(cfg["pre_ret_spend_real"])
+            if pre_spend <= 0:
+                pre_spend = float(cfg.get("spend_real", 120000.0))
+            # Rough tax estimate
+            rough_agi = max(0, gross - trad_deductions - (30000 if cfg["has_spouse"] else 15000))
+            rough_tax = rough_agi * 0.28 + gross * 0.0765  # ~28% marginal + FICA
+            take_home = gross - emp_401k - hsa_c - rough_tax
+            surplus = max(0, take_home - pre_spend)
+            with st.expander("💰 Estimated pre-retirement cash flow (today's $)", expanded=False):
+                cf_data = {
+                    "": ["Gross income", "− Employee 401k/IRA", "− HSA contribution",
+                         "− Est. taxes (fed+state+FICA)", "= Take-home pay",
+                         "− Pre-retirement spending", "= **Surplus → taxable savings**",
+                         "", "Employer match → traditional 401k"],
+                    "Amount": [fmt_dollars(gross), fmt_dollars(-emp_401k), fmt_dollars(-hsa_c),
+                               fmt_dollars(-rough_tax), fmt_dollars(take_home),
+                               fmt_dollars(-pre_spend), f"**{fmt_dollars(surplus)}**",
+                               "", fmt_dollars(match_c)],
+                }
+                st.dataframe(pd.DataFrame(cf_data), use_container_width=True, hide_index=True)
+                st.caption("This is a rough estimate using today's dollars. The simulation uses the full tax engine with inflation-adjusted brackets.")
 
     # ================================================================
     # INCOME
@@ -4815,7 +4967,9 @@ _DIFF_KEYS = [
     ("inh_on", "Inheritance"), ("inh_mean", "Inheritance Mean"),
     ("ltc_on", "LTC Risk"), ("ltc_cost_real", "LTC Annual Cost"),
     ("hsa_on", "HSA"), ("hsa_balance0", "HSA Balance"),
-    ("contrib_on", "Pre-Ret Contributions"), ("contrib_ret_annual", "Contrib Annual"),
+    ("contrib_on", "Pre-Ret Income"), ("pretax_income_1", "Salary S1"), ("pretax_income_2", "Salary S2"),
+    ("income_growth_real", "Wage Growth"), ("pre_ret_spend_real", "Pre-Ret Spending"),
+    ("contrib_ret_annual", "Contrib Annual"), ("contrib_roth_401k_frac", "Roth 401k %"),
     ("fee_tax", "Fee (Taxable)"), ("fee_ret", "Fee (Retirement)"),
     ("irmaa_on", "IRMAA"), ("mort_on", "Mortality"),
     ("crash_on", "Crash Overlay"), ("seq_on", "Sequence Stress"),
@@ -5017,7 +5171,9 @@ def compare_page():
                   "sale_on", "sale_age", "selling_cost_pct", "post_sale_mode", "downsize_fraction", "rent_real"]),
         ("Inheritance", ["inh_on", "inh_min", "inh_mean", "inh_sigma", "inh_prob", "inh_horizon"]),
         ("HSA", ["hsa_on", "hsa_balance0", "hsa_like_ret", "hsa_med_real"]),
-        ("Contributions", ["contrib_on", "contrib_ret_annual", "contrib_match_annual"]),
+        ("Pre-Ret Income & Contributions", ["contrib_on", "pretax_income_1", "pretax_income_2",
+            "income_growth_real", "pre_ret_spend_real", "contrib_ret_annual", "contrib_roth_401k_frac",
+            "contrib_match_annual", "contrib_taxable_annual", "contrib_hsa_annual"]),
         ("Fees", ["fee_tax", "fee_ret"]),
         ("IRMAA", ["irmaa_on", "irmaa_people", "irmaa_base", "irmaa_t1", "irmaa_p1", "irmaa_t2", "irmaa_p2", "irmaa_t3", "irmaa_p3"]),
         ("Crash Overlay", ["crash_on", "crash_prob", "crash_eq_extra", "crash_reit_extra", "crash_alt_extra", "crash_home_extra"]),
