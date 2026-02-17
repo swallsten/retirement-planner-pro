@@ -773,7 +773,7 @@ def bracket_fill_conversion(ordinary_income: np.ndarray, trad_balance: np.ndarra
     return np.maximum(0.0, np.minimum(room, trad_balance))
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=8)
 def simulate(cfg: dict, hold: dict) -> dict:
     rng = np.random.default_rng(int(cfg["seed"]))
     n = int(cfg["n_sims"])
@@ -1878,63 +1878,67 @@ def simulate(cfg: dict, hold: dict) -> dict:
             funded_through_age = int(ages[t_idx - 1])
             break
 
+    # Convert large arrays to float32 before returning to halve cached memory footprint
+    def _f32(a):
+        return a.astype(np.float32) if a.dtype == np.float64 else a
+
     return {
         "ages": ages,
-        "liquid": liquid,
-        "net_worth": net_worth,
-        "liquid_real": liquid_real,
-        "net_worth_real": net_worth_real,
-        "home_value": home_value,
-        "mortgage": mortgage,
-        "hsa": hsa,
-        "magi": magi_track,
+        "liquid": _f32(liquid),
+        "net_worth": _f32(net_worth),
+        "liquid_real": _f32(liquid_real),
+        "net_worth_real": _f32(net_worth_real),
+        "home_value": _f32(home_value),
+        "mortgage": _f32(mortgage),
+        "hsa": _f32(hsa),
+        "magi": _f32(magi_track),
         "irmaa_tier": tier_track,
-        "legacy": legacy,
+        "legacy": _f32(legacy),
         "ruin_age": ruin_age,
         "funded_through_age": funded_through_age,
         "second_death": second_death,
         "decomp": {
-            "baseline_core": baseline_core_track,
-            "core_adjusted": core_spend_track,
-            "spend_real_track": core_spend_track / np.maximum(infl_index, 1e-9),
-            "home_cost": home_cost_track,
-            "mort_pay": mort_pay_track,
-            "rent": rent_track,
-            "health": health_track,
-            "medical_nom": medical_nom_track,
-            "hsa_used_med": hsa_withdraw_track,
-            "ltc_cost": ltc_cost_track,
-            "outflow_total": total_outflow_track,
-            "ss_inflow": ss_nom_track,
-            "irmaa": irmaa_paid_track,
-            "gross_tax_wd": gross_tax_wd_track,
-            "gross_trad_wd": gross_trad_wd_track,
-            "gross_roth_wd": gross_roth_wd_track,
-            "taxes_paid": taxes_paid_track,
-            "hsa_end": hsa_end_track,
-            "annuity_income": annuity_income_track,
-            "annuity_purchase": annuity_purchase_track,
-            "conv_gross": conv_gross_track,
-            "qcd": qcd_track,
-            "gain_harvest": gain_harvest_track,
-            "essential_spend": essential_spend_track,
-            "discretionary_spend": discretionary_spend_track,
-            "essential_funded": essential_funded_track,
-            "fed_tax": fed_tax_track,
-            "state_tax": state_tax_track,
-            "niit": niit_track,
-            "ss_taxable": ss_taxable_track,
-            "effective_rate": effective_rate_track,
-            "marginal_bracket": marginal_bracket_track,
-            "ltcg_realized": ltcg_realized_track,
-            "qual_divs": qual_div_track,
-            "aca_gross": aca_gross_track,
-            "aca_subsidy": aca_subsidy_track,
-            "aca_net": aca_net_track,
-            "irmaa_part_b": irmaa_part_b_track,
-            "irmaa_part_d": irmaa_part_d_track,
+            "baseline_core": _f32(baseline_core_track),
+            "core_adjusted": _f32(core_spend_track),
+            "spend_real_track": _f32(core_spend_track / np.maximum(infl_index, 1e-9)),
+            "home_cost": _f32(home_cost_track),
+            "mort_pay": _f32(mort_pay_track),
+            "rent": _f32(rent_track),
+            "health": _f32(health_track),
+            "medical_nom": _f32(medical_nom_track),
+            "hsa_used_med": _f32(hsa_withdraw_track),
+            "ltc_cost": _f32(ltc_cost_track),
+            "outflow_total": _f32(total_outflow_track),
+            "ss_inflow": _f32(ss_nom_track),
+            "irmaa": _f32(irmaa_paid_track),
+            "gross_tax_wd": _f32(gross_tax_wd_track),
+            "gross_trad_wd": _f32(gross_trad_wd_track),
+            "gross_roth_wd": _f32(gross_roth_wd_track),
+            "taxes_paid": _f32(taxes_paid_track),
+            "hsa_end": _f32(hsa_end_track),
+            "annuity_income": _f32(annuity_income_track),
+            "annuity_purchase": _f32(annuity_purchase_track),
+            "conv_gross": _f32(conv_gross_track),
+            "qcd": _f32(qcd_track),
+            "gain_harvest": _f32(gain_harvest_track),
+            "essential_spend": _f32(essential_spend_track),
+            "discretionary_spend": _f32(discretionary_spend_track),
+            "essential_funded": _f32(essential_funded_track),
+            "fed_tax": _f32(fed_tax_track),
+            "state_tax": _f32(state_tax_track),
+            "niit": _f32(niit_track),
+            "ss_taxable": _f32(ss_taxable_track),
+            "effective_rate": _f32(effective_rate_track),
+            "marginal_bracket": _f32(marginal_bracket_track),
+            "ltcg_realized": _f32(ltcg_realized_track),
+            "qual_divs": _f32(qual_div_track),
+            "aca_gross": _f32(aca_gross_track),
+            "aca_subsidy": _f32(aca_subsidy_track),
+            "aca_net": _f32(aca_net_track),
+            "irmaa_part_b": _f32(irmaa_part_b_track),
+            "irmaa_part_d": _f32(irmaa_part_d_track),
         },
-        "infl_index": infl_index,
+        "infl_index": _f32(infl_index),
         "regime_states": regime_track,
     }
 
@@ -1974,7 +1978,7 @@ def run_optimizer(cfg: dict, hold: dict, objective: str) -> dict:
     """
     import time
     t0 = time.time()
-    n_fast = 1500  # simulations per candidate
+    n_fast = 1000  # simulations per candidate
 
     # Run baseline
     cfg_base = dict(cfg)
@@ -2453,7 +2457,7 @@ def _run_sensitivity_tests(cfg_run: dict, hold: dict, n_fast: int = 3000) -> pd.
 def render_mini_tornado(cfg_run: dict, hold: dict, top_n: int = 6):
     """Quick sensitivity analysis with top N factors displayed."""
     with st.spinner("Analyzing sensitivity..."):
-        tor = _run_sensitivity_tests(cfg_run, hold, n_fast=1000)
+        tor = _run_sensitivity_tests(cfg_run, hold, n_fast=800)
     render_tornado_chart(tor, top_n=top_n)
 
 
@@ -2556,7 +2560,7 @@ def init_defaults():
     _d("override_params", dict(DEFAULT_SCENARIOS["Base"]))
 
     # Simulation
-    _d("n_sims", 5000)
+    _d("n_sims", 3000)
     _d("seed", 42)
 
     # Ages
@@ -3093,7 +3097,7 @@ def dashboard_page():
                 for sname, sparams in DEFAULT_SCENARIOS.items():
                     ctmp = dict(cfg_run)
                     ctmp["scenario_params"] = dict(sparams)
-                    ctmp["n_sims"] = 1500
+                    ctmp["n_sims"] = 1000
                     o = simulate(ctmp, hold)
                     liq_end = o["liquid"][:, -1]
                     nw_end = o["net_worth"][:, -1]
@@ -4043,7 +4047,7 @@ def plan_setup_page():
         st.html('<div class="pro-section-title">Simulation Settings</div>')
         ad1, ad2 = st.columns(2, border=True)
         with ad1:
-            cfg["n_sims"] = st.slider("Number of simulations", 1000, 50000, int(cfg["n_sims"]), 1000, key="ps_n_sims")
+            cfg["n_sims"] = st.slider("Number of simulations", 500, 10000, int(cfg["n_sims"]), 500, key="ps_n_sims")
         with ad2:
             cfg["seed"] = st.number_input("Random seed", value=int(cfg["seed"]), step=1, key="ps_seed")
 
@@ -4171,9 +4175,9 @@ def deep_dive_page():
     # ================================================================
     elif analysis == "Sensitivity":
         st.html('<div class="pro-section-title">Full Sensitivity Analysis</div>')
-        st.caption("Each variable shows the impact of both an increase and decrease. Uses 1,500 simulations per test for speed.")
+        st.caption("Each variable shows the impact of both an increase and decrease. Uses 1,000 simulations per test for speed.")
         with st.spinner("Running sensitivity tests..."):
-            tor = _run_sensitivity_tests(cfg_run, hold, n_fast=1500)
+            tor = _run_sensitivity_tests(cfg_run, hold, n_fast=1000)
         render_tornado_chart(tor)
         # Show clean table
         display_df = tor[["Variable", "Up ($M)", "Down ($M)", "Up Label", "Down Label"]].copy()
@@ -4367,16 +4371,16 @@ def deep_dive_page():
         if not bool(_roth_cfg.get("conv_on", False)):
             st.info("Roth conversions are off. Enable them in Assumptions > Taxes, then come back here.")
         else:
-            st.caption("Compares your current Roth conversion strategy against no conversions. Uses 1,500 simulations for speed.")
+            st.caption("Compares your current Roth conversion strategy against no conversions.")
             with st.spinner("Running comparison simulations..."):
                 # Run with conversions (current live settings)
                 cfg_with = dict(_roth_cfg)
-                cfg_with["n_sims"] = 1500
+                cfg_with["n_sims"] = 1000
                 out_with = simulate(cfg_with, hold)
 
                 # Run without conversions
                 cfg_without = dict(_roth_cfg)
-                cfg_without["n_sims"] = 1500
+                cfg_without["n_sims"] = 1000
                 cfg_without["conv_on"] = False
                 out_without = simulate(cfg_without, hold)
 
@@ -5049,13 +5053,13 @@ def compare_page():
             st.caption(
                 f"Starting from **{picked[0]}**, each bar shows how much the success rate changes "
                 f"when switching that one group of assumptions to **{picked[1]}**'s values. "
-                "Uses 1,500 sims per test for speed."
+                "Uses 1,000 sims per test for speed."
             )
             base_success = met_a["pct_success"]
             attrib_rows = []
             # Build a fast version of cfg_a
             cfg_a_fast = dict(cfg_a)
-            cfg_a_fast["n_sims"] = 1500
+            cfg_a_fast["n_sims"] = 1000
             with st.spinner("Running attribution analysis..."):
                 for gname, gkeys in differing_groups:
                     # Start from A, swap this group to B's values
@@ -5070,7 +5074,7 @@ def compare_page():
                         # Rebuild scenario_params if we changed market outlook keys
                         if gname == "Market Outlook":
                             cfg_test = build_cfg_run(cfg_test)
-                            cfg_test["n_sims"] = 1500
+                            cfg_test["n_sims"] = 1000
                     out_test = simulate(cfg_test, hold_test)
                     ra_test = out_test["ruin_age"]
                     end_age_test = int(cfg_test.get("end_age", sc_a["cfg"]["end_age"]))
