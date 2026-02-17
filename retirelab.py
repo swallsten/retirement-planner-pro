@@ -1974,7 +1974,7 @@ def run_optimizer(cfg: dict, hold: dict, objective: str) -> dict:
     """
     import time
     t0 = time.time()
-    n_fast = 2000  # simulations per candidate
+    n_fast = 1500  # simulations per candidate
 
     # Run baseline
     cfg_base = dict(cfg)
@@ -2453,7 +2453,7 @@ def _run_sensitivity_tests(cfg_run: dict, hold: dict, n_fast: int = 3000) -> pd.
 def render_mini_tornado(cfg_run: dict, hold: dict, top_n: int = 6):
     """Quick sensitivity analysis with top N factors displayed."""
     with st.spinner("Analyzing sensitivity..."):
-        tor = _run_sensitivity_tests(cfg_run, hold, n_fast=2000)
+        tor = _run_sensitivity_tests(cfg_run, hold, n_fast=1000)
     render_tornado_chart(tor, top_n=top_n)
 
 
@@ -2556,7 +2556,7 @@ def init_defaults():
     _d("override_params", dict(DEFAULT_SCENARIOS["Base"]))
 
     # Simulation
-    _d("n_sims", 10000)
+    _d("n_sims", 5000)
     _d("seed", 42)
 
     # Ages
@@ -3087,29 +3087,32 @@ def dashboard_page():
     # ---- Quick market outlook comparison ----
     with st.expander("Quick market outlook comparison", expanded=False):
         st.caption("See how your plan looks under different market outlooks (uses fewer simulations for speed).")
-        comp_rows = []
-        for sname, sparams in DEFAULT_SCENARIOS.items():
-            ctmp = dict(cfg_run)
-            ctmp["scenario_params"] = dict(sparams)
-            ctmp["n_sims"] = 2000
-            o = simulate(ctmp, hold)
-            liq_end = o["liquid"][:, -1]
-            nw_end = o["net_worth"][:, -1]
-            ra = o["ruin_age"]
-            pct_ok = 100.0 - float((ra <= end_age_val).sum()) / len(ra) * 100
-            comp_rows.append({
-                "Market Outlook": sname,
-                "Won't Run Out": f"{pct_ok:.0f}%",
-                "Median Liquid": f"${np.median(liq_end)/1e6:.1f}M",
-                "Median Net Worth": f"${np.median(nw_end)/1e6:.1f}M",
-                "p10 Liquid": f"${np.percentile(liq_end, 10)/1e6:.1f}M",
-            })
-        st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
+        if st.button("Run comparison", key="dash_mkt_compare"):
+            comp_rows = []
+            with st.spinner("Comparing market outlooks..."):
+                for sname, sparams in DEFAULT_SCENARIOS.items():
+                    ctmp = dict(cfg_run)
+                    ctmp["scenario_params"] = dict(sparams)
+                    ctmp["n_sims"] = 1500
+                    o = simulate(ctmp, hold)
+                    liq_end = o["liquid"][:, -1]
+                    nw_end = o["net_worth"][:, -1]
+                    ra = o["ruin_age"]
+                    pct_ok = 100.0 - float((ra <= end_age_val).sum()) / len(ra) * 100
+                    comp_rows.append({
+                        "Market Outlook": sname,
+                        "Won't Run Out": f"{pct_ok:.0f}%",
+                        "Median Liquid": f"${np.median(liq_end)/1e6:.1f}M",
+                        "Median Net Worth": f"${np.median(nw_end)/1e6:.1f}M",
+                        "p10 Liquid": f"${np.percentile(liq_end, 10)/1e6:.1f}M",
+                    })
+            st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
 
     # ---- What Matters Most (mini tornado) ----
     st.html('<div class="pro-section-title">What Matters Most</div>')
     st.caption("Top factors affecting your median ending net worth. Full analysis available in Deep Dive.")
-    render_mini_tornado(cfg_run, hold, top_n=6)
+    if st.button("▶ Analyze sensitivity", key="dash_sensitivity"):
+        render_mini_tornado(cfg_run, hold, top_n=6)
 
 
 # ---- 8b: Plan Setup page ----
@@ -4168,9 +4171,9 @@ def deep_dive_page():
     # ================================================================
     elif analysis == "Sensitivity":
         st.html('<div class="pro-section-title">Full Sensitivity Analysis</div>')
-        st.caption("Each variable shows the impact of both an increase and decrease. Uses 3,000 simulations per test for speed.")
+        st.caption("Each variable shows the impact of both an increase and decrease. Uses 1,500 simulations per test for speed.")
         with st.spinner("Running sensitivity tests..."):
-            tor = _run_sensitivity_tests(cfg_run, hold, n_fast=3000)
+            tor = _run_sensitivity_tests(cfg_run, hold, n_fast=1500)
         render_tornado_chart(tor)
         # Show clean table
         display_df = tor[["Variable", "Up ($M)", "Down ($M)", "Up Label", "Down Label"]].copy()
@@ -4364,16 +4367,16 @@ def deep_dive_page():
         if not bool(_roth_cfg.get("conv_on", False)):
             st.info("Roth conversions are off. Enable them in Assumptions > Taxes, then come back here.")
         else:
-            st.caption("Compares your current Roth conversion strategy against no conversions. Uses 3,000 simulations for speed.")
+            st.caption("Compares your current Roth conversion strategy against no conversions. Uses 1,500 simulations for speed.")
             with st.spinner("Running comparison simulations..."):
                 # Run with conversions (current live settings)
                 cfg_with = dict(_roth_cfg)
-                cfg_with["n_sims"] = 3000
+                cfg_with["n_sims"] = 1500
                 out_with = simulate(cfg_with, hold)
 
                 # Run without conversions
                 cfg_without = dict(_roth_cfg)
-                cfg_without["n_sims"] = 3000
+                cfg_without["n_sims"] = 1500
                 cfg_without["conv_on"] = False
                 out_without = simulate(cfg_without, hold)
 
@@ -5046,13 +5049,13 @@ def compare_page():
             st.caption(
                 f"Starting from **{picked[0]}**, each bar shows how much the success rate changes "
                 f"when switching that one group of assumptions to **{picked[1]}**'s values. "
-                "Uses 2,000 sims per test for speed."
+                "Uses 1,500 sims per test for speed."
             )
             base_success = met_a["pct_success"]
             attrib_rows = []
             # Build a fast version of cfg_a
             cfg_a_fast = dict(cfg_a)
-            cfg_a_fast["n_sims"] = 2000
+            cfg_a_fast["n_sims"] = 1500
             with st.spinner("Running attribution analysis..."):
                 for gname, gkeys in differing_groups:
                     # Start from A, swap this group to B's values
@@ -5067,7 +5070,7 @@ def compare_page():
                         # Rebuild scenario_params if we changed market outlook keys
                         if gname == "Market Outlook":
                             cfg_test = build_cfg_run(cfg_test)
-                            cfg_test["n_sims"] = 2000
+                            cfg_test["n_sims"] = 1500
                     out_test = simulate(cfg_test, hold_test)
                     ra_test = out_test["ruin_age"]
                     end_age_test = int(cfg_test.get("end_age", sc_a["cfg"]["end_age"]))
