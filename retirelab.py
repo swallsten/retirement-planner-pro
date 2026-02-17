@@ -3394,13 +3394,16 @@ def plan_setup_page():
                 "dollars_ret": {k: manual_ret * w_ret_m[k] for k in ASSET_CLASSES},
             }
 
-        st.html('<div class="pro-section-title">Pre-Retirement Income & Savings</div>')
+    # ================================================================
+    # INCOME
+    # ================================================================
+    elif section == "Income":
+        st.html('<div class="pro-section-title">Pre-Retirement Earned Income</div>')
         cfg["contrib_on"] = st.toggle("Still working before retirement", value=bool(cfg["contrib_on"]), key="ps_contrib_on",
             help="If you haven't retired yet, the model uses your earned income to pay taxes, fund spending, make retirement contributions, and save any surplus.")
         if not cfg["contrib_on"]:
             st.caption("Toggle on if you're still working. The model will track your income, taxes, contributions, and surplus savings until retirement.")
         if cfg["contrib_on"]:
-            st.html('<div style="font-weight:600; color:#1B2A4A; font-size:0.95rem; margin:0.5rem 0 0.3rem;">Earned Income</div>')
             inc1, inc2 = st.columns(2, border=True)
             with inc1:
                 cfg["pretax_income_1"] = st.number_input("Spouse 1 gross salary (today's $)", value=float(cfg["pretax_income_1"]), step=10000.0, key="ps_income_1",
@@ -3423,7 +3426,7 @@ def plan_setup_page():
                     help="Annual spending while working. Set to 0 to use your post-retirement spending amount. "
                          "Typically higher than retirement spending due to commuting, childcare, etc.")
 
-            st.html('<div style="font-weight:600; color:#1B2A4A; font-size:0.95rem; margin:0.5rem 0 0.3rem;">Retirement Contributions</div>')
+            st.html('<div class="pro-section-title">Retirement Contributions</div>')
             cc1, cc2 = st.columns(2, border=True)
             with cc1:
                 cfg["contrib_ret_annual"] = st.number_input("Employee 401k/IRA (today's $)", value=float(cfg["contrib_ret_annual"]), step=1000.0, key="ps_contrib_ret",
@@ -3455,7 +3458,7 @@ def plan_setup_page():
             rough_tax = rough_agi * 0.28 + gross * 0.0765  # ~28% marginal + FICA
             take_home = gross - emp_401k - hsa_c - rough_tax
             surplus = max(0, take_home - pre_spend)
-            with st.expander("💰 Estimated pre-retirement cash flow (today's $)", expanded=False):
+            with st.expander("💰 Estimated pre-retirement cash flow (today's $)", expanded=True):
                 cf_data = {
                     "": ["Gross income", "− Employee 401k/IRA", "− HSA contribution",
                          "− Est. taxes (fed+state+FICA)", "= Take-home pay",
@@ -3469,10 +3472,6 @@ def plan_setup_page():
                 st.dataframe(pd.DataFrame(cf_data), use_container_width=True, hide_index=True)
                 st.caption("This is a rough estimate using today's dollars. The simulation uses the full tax engine with inflation-adjusted brackets.")
 
-    # ================================================================
-    # INCOME
-    # ================================================================
-    elif section == "Income":
         st.html('<div class="pro-section-title">Social Security</div>')
         cfg["fra"] = st.number_input("Full retirement age (FRA)", value=int(cfg["fra"]), step=1, key="ps_fra")
 
