@@ -2924,6 +2924,166 @@ def init_defaults():
         }
 
 
+
+# ---- Section completion tracking (Feature 4) ----
+# Which config keys belong to each Plan Setup section, used for completion indicators
+_SECTION_KEYS = {
+    "Basics": ["start_age", "end_age", "retire_age", "has_spouse", "spouse_age"],
+    "Income": ["contrib_on", "pretax_income_1", "pretax_income_2", "income_growth_real",
+               "contrib_ret_annual", "contrib_roth_401k_frac", "contrib_match_annual",
+               "ss62_1", "claim1", "ss62_2", "claim2"],
+    "Spending": ["spend_real", "spend_split_on", "spend_essential_real", "spend_discretionary_real",
+                 "gk_on", "pre_ret_spend_real"],
+    "Home": ["home_on"],
+    "Health": ["health_model", "ltc_on"],
+    "Taxes": ["tax_engine_on", "filing_status", "conv_on", "rmd_on", "gain_harvest_on",
+              "irmaa_on", "qcd_on"],
+    "Market": ["return_model", "scenario", "manual_override"],
+    "Allocation": ["glide_on", "equity_granular_on"],
+    "Stress Tests": ["crash_on", "seq_on"],
+    "Advanced": ["n_sims", "seed", "dist_type", "t_df"],
+}
+
+# Default values for tracking what's been customized
+_SECTION_DEFAULTS = {
+    "start_age": 55, "end_age": 90, "retire_age": 62, "has_spouse": True, "spouse_age": 55,
+    "contrib_on": False, "pretax_income_1": 200000.0, "pretax_income_2": 0.0,
+    "income_growth_real": 0.01, "contrib_ret_annual": 0.0, "contrib_roth_401k_frac": 0.0,
+    "contrib_match_annual": 0.0, "ss62_1": 0.0, "claim1": 67, "ss62_2": 0.0, "claim2": 67,
+    "spend_real": 300000.0, "spend_split_on": False, "spend_essential_real": 180000.0,
+    "spend_discretionary_real": 120000.0, "gk_on": True, "pre_ret_spend_real": 0.0,
+    "home_on": False, "health_model": "aca_marketplace", "ltc_on": False,
+    "tax_engine_on": True, "filing_status": "mfj", "conv_on": False, "rmd_on": True,
+    "gain_harvest_on": False, "irmaa_on": False, "qcd_on": False,
+    "return_model": "standard", "scenario": "Base", "manual_override": False,
+    "glide_on": False, "equity_granular_on": False,
+    "crash_on": True, "seq_on": False,
+    "n_sims": 3000, "seed": 42, "dist_type": "t", "t_df": 7,
+}
+
+def _section_is_customized(cfg: dict, section_name: str) -> bool:
+    """Check if any key in a section differs from its default value."""
+    keys = _SECTION_KEYS.get(section_name, [])
+    for k in keys:
+        if k in cfg and k in _SECTION_DEFAULTS:
+            cv = cfg[k]
+            dv = _SECTION_DEFAULTS[k]
+            if isinstance(dv, float):
+                if abs(float(cv) - dv) > 0.001:
+                    return True
+            elif cv != dv:
+                return True
+    return False
+
+
+def _generate_plan_interpretation(pct_success: float, funded_through: int, end_age_val: int,
+                                   cfg: dict, sLr: dict, out: dict) -> str:
+    """Generate rule-based plain-English interpretation of simulation results."""
+    lines = []
+
+    # Overall assessment
+    if pct_success >= 95:
+        lines.append("**Your plan looks very strong.** You have money left in the vast majority of scenarios.")
+    elif pct_success >= 90:
+        lines.append("**Your plan looks solid.** There's a small chance of running short in poor-market scenarios, but the odds are well in your favor.")
+    elif pct_success >= 80:
+        lines.append("**Your plan is reasonable but has some risk.** About 1 in " + f"{int(round(100/(100-pct_success)))}" + " scenarios run out of money. Consider adjusting spending or building in more buffer.")
+    elif pct_success >= 70:
+        lines.append("**Your plan has notable risk.** Roughly " + f"{100-pct_success:.0f}%" + " of scenarios run short. You may want to reduce spending, delay retirement, or add income sources.")
+    else:
+        lines.append("**Your plan needs attention.** More than " + f"{100-pct_success:.0f}%" + " of scenarios run out of money before age " + str(end_age_val) + ". Significant changes are recommended.")
+
+    # Funded-through age insight
+    if funded_through < end_age_val:
+        shortfall_years = end_age_val - funded_through
+        shortfall_msg = f"that is {shortfall_years} years short." if shortfall_years > 0 else "cutting it close."
+        lines.append(f"In a bad-luck scenario (worst 10%), your money runs out around age {funded_through} — {shortfall_msg}")
+
+    # Real vs nominal gap
+    real_med = sLr.get("p50", 0)
+    if real_med < 0:
+        lines.append("After inflation, the median scenario ends with negative liquid assets — inflation is a real threat to your plan.")
+
+    # Spending level check
+    spend = float(cfg.get("spend_real", 0))
+    total_portfolio = float(cfg.get("_total_portfolio_approx", 0))
+    if total_portfolio <= 0:
+        hold = st.session_state.get("hold", {})
+        total_portfolio = float(hold.get("total_tax", 0)) + float(hold.get("total_ret", 0))
+    if total_portfolio > 0 and spend > 0:
+        wr = spend / total_portfolio * 100
+        if wr > 5:
+            lines.append(f"Your implied withdrawal rate is **{wr:.1f}%**, which is above the commonly cited 4% guideline. "
+                         "Reducing spending or increasing savings would improve your odds.")
+        elif wr > 4:
+            lines.append(f"Your implied withdrawal rate of **{wr:.1f}%** is slightly above the traditional 4% rule. "
+                         "Guardrails and flexible spending help manage this.")
+
+    # Social Security insight
+    claim1 = int(cfg.get("claim1", 67))
+    ss62 = float(cfg.get("ss62_1", 0))
+    if ss62 > 0 and claim1 < 70:
+        lines.append(f"You're claiming Social Security at {claim1}. Delaying to 70 increases your benefit by about "
+                     f"{int((70-claim1)*8)}% — the sensitivity analysis can show you the dollar impact.")
+
+    # Guardrails note
+    if not bool(cfg.get("gk_on", False)):
+        lines.append("Adaptive spending guardrails are off. Turning them on lets your spending flex with market performance, "
+                     "which significantly improves plan survival in bad scenarios.")
+
+    return " ".join(lines)
+
+
+# ---- Regime-switching market presets (Feature 5) ----
+_REGIME_PRESETS = {
+    "Historical Average": {
+        "desc": "Based on long-run historical market behavior. Moderate bull/bear cycle frequencies.",
+        "params": dict(DEFAULT_REGIME_PARAMS),
+        "transition": [list(row) for row in DEFAULT_TRANSITION_MATRIX],
+        "initial": list(DEFAULT_REGIME_INITIAL_PROBS),
+    },
+    "Conservative": {
+        "desc": "Lower returns across all states. Longer bear markets, shorter bulls. Good for stress-testing.",
+        "params": {
+            "Bull":   {"eq_mu": 0.10, "eq_vol": 0.14, "bond_mu": 0.02, "bond_vol": 0.04,
+                       "reit_mu": 0.08, "reit_vol": 0.16, "alt_mu": 0.04, "alt_vol": 0.08, "cash_mu": 0.01},
+            "Normal": {"eq_mu": 0.04, "eq_vol": 0.18, "bond_mu": 0.015, "bond_vol": 0.05,
+                       "reit_mu": 0.04, "reit_vol": 0.18, "alt_mu": 0.03, "alt_vol": 0.10, "cash_mu": 0.005},
+            "Bear":   {"eq_mu": -0.15, "eq_vol": 0.30, "bond_mu": 0.01, "bond_vol": 0.06,
+                       "reit_mu": -0.12, "reit_vol": 0.28, "alt_mu": -0.02, "alt_vol": 0.15, "cash_mu": 0.003},
+        },
+        "transition": [[0.80, 0.15, 0.05], [0.10, 0.70, 0.20], [0.08, 0.32, 0.60]],
+        "initial": [0.20, 0.50, 0.30],
+    },
+    "Optimistic": {
+        "desc": "Higher returns, shorter bear markets. Reflects a favorable economic outlook.",
+        "params": {
+            "Bull":   {"eq_mu": 0.18, "eq_vol": 0.11, "bond_mu": 0.04, "bond_vol": 0.035,
+                       "reit_mu": 0.16, "reit_vol": 0.13, "alt_mu": 0.08, "alt_vol": 0.07, "cash_mu": 0.03},
+            "Normal": {"eq_mu": 0.10, "eq_vol": 0.15, "bond_mu": 0.035, "bond_vol": 0.04,
+                       "reit_mu": 0.09, "reit_vol": 0.14, "alt_mu": 0.06, "alt_vol": 0.09, "cash_mu": 0.025},
+            "Bear":   {"eq_mu": -0.06, "eq_vol": 0.25, "bond_mu": 0.02, "bond_vol": 0.05,
+                       "reit_mu": -0.05, "reit_vol": 0.22, "alt_mu": 0.00, "alt_vol": 0.12, "cash_mu": 0.015},
+        },
+        "transition": [[0.92, 0.06, 0.02], [0.20, 0.72, 0.08], [0.15, 0.40, 0.45]],
+        "initial": [0.40, 0.45, 0.15],
+    },
+    "Volatile": {
+        "desc": "More frequent regime changes and higher volatility. Tests plan resilience to market whipsaws.",
+        "params": {
+            "Bull":   {"eq_mu": 0.18, "eq_vol": 0.18, "bond_mu": 0.03, "bond_vol": 0.05,
+                       "reit_mu": 0.16, "reit_vol": 0.20, "alt_mu": 0.07, "alt_vol": 0.12, "cash_mu": 0.02},
+            "Normal": {"eq_mu": 0.05, "eq_vol": 0.22, "bond_mu": 0.02, "bond_vol": 0.06,
+                       "reit_mu": 0.04, "reit_vol": 0.22, "alt_mu": 0.03, "alt_vol": 0.14, "cash_mu": 0.01},
+            "Bear":   {"eq_mu": -0.18, "eq_vol": 0.35, "bond_mu": 0.01, "bond_vol": 0.07,
+                       "reit_mu": -0.15, "reit_vol": 0.32, "alt_mu": -0.05, "alt_vol": 0.20, "cash_mu": 0.005},
+        },
+        "transition": [[0.75, 0.15, 0.10], [0.15, 0.60, 0.25], [0.12, 0.28, 0.60]],
+        "initial": [0.25, 0.45, 0.30],
+    },
+}
+
+
 def build_cfg_run(cfg: dict) -> dict:
     """Prepare cfg for simulate() by adding computed fields."""
     scenario_params = dict(cfg["override_params"]) if bool(cfg["manual_override"]) else dict(DEFAULT_SCENARIOS[cfg["scenario"]])
@@ -3032,54 +3192,101 @@ def dashboard_page():
                 st.session_state["cfg"] = json.loads(up.read().decode("utf-8"))
                 st.rerun()
 
-    # ---- Portfolio upload (compact) ----
+    # ---- Getting Started / Portfolio upload ----
     _using_defaults = (abs(hold["total_tax"] - 1_000_000.0) < 1.0 and abs(hold["total_ret"] - 2_000_000.0) < 1.0
                        and not st.session_state.get("_portfolio_uploaded", False))
-    if _using_defaults:
-        st.warning("**Using placeholder portfolio** ($1M taxable + $2M retirement). "
-                   "Upload your brokerage CSVs below, or go to **Assumptions → Basics** to enter manually.", icon="⚠️")
-        uc1, uc2 = st.columns(2)
-        with uc1:
-            dash_tax_file = st.file_uploader(
-                "Taxable account CSV", type=["csv", "txt", "tsv"], key="dash_tax_up",
-                help="CSV export from your taxable brokerage (Schwab, Fidelity, Vanguard, etc.)",
-            )
-        with uc2:
-            dash_ret_file = st.file_uploader(
-                "Retirement account CSV", type=["csv", "txt", "tsv"], key="dash_ret_up",
-                help="CSV export from your 401(k), IRA, 403(b), or similar retirement account",
-            )
-        # Process uploads
-        dash_tax_ok, dash_ret_ok = False, False
-        if dash_tax_file:
-            try:
-                tax_df, tax_val = load_snapshot(dash_tax_file)
-                w_tax_u, total_tax_u, dollars_tax_u = weights_and_dollars(tax_df, tax_val)
-                dash_tax_ok = True
-            except Exception as e:
-                st.error(f"Error parsing taxable CSV: {e}")
-        if dash_ret_file:
-            try:
-                ret_df, ret_val = load_snapshot(dash_ret_file)
-                w_ret_u, total_ret_u, dollars_ret_u = weights_and_dollars(ret_df, ret_val)
-                dash_ret_ok = True
-            except Exception as e:
-                st.error(f"Error parsing retirement CSV: {e}")
-        if dash_tax_ok or dash_ret_ok:
-            final_hold = dict(hold)
-            if dash_tax_ok:
-                final_hold["total_tax"] = total_tax_u
-                final_hold["w_tax"] = w_tax_u
-                final_hold["dollars_tax"] = dollars_tax_u
-            if dash_ret_ok:
-                final_hold["total_ret"] = total_ret_u
-                final_hold["w_ret"] = w_ret_u
-                final_hold["dollars_ret"] = dollars_ret_u
-            st.session_state["hold"] = final_hold
-            st.session_state["_portfolio_uploaded"] = True
-            hold = final_hold
-            st.success(f"Portfolio loaded — Taxable: {fmt_dollars(final_hold['total_tax'])} | "
-                       f"Retirement: {fmt_dollars(final_hold['total_ret'])}")
+    # Check if core inputs are still at defaults (first-time user signal)
+    _basics_at_defaults = (int(cfg.get("start_age", 55)) == 55
+                           and abs(float(cfg.get("spend_real", 300000)) - 300000.0) < 1.0
+                           and float(cfg.get("ss62_1", 0)) == 0.0)
+    _show_getting_started = _using_defaults or _basics_at_defaults
+
+    if _show_getting_started and not st.session_state.get("_onboarding_dismissed", False):
+        with st.expander("🚀 **Getting Started — enter your key numbers** (everything else has smart defaults)", expanded=True):
+            st.markdown("Fill in these 5–6 inputs to get a meaningful projection. "
+                        "You can fine-tune everything else later in the **Assumptions** tab.")
+
+            gs_c1, gs_c2, gs_c3 = st.columns(3, border=True)
+            with gs_c1:
+                st.markdown("**Your ages**")
+                cfg["start_age"] = st.number_input("Current age", value=int(cfg["start_age"]), step=1, key="gs_start_age")
+                cfg["retire_age"] = st.number_input("Planned retirement age", value=int(cfg["retire_age"]), step=1, key="gs_retire_age")
+                cfg["end_age"] = st.number_input("Plan through age", value=int(cfg["end_age"]), step=1, key="gs_end_age")
+            with gs_c2:
+                st.markdown("**Your money**")
+                _gs_tax = st.number_input("Taxable account balance ($)", value=float(hold["total_tax"]),
+                    step=50000.0, key="gs_total_tax",
+                    help="Brokerage accounts, savings, CDs — anything outside retirement accounts.")
+                _gs_ret = st.number_input("Retirement account balance ($)", value=float(hold["total_ret"]),
+                    step=50000.0, key="gs_total_ret",
+                    help="401(k), IRA, 403(b), TSP, Roth IRA — all retirement accounts combined.")
+            with gs_c3:
+                st.markdown("**Your spending & income**")
+                cfg["spend_real"] = st.number_input("Annual spending in retirement ($)", value=float(cfg["spend_real"]),
+                    step=10000.0, key="gs_spend_real",
+                    help="Total annual living expenses in today's dollars. Don't include mortgage (tracked separately).")
+                cfg["ss62_1"] = st.number_input("Monthly Social Security at 62 ($)", value=float(cfg["ss62_1"]),
+                    step=100.0, key="gs_ss62",
+                    help="Your estimated monthly benefit at age 62. Find yours at ssa.gov/myaccount. Set to 0 if unknown.")
+
+            # Process manual portfolio entry from Getting Started
+            if abs(_gs_tax - hold["total_tax"]) > 1.0 or abs(_gs_ret - hold["total_ret"]) > 1.0:
+                # User changed balances — update holdings with existing allocation weights
+                final_hold = dict(hold)
+                final_hold["total_tax"] = _gs_tax
+                final_hold["dollars_tax"] = {k: _gs_tax * hold["w_tax"][k] for k in ASSET_CLASSES}
+                final_hold["total_ret"] = _gs_ret
+                final_hold["dollars_ret"] = {k: _gs_ret * hold["w_ret"][k] for k in ASSET_CLASSES}
+                st.session_state["hold"] = final_hold
+                hold = final_hold
+
+            # CSV upload option
+            with st.popover("📎 Or upload brokerage CSVs instead"):
+                uc1, uc2 = st.columns(2)
+                with uc1:
+                    dash_tax_file = st.file_uploader(
+                        "Taxable account CSV", type=["csv", "txt", "tsv"], key="dash_tax_up",
+                        help="CSV export from your taxable brokerage (Schwab, Fidelity, Vanguard, etc.)",
+                    )
+                with uc2:
+                    dash_ret_file = st.file_uploader(
+                        "Retirement account CSV", type=["csv", "txt", "tsv"], key="dash_ret_up",
+                        help="CSV export from your 401(k), IRA, 403(b), or similar retirement account",
+                    )
+                dash_tax_ok, dash_ret_ok = False, False
+                if dash_tax_file:
+                    try:
+                        tax_df, tax_val = load_snapshot(dash_tax_file)
+                        w_tax_u, total_tax_u, dollars_tax_u = weights_and_dollars(tax_df, tax_val)
+                        dash_tax_ok = True
+                    except Exception as e:
+                        st.error(f"Error parsing taxable CSV: {e}")
+                if dash_ret_file:
+                    try:
+                        ret_df, ret_val = load_snapshot(dash_ret_file)
+                        w_ret_u, total_ret_u, dollars_ret_u = weights_and_dollars(ret_df, ret_val)
+                        dash_ret_ok = True
+                    except Exception as e:
+                        st.error(f"Error parsing retirement CSV: {e}")
+                if dash_tax_ok or dash_ret_ok:
+                    final_hold = dict(hold)
+                    if dash_tax_ok:
+                        final_hold["total_tax"] = total_tax_u
+                        final_hold["w_tax"] = w_tax_u
+                        final_hold["dollars_tax"] = dollars_tax_u
+                    if dash_ret_ok:
+                        final_hold["total_ret"] = total_ret_u
+                        final_hold["w_ret"] = w_ret_u
+                        final_hold["dollars_ret"] = dollars_ret_u
+                    st.session_state["hold"] = final_hold
+                    st.session_state["_portfolio_uploaded"] = True
+                    hold = final_hold
+                    st.success(f"Portfolio loaded — Taxable: {fmt_dollars(final_hold['total_tax'])} | "
+                               f"Retirement: {fmt_dollars(final_hold['total_ret'])}")
+
+            if st.button("✓ I've entered my basics — dismiss this panel", key="gs_dismiss"):
+                st.session_state["_onboarding_dismissed"] = True
+                st.rerun()
 
     # Build cfg_run and simulate
     cfg_run = build_cfg_run(cfg)
@@ -3138,7 +3345,15 @@ def dashboard_page():
             f"nominal (real: ${sNr['p50']/1e6:.1f}M)", "metric-navy"
         ))
 
-    st.markdown("")
+    # ---- Interpretive guidance (Feature 3) ----
+    _interpretation = _generate_plan_interpretation(pct_success, funded_through, end_age_val, cfg, sLr, out)
+    if pct_success >= 90:
+        _interp_icon = "✅"
+    elif pct_success >= 75:
+        _interp_icon = "⚠️"
+    else:
+        _interp_icon = "🔴"
+    st.info(f"{_interp_icon} {_interpretation}")
 
     # ---- View toggles ----
     tc1, tc2 = st.columns(2)
@@ -3217,11 +3432,22 @@ def plan_setup_page():
 
     st.html('<div style="font-size:1.8rem; font-weight:700; color:#1B2A4A; margin-bottom:0.5rem;">Plan Setup</div>')
 
-    section = st.segmented_control(
+    # Section names with completion indicators (Feature 4)
+    _section_names = ["Basics", "Income", "Spending", "Home", "Health", "Taxes", "Market", "Allocation", "Stress Tests", "Advanced"]
+    _section_labels = []
+    for sn in _section_names:
+        if _section_is_customized(cfg, sn):
+            _section_labels.append(f"✓ {sn}")
+        else:
+            _section_labels.append(sn)
+    _label_to_name = dict(zip(_section_labels, _section_names))
+
+    section_label = st.segmented_control(
         "Section",
-        ["Basics", "Income", "Spending", "Home", "Health", "Taxes", "Market", "Allocation", "Stress Tests", "Advanced"],
-        default="Basics", key="setup_section"
+        _section_labels,
+        default=_section_labels[0], key="setup_section"
     )
+    section = _label_to_name.get(section_label, "Basics") if section_label else "Basics"
 
     # ================================================================
     # BASICS
@@ -3610,6 +3836,8 @@ def plan_setup_page():
                 st.caption(f"Using retirement spending of **${float(cfg['spend_real']):,.0f}** for pre-retirement years too.")
 
         st.html('<div class="pro-section-title">Spending Phases</div>')
+        st.caption("Most retirees spend more in early retirement (travel, hobbies), settle into a routine in the middle years, "
+                   "and spend less in late retirement. A multiplier of 1.10 means 10% more than your base spending; 0.85 means 15% less.")
         pc1, pc2, pc3 = st.columns(3, border=True)
         with pc1:
             st.markdown("**Early retirement**")
@@ -3626,9 +3854,13 @@ def plan_setup_page():
 
         st.html('<div class="pro-section-title">Adaptive Spending Guardrails (Guyton-Klinger)</div>')
         cfg["gk_on"] = st.toggle("Enable adaptive spending", value=bool(cfg["gk_on"]), key="ps_gk_on",
-            help="Guyton-Klinger guardrails automatically cut or raise spending based on portfolio performance.")
+            help="If the market drops early in retirement, this automatically reduces your spending to preserve your portfolio. "
+                 "If the market booms, it lets you spend a bit more. Most planners recommend this over fixed withdrawals "
+                 "because it dramatically improves the chance your money lasts.")
         if not cfg["gk_on"]:
-            st.caption("Toggle on to enable dynamic spending rules that adjust your withdrawals up or down based on how your portfolio is doing.")
+            st.caption("**Recommended.** Without guardrails, you withdraw the same amount regardless of market performance. "
+                       "With them, your spending flexes with your portfolio — cutting ~10% after bad years and raising ~5% after good ones. "
+                       "This simple rule can improve your plan's survival rate by 10–15 percentage points.")
         if cfg["gk_on"]:
             gc1, gc2 = st.columns(2, border=True)
             with gc1:
@@ -3865,7 +4097,10 @@ def plan_setup_page():
             if cfg["rmd_on"]:
                 cfg["rmd_start_age"] = st.number_input("RMD start age", value=int(cfg["rmd_start_age"]), step=1, key="ps_rmd_age")
         with rc2:
-            cfg["conv_on"] = st.toggle("Plan Roth conversions", value=bool(cfg["conv_on"]), key="ps_conv_on")
+            cfg["conv_on"] = st.toggle("Plan Roth conversions", value=bool(cfg["conv_on"]), key="ps_conv_on",
+                help="Convert traditional IRA/401k money to Roth, paying taxes now at today's rates to avoid higher taxes later. "
+                     "Especially valuable in the 'gap years' between retirement and Social Security/RMDs when your income is low. "
+                     "The bracket-fill strategy automatically converts just enough to stay within a target tax bracket.")
             if cfg["conv_on"]:
                 cfg["conv_start"] = st.number_input("Start age", value=int(cfg["conv_start"]), step=1, key="ps_conv_start")
                 cfg["conv_end"] = st.number_input("End age", value=int(cfg["conv_end"]), step=1, key="ps_conv_end")
@@ -3933,19 +4168,38 @@ def plan_setup_page():
         cfg["return_model"] = st.selectbox("Return generation model",
             ["standard", "regime"],
             index=["standard", "regime"].index(str(cfg.get("return_model", "standard"))),
-            format_func=lambda x: "Standard (t-distribution)" if x == "standard" else "Regime-switching (Markov)",
+            format_func=lambda x: "Standard (single outlook)" if x == "standard" else "Regime-switching (Bull/Normal/Bear cycles)",
             key="ps_return_model",
-            help="Standard: single set of return parameters with optional crash overlay. "
-                 "Regime-switching: returns vary depending on whether we're in a Bull, Normal, or Bear market state.")
+            help="**Standard** uses one set of return assumptions for the whole simulation — simple and transparent. "
+                 "**Regime-switching** models how markets actually behave: long bull runs, occasional bear markets, and "
+                 "transitions between them. This produces more realistic risk estimates because it captures the 'clustering' "
+                 "of bad years that simple models miss.")
 
         if cfg["return_model"] == "regime":
-            st.info("When regime-switching is on, the market outlook table is ignored. "
-                    "Returns are drawn from state-specific distributions with Markov transitions between Bull, Normal, and Bear markets.")
+            st.caption("The market alternates between Bull, Normal, and Bear states with different return profiles. "
+                       "This better captures real market behavior — long expansions punctuated by sharp downturns — "
+                       "compared to a single fixed return assumption.")
+
+            # Preset buttons
+            st.html('<div class="pro-section-title">Quick Presets</div>')
+            st.caption("Pick a preset to populate all parameters, or customize below.")
+            preset_cols = st.columns(len(_REGIME_PRESETS))
+            for i, (pname, pdata) in enumerate(_REGIME_PRESETS.items()):
+                with preset_cols[i]:
+                    if st.button(f"**{pname}**", key=f"ps_regime_preset_{i}", use_container_width=True,
+                                 help=pdata["desc"]):
+                        import copy as _cp
+                        cfg["regime_params"] = _cp.deepcopy(pdata["params"])
+                        cfg["regime_transition"] = _cp.deepcopy(pdata["transition"])
+                        cfg["regime_initial_probs"] = list(pdata["initial"])
+                        st.rerun()
+
             r_params = cfg.get("regime_params", dict(DEFAULT_REGIME_PARAMS))
             r_trans = cfg.get("regime_transition", [list(row) for row in DEFAULT_TRANSITION_MATRIX])
             r_init = cfg.get("regime_initial_probs", list(DEFAULT_REGIME_INITIAL_PROBS))
 
             st.html('<div class="pro-section-title">State Parameters</div>')
+            st.caption("Advanced: edit individual return and volatility assumptions per market state.")
             for si, sname in enumerate(REGIME_NAMES):
                 sp = r_params.get(sname, DEFAULT_REGIME_PARAMS[sname])
                 with st.expander(f"**{sname}** state", expanded=(si == 1)):
@@ -4039,9 +4293,12 @@ def plan_setup_page():
     elif section == "Allocation":
         st.html('<div class="pro-section-title">Age-Based Glide Path</div>')
         cfg["glide_on"] = st.toggle("Enable age-based allocation glide path", value=bool(cfg["glide_on"]), key="ps_glide_on",
-            help="Gradually shift your portfolio from stocks to bonds as you age. The equity percentage changes linearly between a start and end age.")
+            help="Gradually shift your portfolio mix as you age. The traditional approach reduces stocks over time to protect against "
+                 "a crash when you can't wait for recovery. Some research suggests a 'rising equity' path (starting conservative and "
+                 "adding stocks later) may actually work better in retirement since early losses are the most dangerous.")
         if not cfg["glide_on"]:
-            st.caption("Toggle on to automatically shift your allocation over time. Without this, your portfolio weights stay constant throughout the simulation.")
+            st.caption("Without a glide path, your portfolio weights stay constant forever. A glide path lets you start conservative "
+                       "in early retirement (when sequence risk is highest) or follow a traditional declining-equity strategy.")
         if cfg["glide_on"]:
             st.html('<div class="pro-section-title">Taxable Account Glide Path</div>')
             gc1, gc2 = st.columns(2, border=True)
@@ -5355,6 +5612,121 @@ def compare_page():
         render_spending_fan_chart(out_b, cfg_b, y_max=spend_y_max)
 
 
+
+# ---- 8e: Methodology page (Feature 6) ----
+def methodology_page():
+    st.html('<div style="font-size:1.8rem; font-weight:700; color:#1B2A4A; margin-bottom:0.5rem;">How RetireLab Works</div>')
+    st.caption("A plain-English guide to what's under the hood.")
+
+    st.html('<div class="pro-section-title">Monte Carlo Simulation</div>')
+    st.markdown(
+        "RetireLab doesn't predict one future — it simulates **thousands** of possible futures. "
+        "Each simulation randomly draws investment returns, inflation rates, and other variables "
+        "from realistic distributions, then plays out your entire financial life year by year. "
+        "The result is a probability distribution: instead of saying 'you'll have $X,' it says "
+        "'in 90% of scenarios, you still have money at age 95.'\n\n"
+        "This is the same methodology used by institutional pension funds and major financial planning firms. "
+        "The key insight: a plan that works in the *average* case can still fail badly if the market drops "
+        "at the wrong time (this is called **sequence-of-returns risk**)."
+    )
+
+    st.html('<div class="pro-section-title">Reading the Fan Charts</div>')
+    st.markdown(
+        "The colored bands on the projection charts show the range of outcomes across all simulations:\n\n"
+        "- **Dark center band** — the middle 20% of outcomes (40th to 60th percentile). This is the 'most likely' range.\n"
+        "- **Medium band** — the middle 60% (20th to 80th percentile). Most scenarios fall here.\n"
+        "- **Light outer band** — the middle 90% (5th to 95th percentile). Only extreme outliers fall outside this.\n"
+        "- **Solid line** — the median (50th percentile), the single most likely path.\n\n"
+        "A plan with a tight, upward-sloping fan is robust. A plan with a wide fan that dips below zero "
+        "has meaningful risk of running out of money."
+    )
+
+    st.html('<div class="pro-section-title">How Taxes Are Computed</div>')
+    st.markdown(
+        "RetireLab uses a detailed tax engine that models:\n\n"
+        "- **Federal income tax** with inflation-adjusted brackets (10%, 12%, 22%, 24%, 32%, 35%, 37%)\n"
+        "- **Standard deduction** adjusted for age (extra deduction for 65+)\n"
+        "- **Social Security taxation** (up to 85% of benefits can be taxable, based on provisional income)\n"
+        "- **Capital gains** at preferential rates (0%, 15%, 20%) depending on income\n"
+        "- **NIIT** (3.8% Net Investment Income Tax) for high earners\n"
+        "- **State income tax** as a flat rate you specify\n"
+        "- **IRMAA** Medicare surcharges for high-income retirees\n\n"
+        "All brackets and thresholds are inflation-adjusted each year using simulated inflation. "
+        "The tax engine runs every year of every simulation, so tax-efficient strategies like Roth "
+        "conversions and gain harvesting are modeled realistically."
+    )
+
+    st.html('<div class="pro-section-title">Withdrawal Order</div>')
+    st.markdown(
+        "When you need money in retirement, RetireLab withdraws in a tax-efficient order:\n\n"
+        "1. **Social Security and annuity income** first (these are fixed and automatic)\n"
+        "2. **Taxable account** — preferring to spend from here early to let tax-advantaged accounts grow\n"
+        "3. **Traditional IRA/401(k)** — taxed as ordinary income when withdrawn\n"
+        "4. **Roth IRA** — tax-free withdrawals, saved for last to maximize tax-free growth\n\n"
+        "Required Minimum Distributions (RMDs) from traditional accounts are taken automatically starting at age 73."
+    )
+
+    st.html('<div class="pro-section-title">Adaptive Guardrails</div>')
+    st.markdown(
+        "The Guyton-Klinger guardrail system adjusts your spending based on portfolio performance:\n\n"
+        "- Each year, it calculates your current withdrawal rate (spending ÷ portfolio)\n"
+        "- If the withdrawal rate rises too high (portfolio shrank), spending is **cut** by a set percentage\n"
+        "- If the withdrawal rate drops too low (portfolio grew), spending is **raised** by a set percentage\n"
+        "- Essential spending is never cut — only discretionary spending is reduced\n\n"
+        "This mimics how real retirees behave: tightening the belt in bad years and enjoying more in good years. "
+        "Research shows this improves plan survival by 10–15 percentage points compared to rigid withdrawals."
+    )
+
+    st.html('<div class="pro-section-title">Regime-Switching Model</div>')
+    st.markdown(
+        "The optional regime-switching model (under Market settings) generates more realistic return sequences "
+        "by modeling three market states:\n\n"
+        "- **Bull** — above-average returns, low volatility (typical of long expansions)\n"
+        "- **Normal** — moderate returns and volatility (the baseline)\n"
+        "- **Bear** — negative returns, high volatility (recessions and crises)\n\n"
+        "Each year, the market can transition between states with calibrated probabilities. "
+        "This captures the 'clustering' of bad years (bear markets last multiple years) and the long "
+        "bull runs that simple models miss. The result is more realistic tail risk estimates."
+    )
+
+    st.html('<div class="pro-section-title">What the Success Rate Means</div>')
+    st.markdown(
+        "The success rate is the percentage of simulations where you still have liquid assets at "
+        "your plan end age. A few guidelines:\n\n"
+        "- **95%+** — Very strong. Your plan handles most bad scenarios.\n"
+        "- **85–95%** — Solid. Some risk in worst-case scenarios, but reasonable.\n"
+        "- **75–85%** — Moderate risk. Consider adjustments to spending or income.\n"
+        "- **Below 75%** — Significant risk. Changes are strongly recommended.\n\n"
+        "Note: 100% is not the goal — that usually means you're spending too little and leaving money on the table. "
+        "Most planners target 85–95% as a reasonable balance between security and enjoyment."
+    )
+
+    st.html('<div class="pro-section-title">Sensitivity Analysis (Tornado Charts)</div>')
+    st.markdown(
+        "The 'What Matters Most' tornado chart shows which assumptions have the biggest impact on your outcome. "
+        "For each variable, the model runs two variants (e.g., spending +$25k and -$25k) and shows how much "
+        "the median ending net worth changes compared to your baseline.\n\n"
+        "The variables with the longest bars are the ones most worth your attention. If 'Annual Spending' "
+        "dominates the chart, your spending level is the most impactful lever. If 'Stock Returns' is largest, "
+        "your outcome depends heavily on market performance — and diversification or guardrails become important."
+    )
+
+    st.html('<div class="pro-section-title">Key Limitations</div>')
+    st.markdown(
+        "RetireLab is a planning tool, not a crystal ball:\n\n"
+        "- **Returns are random** — the model doesn't predict markets, it tests your plan against a wide range of scenarios.\n"
+        "- **Tax law changes** — current brackets and rules may change. The model uses today's tax code projected forward.\n"
+        "- **Spending is simplified** — real spending is irregular (car repairs, vacations, medical events). The model uses smooth annual averages.\n"
+        "- **No behavioral modeling** — the model assumes you follow the plan. In reality, people panic-sell or overspend.\n"
+        "- **Inflation uncertainty** — the model simulates variable inflation, but extreme scenarios (hyperinflation) are unlikely but possible.\n\n"
+        "Use RetireLab to understand the *range* of possibilities and which decisions matter most — not as a precise prediction."
+    )
+
+    st.divider()
+    st.caption("RetireLab is for educational and informational purposes only. It is not financial, tax, or investment advice. "
+               "Consult a qualified financial professional for personalized guidance.")
+
+
 # ============================================================
 # SECTION 9: Navigation entrypoint
 # ============================================================
@@ -5367,6 +5739,7 @@ pg = st.navigation(
         st.Page(plan_setup_page, title="Assumptions", icon=":material/tune:"),
         st.Page(deep_dive_page, title="Deep Dive", icon=":material/analytics:"),
         st.Page(compare_page, title="Compare", icon=":material/compare_arrows:"),
+        st.Page(methodology_page, title="How It Works", icon=":material/help_outline:"),
     ],
     position="top",
 )
