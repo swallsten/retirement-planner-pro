@@ -4637,32 +4637,39 @@ def deep_dive_page():
         _ret_age_idx = max(0, int(cfg_run.get("retire_age", 62)) - int(ages[0]))
         _post_ret_ages = ages[_ret_age_idx:]
         if len(_post_ret_ages) > 1:
+            # Pick a single representative simulation (median-outcome) so income
+            # sources add up consistently — avoids the "marginal median" problem
+            # where independent p50s of each source can all be near zero.
+            _liq_end = out["liquid"][:, -1]
+            _median_val = float(np.median(_liq_end))
+            _rep_sim = int(np.argmin(np.abs(_liq_end - _median_val)))
+
             _income_rows = []
             _expense_rows = []
             for i, age in enumerate(_post_ret_ages):
                 idx = _ret_age_idx + i
                 _income_rows.append({
                     "Age": int(age),
-                    "Social Security": float(np.percentile(de["ss_inflow"][:, idx], 50)) / 1e3,
-                    "RMDs": float(np.percentile(de["gross_rmd"][:, idx], 50)) / 1e3,
-                    "Taxable Withdrawals": float(np.percentile(de["gross_tax_wd"][:, idx], 50)) / 1e3,
-                    "Trad IRA Withdrawals": float(np.percentile(de["gross_trad_wd"][:, idx], 50)) / 1e3,
-                    "Roth Withdrawals": float(np.percentile(de["gross_roth_wd"][:, idx], 50)) / 1e3,
-                    "Annuity Income": float(np.percentile(de["annuity_income"][:, idx], 50)) / 1e3,
+                    "Social Security": float(de["ss_inflow"][_rep_sim, idx]) / 1e3,
+                    "RMDs": float(de["gross_rmd"][_rep_sim, idx]) / 1e3,
+                    "Taxable Withdrawals": float(de["gross_tax_wd"][_rep_sim, idx]) / 1e3,
+                    "Trad IRA Withdrawals": float(de["gross_trad_wd"][_rep_sim, idx]) / 1e3,
+                    "Roth Withdrawals": float(de["gross_roth_wd"][_rep_sim, idx]) / 1e3,
+                    "Annuity Income": float(de["annuity_income"][_rep_sim, idx]) / 1e3,
                 })
-                _hc = (float(np.percentile(de["home_cost"][:, idx], 50)) +
-                       float(np.percentile(de["mort_pay"][:, idx], 50)) +
-                       float(np.percentile(de["rent"][:, idx], 50)))
-                _health_total = (float(np.percentile(de["health"][:, idx], 50)) +
-                                 float(np.percentile(de["medical_nom"][:, idx], 50)) +
-                                 float(np.percentile(de["ltc_cost"][:, idx], 50)))
+                _hc = (float(de["home_cost"][_rep_sim, idx]) +
+                       float(de["mort_pay"][_rep_sim, idx]) +
+                       float(de["rent"][_rep_sim, idx]))
+                _health_total = (float(de["health"][_rep_sim, idx]) +
+                                 float(de["medical_nom"][_rep_sim, idx]) +
+                                 float(de["ltc_cost"][_rep_sim, idx]))
                 _expense_rows.append({
                     "Age": int(age),
-                    "Core Spending": float(np.percentile(de["core_adjusted"][:, idx], 50)) / 1e3,
+                    "Core Spending": float(de["core_adjusted"][_rep_sim, idx]) / 1e3,
                     "Housing": _hc / 1e3,
                     "Healthcare": _health_total / 1e3,
-                    "Taxes": float(np.percentile(de["taxes_paid"][:, idx], 50)) / 1e3,
-                    "IRMAA": float(np.percentile(de["irmaa"][:, idx], 50)) / 1e3,
+                    "Taxes": float(de["taxes_paid"][_rep_sim, idx]) / 1e3,
+                    "IRMAA": float(de["irmaa"][_rep_sim, idx]) / 1e3,
                 })
 
             _inc_df = pd.DataFrame(_income_rows)
@@ -4674,6 +4681,7 @@ def deep_dive_page():
             _inc_colors = ["#FF8F00", "#AB47BC", "#1B2A4A", "#E57373", "#00897B", "#7E57C2"]
             _exp_colors = ["#1B2A4A", "#8D6E63", "#E57373", "#FF8F00", "#9E9E9E"]
 
+            st.caption("Showing a single representative simulation (median final wealth outcome) so income sources add up consistently.")
             ch_inc, ch_exp = st.columns(2)
             with ch_inc:
                 st.markdown("**Where the Money Comes From**")
