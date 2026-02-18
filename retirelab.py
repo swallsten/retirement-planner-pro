@@ -1175,6 +1175,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
     gross_tax_wd_track = np.zeros((n, T+1))
     gross_trad_wd_track = np.zeros((n, T+1))
     gross_roth_wd_track = np.zeros((n, T+1))
+    gross_rmd_track = np.zeros((n, T+1))
     taxes_paid_track = np.zeros((n, T+1))
     conv_gross_track = np.zeros((n, T+1))
     qcd_track = np.zeros((n, T+1))
@@ -1589,6 +1590,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
         qcd_track[:, t] = qcd_amount
         taxable_rmd = gross_rmd - qcd_amount
         trad_prev = np.maximum(0.0, trad_prev - gross_rmd)
+        gross_rmd_track[:, t] = gross_rmd
 
         # Compute income components for tax engine
         div_yield_val = float(cfg["div_yield"])
@@ -2006,6 +2008,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
             "outflow_total": _f32(total_outflow_track),
             "ss_inflow": _f32(ss_nom_track),
             "irmaa": _f32(irmaa_paid_track),
+            "gross_rmd": _f32(gross_rmd_track),
             "gross_tax_wd": _f32(gross_tax_wd_track),
             "gross_trad_wd": _f32(gross_trad_wd_track),
             "gross_roth_wd": _f32(gross_roth_wd_track),
@@ -4641,8 +4644,9 @@ def deep_dive_page():
                 _income_rows.append({
                     "Age": int(age),
                     "Social Security": float(np.percentile(de["ss_inflow"][:, idx], 50)) / 1e3,
+                    "RMDs": float(np.percentile(de["gross_rmd"][:, idx], 50)) / 1e3,
                     "Taxable Withdrawals": float(np.percentile(de["gross_tax_wd"][:, idx], 50)) / 1e3,
-                    "Traditional IRA": float(np.percentile(de["gross_trad_wd"][:, idx], 50)) / 1e3,
+                    "Trad IRA Withdrawals": float(np.percentile(de["gross_trad_wd"][:, idx], 50)) / 1e3,
                     "Roth Withdrawals": float(np.percentile(de["gross_roth_wd"][:, idx], 50)) / 1e3,
                     "Annuity Income": float(np.percentile(de["annuity_income"][:, idx], 50)) / 1e3,
                 })
@@ -4667,7 +4671,7 @@ def deep_dive_page():
             _inc_melt = _inc_df.melt("Age", var_name="Source", value_name="Amount ($K)")
             _exp_melt = _exp_df.melt("Age", var_name="Category", value_name="Amount ($K)")
 
-            _inc_colors = ["#FF8F00", "#1B2A4A", "#E57373", "#00897B", "#7E57C2"]
+            _inc_colors = ["#FF8F00", "#AB47BC", "#1B2A4A", "#E57373", "#00897B", "#7E57C2"]
             _exp_colors = ["#1B2A4A", "#8D6E63", "#E57373", "#FF8F00", "#9E9E9E"]
 
             ch_inc, ch_exp = st.columns(2)
@@ -4677,7 +4681,7 @@ def deep_dive_page():
                     x=alt.X("Age:Q", title="Age"),
                     y=alt.Y("Amount ($K):Q", title="Amount ($K nominal)", stack=True),
                     color=alt.Color("Source:N", scale=alt.Scale(
-                        domain=["Social Security", "Taxable Withdrawals", "Traditional IRA", "Roth Withdrawals", "Annuity Income"],
+                        domain=["Social Security", "RMDs", "Taxable Withdrawals", "Trad IRA Withdrawals", "Roth Withdrawals", "Annuity Income"],
                         range=_inc_colors)),
                     tooltip=["Age:Q", "Source:N", alt.Tooltip("Amount ($K):Q", format=",.0f")]
                 ).properties(height=350)
@@ -4719,6 +4723,7 @@ def deep_dive_page():
                     "LTC": float(np.percentile(de["ltc_cost"][:, idx], 50)),
                     "Total Spending": float(np.percentile(de["outflow_total"][:, idx], 50)),
                     "SS Income": float(np.percentile(de["ss_inflow"][:, idx], 50)),
+                    "RMDs (gross)": float(np.percentile(de["gross_rmd"][:, idx], 50)),
                     "Annuity Income": float(np.percentile(de["annuity_income"][:, idx], 50)),
                     "Roth Conversions": float(np.percentile(de["conv_gross"][:, idx], 50)),
                     "IRMAA": float(np.percentile(de["irmaa"][:, idx], 50)),
