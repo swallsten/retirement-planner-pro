@@ -1148,6 +1148,12 @@ def simulate(cfg: dict, hold: dict) -> dict:
     pre_ret_spend = float(cfg.get("pre_ret_spend_real", 0.0))
     if pre_ret_spend <= 0 and contrib_on:
         pre_ret_spend = float(cfg.get("spend_real", 120000.0))  # default to post-retirement spend
+    # Coast FIRE phase
+    coast_on = bool(cfg.get("coast_on", False)) and contrib_on
+    coast_start_age = int(cfg.get("coast_start_age", 55))
+    coast_income_real = float(cfg.get("coast_income_real", 50000.0))
+    coast_contrib_ret = float(cfg.get("coast_contrib_ret", 0.0))
+    coast_contrib_hsa = float(cfg.get("coast_contrib_hsa", 0.0))
 
     # -------- Decomposition trackers (nominal) --------
     ltc_cost_track = np.zeros((n, T+1))
@@ -1855,28 +1861,40 @@ def simulate(cfg: dict, hold: dict) -> dict:
         # Pre-retirement income, taxes, contributions, and surplus savings
         if contrib_on and age < retire_age:
             ci = infl_index[:, t]
-            # Real wage growth on top of inflation
-            years_worked = age - start_age
-            real_growth_factor = (1 + income_growth_real) ** years_worked
-            gross_income_nom = (pretax_income_1 + pretax_income_2) * ci * real_growth_factor
+            _in_coast = coast_on and age >= coast_start_age
+
+            if _in_coast:
+                # Coast FIRE: part-time income, reduced/no contributions, no employer match
+                gross_income_nom = coast_income_real * ci
+                employee_401k_nom = coast_contrib_ret * ci
+                roth_401k_nom = employee_401k_nom * contrib_roth_401k_frac
+                trad_401k_nom = employee_401k_nom * (1 - contrib_roth_401k_frac)
+                match_nom = np.zeros(n)  # no employer match during coast
+                hsa_contrib_nom = np.zeros(n)
+                if hsa_on and coast_contrib_hsa > 0:
+                    hsa_contrib_nom = coast_contrib_hsa * ci
+                    hsa[:, t] += hsa_contrib_nom
+            else:
+                # Full-time: real wage growth on top of inflation
+                years_worked = age - start_age
+                real_growth_factor = (1 + income_growth_real) ** years_worked
+                gross_income_nom = (pretax_income_1 + pretax_income_2) * ci * real_growth_factor
+                # Employee 401k contributions (today's $ scaled by inflation)
+                employee_401k_nom = contrib_ret * ci
+                # Split employee contribution: Roth 401k vs Traditional 401k
+                roth_401k_nom = employee_401k_nom * contrib_roth_401k_frac
+                trad_401k_nom = employee_401k_nom * (1 - contrib_roth_401k_frac)
+                # Employer match is always pre-tax traditional
+                match_nom = contrib_match * ci
+                # HSA contributions (pre-tax)
+                hsa_contrib_nom = np.zeros(n)
+                if hsa_on and contrib_hsa > 0:
+                    hsa_contrib_nom = np.full(n, contrib_hsa * ci)
+                    hsa[:, t] += hsa_contrib_nom
+
             earned_income_track[:, t] = gross_income_nom
-
-            # Employee 401k contributions (today's $ scaled by inflation)
-            employee_401k_nom = contrib_ret * ci
-            # Split employee contribution: Roth 401k vs Traditional 401k
-            roth_401k_nom = employee_401k_nom * contrib_roth_401k_frac
-            trad_401k_nom = employee_401k_nom * (1 - contrib_roth_401k_frac)
-            # Employer match is always pre-tax traditional
-            match_nom = contrib_match * ci
-
             trad[:, t] += trad_401k_nom + match_nom
             roth[:, t] += roth_401k_nom
-
-            # HSA contributions (pre-tax)
-            hsa_contrib_nom = np.zeros(n)
-            if hsa_on and contrib_hsa > 0:
-                hsa_contrib_nom = np.full(n, contrib_hsa * ci)
-                hsa[:, t] += hsa_contrib_nom
 
             # Taxable income for working years: gross - traditional 401k - HSA
             # (Roth 401k is post-tax, so not deducted)
@@ -1964,6 +1982,9 @@ def simulate(cfg: dict, hold: dict) -> dict:
         "net_worth_real": _f32(net_worth_real),
         "home_value": _f32(home_value),
         "mortgage": _f32(mortgage),
+        "taxable": _f32(taxable),
+        "trad": _f32(trad),
+        "roth": _f32(roth),
         "hsa": _f32(hsa),
         "magi": _f32(magi_track),
         "irmaa_tier": tier_track,
@@ -2886,6 +2907,12 @@ def init_defaults():
     _d("contrib_taxable_annual", 0.0)  # Extra after-tax savings to taxable
     _d("contrib_hsa_annual", 4300.0)
     _d("pre_ret_spend_real", 0.0)      # Pre-retirement annual spending (today's $); 0 = use post-ret spend_real
+    # Coast FIRE / part-time income phase
+    _d("coast_on", False)
+    _d("coast_start_age", 55)
+    _d("coast_income_real", 50000.0)
+    _d("coast_contrib_ret", 0.0)
+    _d("coast_contrib_hsa", 0.0)
 
     # Equity sub-buckets (Phase 5)
     _d("equity_granular_on", False)
@@ -2931,7 +2958,8 @@ _SECTION_KEYS = {
     "Basics": ["start_age", "end_age", "retire_age", "has_spouse", "spouse_age"],
     "Income": ["contrib_on", "pretax_income_1", "pretax_income_2", "income_growth_real",
                "contrib_ret_annual", "contrib_roth_401k_frac", "contrib_match_annual",
-               "ss62_1", "claim1", "ss62_2", "claim2"],
+               "ss62_1", "claim1", "ss62_2", "claim2",
+               "coast_on", "coast_start_age", "coast_income_real"],
     "Spending": ["spend_real", "spend_split_on", "spend_essential_real", "spend_discretionary_real",
                  "gk_on", "pre_ret_spend_real"],
     "Home": ["home_on"],
@@ -2950,6 +2978,7 @@ _SECTION_DEFAULTS = {
     "contrib_on": False, "pretax_income_1": 200000.0, "pretax_income_2": 0.0,
     "income_growth_real": 0.01, "contrib_ret_annual": 0.0, "contrib_roth_401k_frac": 0.0,
     "contrib_match_annual": 0.0, "ss62_1": 0.0, "claim1": 67, "ss62_2": 0.0, "claim2": 67,
+    "coast_on": False, "coast_start_age": 55, "coast_income_real": 50000.0,
     "spend_real": 300000.0, "spend_split_on": False, "spend_essential_real": 180000.0,
     "spend_discretionary_real": 120000.0, "gk_on": True, "pre_ret_spend_real": 0.0,
     "home_on": False, "health_model": "aca_marketplace", "ltc_on": False,
@@ -3707,6 +3736,39 @@ def plan_setup_page():
                 }
                 st.dataframe(pd.DataFrame(cf_data), use_container_width=True, hide_index=True)
                 st.caption("This is a rough estimate using today's dollars. The simulation uses the full tax engine with inflation-adjusted brackets.")
+
+            # Coast FIRE / Part-time income phase
+            st.html('<div class="pro-section-title">Part-Time / Coast FIRE Phase</div>')
+            cfg["coast_on"] = st.toggle("Add a part-time income phase before full retirement",
+                value=bool(cfg.get("coast_on", False)), key="ps_coast_on",
+                help="Models a transition period where you leave your primary career but earn part-time income "
+                     "until full retirement. Common in Coast FIRE and Barista FIRE strategies.")
+            if not cfg["coast_on"]:
+                st.caption("Toggle on to model a period of reduced income between your full-time career and full retirement. "
+                           "During this phase, you earn part-time income with reduced or no retirement contributions.")
+            if cfg["coast_on"]:
+                co1, co2 = st.columns(2, border=True)
+                with co1:
+                    cfg["coast_start_age"] = st.number_input("Coast phase starts at age",
+                        min_value=int(cfg.get("start_age", 55)),
+                        max_value=int(cfg.get("retire_age", 62)) - 1,
+                        value=min(int(cfg.get("coast_start_age", 55)), int(cfg.get("retire_age", 62)) - 1),
+                        step=1, key="ps_coast_start",
+                        help="Age when you switch from full-time to part-time. Must be before retirement age.")
+                    cfg["coast_income_real"] = st.number_input("Part-time annual income (today's $)",
+                        value=float(cfg.get("coast_income_real", 50000.0)), step=5000.0, key="ps_coast_income",
+                        help="Annual gross income from part-time work, consulting, freelancing, etc.")
+                with co2:
+                    cfg["coast_contrib_ret"] = st.number_input("401k/IRA contributions during coast (today's $)",
+                        value=float(cfg.get("coast_contrib_ret", 0.0)), step=1000.0, key="ps_coast_contrib_ret",
+                        help="Reduced retirement contributions during part-time phase. Set to 0 if no employer plan.")
+                    cfg["coast_contrib_hsa"] = st.number_input("HSA contributions during coast (today's $)",
+                        value=float(cfg.get("coast_contrib_hsa", 0.0)), step=500.0, key="ps_coast_contrib_hsa",
+                        help="HSA contributions during part-time phase. Set to 0 if no HSA access.")
+                _coast_years = max(0, int(cfg.get("retire_age", 62)) - int(cfg.get("coast_start_age", 55)))
+                st.info(f"Coast phase: age {cfg['coast_start_age']}–{int(cfg.get('retire_age', 62))-1} "
+                        f"({_coast_years} years at ${float(cfg['coast_income_real']):,.0f}/yr). "
+                        "No employer match during this phase.")
 
         st.html('<div class="pro-section-title">Social Security</div>')
         cfg["fra"] = st.number_input("Full retirement age (FRA)", value=int(cfg["fra"]), step=1, key="ps_fra")
@@ -4549,7 +4611,7 @@ def deep_dive_page():
 
     analysis = st.segmented_control(
         "Analysis",
-        ["Cashflows", "Sensitivity", "IRMAA", "Legacy", "Annuity", "Roth Strategy", "Tax Brackets", "ACA", "Optimizer", "Regimes", "Reallocation"],
+        ["Cashflows", "Accounts", "Withdrawal Rate", "Sensitivity", "IRMAA", "Legacy", "Annuity", "Roth Strategy", "Tax Brackets", "ACA", "Optimizer", "Retire When?", "Failure Analysis", "Regimes", "Reallocation"],
         default="Cashflows", key="dd_analysis"
     )
 
@@ -4557,8 +4619,8 @@ def deep_dive_page():
     # CASHFLOWS
     # ================================================================
     if analysis == "Cashflows":
-        st.html('<div class="pro-section-title">Year-by-Year Cashflow Breakdown</div>')
-        st.caption("Median (50th percentile) values across all simulations, in nominal dollars.")
+        st.html('<div class="pro-section-title">Income Sources & Expenses</div>')
+        st.caption("Median (50th percentile) values across all simulations, in nominal dollars. Post-retirement years only.")
 
         de = out["decomp"]
         liq = out["liquid"]
@@ -4568,46 +4630,238 @@ def deep_dive_page():
         home_eq = np.maximum(0.0, hv - mb)
         hsa_bal = out["hsa"]
 
-        rows = []
-        for idx, age in enumerate(ages):
-            idx_next = min(idx + 1, len(ages) - 1)
-            rows.append({
-                "Age": int(age),
-                "Liquid (start)": float(np.percentile(liq[:, idx], 50)),
-                "Liquid (end)": float(np.percentile(liq[:, idx_next], 50)),
-                "Net Worth (start)": float(np.percentile(nw[:, idx], 50)),
-                "Net Worth (end)": float(np.percentile(nw[:, idx_next], 50)),
-                "Home Equity": float(np.percentile(home_eq[:, idx], 50)),
-                "Core Spending (planned)": float(np.percentile(de["baseline_core"][:, idx], 50)),
-                "Core Spending (guardrails)": float(np.percentile(de["core_adjusted"][:, idx], 50)),
-                "Essential Spending": float(np.percentile(de["essential_spend"][:, idx], 50)),
-                "Discretionary Spending": float(np.percentile(de["discretionary_spend"][:, idx], 50)),
-                "Home Costs": float(np.percentile(de["home_cost"][:, idx], 50)),
-                "Mortgage": float(np.percentile(de["mort_pay"][:, idx], 50)),
-                "Rent": float(np.percentile(de["rent"][:, idx], 50)),
-                "Health Insurance": float(np.percentile(de["health"][:, idx], 50)),
-                "Medical": float(np.percentile(de["medical_nom"][:, idx], 50)),
-                "HSA Used": float(np.percentile(de["hsa_used_med"][:, idx], 50)),
-                "LTC": float(np.percentile(de["ltc_cost"][:, idx], 50)),
-                "Total Spending": float(np.percentile(de["outflow_total"][:, idx], 50)),
-                "SS Income": float(np.percentile(de["ss_inflow"][:, idx], 50)),
-                "Annuity Income": float(np.percentile(de["annuity_income"][:, idx], 50)),
-                "Roth Conversions": float(np.percentile(de["conv_gross"][:, idx], 50)),
-                "IRMAA": float(np.percentile(de["irmaa"][:, idx], 50)),
-                "Taxable WD": float(np.percentile(de["gross_tax_wd"][:, idx], 50)),
-                "Trad IRA WD": float(np.percentile(de["gross_trad_wd"][:, idx], 50)),
-                "Roth WD": float(np.percentile(de["gross_roth_wd"][:, idx], 50)),
-                "Taxes": float(np.percentile(de["taxes_paid"][:, idx], 50)),
-                "QCD": float(np.percentile(de["qcd"][:, idx], 50)),
-                "Gain Harvest": float(np.percentile(de["gain_harvest"][:, idx], 50)),
-                "HSA Balance": float(np.percentile(hsa_bal[:, idx], 50)),
-            })
+        # Stacked area charts for income sources and expenses (Change 3)
+        _ret_age_idx = max(0, int(cfg_run.get("retire_age", 62)) - int(ages[0]))
+        _post_ret_ages = ages[_ret_age_idx:]
+        if len(_post_ret_ages) > 1:
+            _income_rows = []
+            _expense_rows = []
+            for i, age in enumerate(_post_ret_ages):
+                idx = _ret_age_idx + i
+                _income_rows.append({
+                    "Age": int(age),
+                    "Social Security": float(np.percentile(de["ss_inflow"][:, idx], 50)) / 1e3,
+                    "Taxable Withdrawals": float(np.percentile(de["gross_tax_wd"][:, idx], 50)) / 1e3,
+                    "Traditional IRA": float(np.percentile(de["gross_trad_wd"][:, idx], 50)) / 1e3,
+                    "Roth Withdrawals": float(np.percentile(de["gross_roth_wd"][:, idx], 50)) / 1e3,
+                    "Annuity Income": float(np.percentile(de["annuity_income"][:, idx], 50)) / 1e3,
+                })
+                _hc = (float(np.percentile(de["home_cost"][:, idx], 50)) +
+                       float(np.percentile(de["mort_pay"][:, idx], 50)) +
+                       float(np.percentile(de["rent"][:, idx], 50)))
+                _health_total = (float(np.percentile(de["health"][:, idx], 50)) +
+                                 float(np.percentile(de["medical_nom"][:, idx], 50)) +
+                                 float(np.percentile(de["ltc_cost"][:, idx], 50)))
+                _expense_rows.append({
+                    "Age": int(age),
+                    "Core Spending": float(np.percentile(de["core_adjusted"][:, idx], 50)) / 1e3,
+                    "Housing": _hc / 1e3,
+                    "Healthcare": _health_total / 1e3,
+                    "Taxes": float(np.percentile(de["taxes_paid"][:, idx], 50)) / 1e3,
+                    "IRMAA": float(np.percentile(de["irmaa"][:, idx], 50)) / 1e3,
+                })
 
-        de_df = pd.DataFrame(rows)
-        for c in de_df.columns:
-            if c != "Age":
-                de_df[c] = de_df[c].apply(fmt_dollars)
-        st.dataframe(de_df, use_container_width=True, hide_index=True, height=500)
+            _inc_df = pd.DataFrame(_income_rows)
+            _exp_df = pd.DataFrame(_expense_rows)
+
+            _inc_melt = _inc_df.melt("Age", var_name="Source", value_name="Amount ($K)")
+            _exp_melt = _exp_df.melt("Age", var_name="Category", value_name="Amount ($K)")
+
+            _inc_colors = ["#FF8F00", "#1B2A4A", "#E57373", "#00897B", "#7E57C2"]
+            _exp_colors = ["#1B2A4A", "#8D6E63", "#E57373", "#FF8F00", "#9E9E9E"]
+
+            ch_inc, ch_exp = st.columns(2)
+            with ch_inc:
+                st.markdown("**Where the Money Comes From**")
+                _inc_chart = alt.Chart(_inc_melt).mark_area().encode(
+                    x=alt.X("Age:Q", title="Age"),
+                    y=alt.Y("Amount ($K):Q", title="Amount ($K nominal)", stack=True),
+                    color=alt.Color("Source:N", scale=alt.Scale(
+                        domain=["Social Security", "Taxable Withdrawals", "Traditional IRA", "Roth Withdrawals", "Annuity Income"],
+                        range=_inc_colors)),
+                    tooltip=["Age:Q", "Source:N", alt.Tooltip("Amount ($K):Q", format=",.0f")]
+                ).properties(height=350)
+                st.altair_chart(_inc_chart, use_container_width=True)
+            with ch_exp:
+                st.markdown("**Where the Money Goes**")
+                _exp_chart = alt.Chart(_exp_melt).mark_area().encode(
+                    x=alt.X("Age:Q", title="Age"),
+                    y=alt.Y("Amount ($K):Q", title="Amount ($K nominal)", stack=True),
+                    color=alt.Color("Category:N", scale=alt.Scale(
+                        domain=["Core Spending", "Housing", "Healthcare", "Taxes", "IRMAA"],
+                        range=_exp_colors)),
+                    tooltip=["Age:Q", "Category:N", alt.Tooltip("Amount ($K):Q", format=",.0f")]
+                ).properties(height=350)
+                st.altair_chart(_exp_chart, use_container_width=True)
+
+        # Detailed cashflow table in expander
+        with st.expander("Detailed cashflow table", expanded=False):
+            rows = []
+            for idx, age in enumerate(ages):
+                idx_next = min(idx + 1, len(ages) - 1)
+                rows.append({
+                    "Age": int(age),
+                    "Liquid (start)": float(np.percentile(liq[:, idx], 50)),
+                    "Liquid (end)": float(np.percentile(liq[:, idx_next], 50)),
+                    "Net Worth (start)": float(np.percentile(nw[:, idx], 50)),
+                    "Net Worth (end)": float(np.percentile(nw[:, idx_next], 50)),
+                    "Home Equity": float(np.percentile(home_eq[:, idx], 50)),
+                    "Core Spending (planned)": float(np.percentile(de["baseline_core"][:, idx], 50)),
+                    "Core Spending (guardrails)": float(np.percentile(de["core_adjusted"][:, idx], 50)),
+                    "Essential Spending": float(np.percentile(de["essential_spend"][:, idx], 50)),
+                    "Discretionary Spending": float(np.percentile(de["discretionary_spend"][:, idx], 50)),
+                    "Home Costs": float(np.percentile(de["home_cost"][:, idx], 50)),
+                    "Mortgage": float(np.percentile(de["mort_pay"][:, idx], 50)),
+                    "Rent": float(np.percentile(de["rent"][:, idx], 50)),
+                    "Health Insurance": float(np.percentile(de["health"][:, idx], 50)),
+                    "Medical": float(np.percentile(de["medical_nom"][:, idx], 50)),
+                    "HSA Used": float(np.percentile(de["hsa_used_med"][:, idx], 50)),
+                    "LTC": float(np.percentile(de["ltc_cost"][:, idx], 50)),
+                    "Total Spending": float(np.percentile(de["outflow_total"][:, idx], 50)),
+                    "SS Income": float(np.percentile(de["ss_inflow"][:, idx], 50)),
+                    "Annuity Income": float(np.percentile(de["annuity_income"][:, idx], 50)),
+                    "Roth Conversions": float(np.percentile(de["conv_gross"][:, idx], 50)),
+                    "IRMAA": float(np.percentile(de["irmaa"][:, idx], 50)),
+                    "Taxable WD": float(np.percentile(de["gross_tax_wd"][:, idx], 50)),
+                    "Trad IRA WD": float(np.percentile(de["gross_trad_wd"][:, idx], 50)),
+                    "Roth WD": float(np.percentile(de["gross_roth_wd"][:, idx], 50)),
+                    "Taxes": float(np.percentile(de["taxes_paid"][:, idx], 50)),
+                    "QCD": float(np.percentile(de["qcd"][:, idx], 50)),
+                    "Gain Harvest": float(np.percentile(de["gain_harvest"][:, idx], 50)),
+                    "HSA Balance": float(np.percentile(hsa_bal[:, idx], 50)),
+                })
+
+            de_df = pd.DataFrame(rows)
+            for c in de_df.columns:
+                if c != "Age":
+                    de_df[c] = de_df[c].apply(fmt_dollars)
+            st.dataframe(de_df, use_container_width=True, hide_index=True, height=500)
+
+    # ================================================================
+    # ACCOUNTS (Change 1)
+    # ================================================================
+    elif analysis == "Accounts":
+        st.html('<div class="pro-section-title">Account Balances Over Time</div>')
+
+        _acct_dollar = st.segmented_control("Dollars", ["Nominal", "Real"], default="Nominal", key="dd_acct_dollars")
+        _acct_infl = out["infl_index"]
+
+        _acct_tax = out["taxable"]
+        _acct_trad = out["trad"]
+        _acct_roth = out["roth"]
+        _acct_hsa = out["hsa"]
+
+        if _acct_dollar == "Real":
+            _acct_tax = _acct_tax / _acct_infl
+            _acct_trad = _acct_trad / _acct_infl
+            _acct_roth = _acct_roth / _acct_infl
+            _acct_hsa = _acct_hsa / _acct_infl
+
+        _acct_rows = []
+        for i, age in enumerate(ages):
+            _acct_rows.append({"Age": int(age), "Taxable": float(np.median(_acct_tax[:, i])) / 1e3,
+                               "Traditional IRA": float(np.median(_acct_trad[:, i])) / 1e3,
+                               "Roth IRA": float(np.median(_acct_roth[:, i])) / 1e3,
+                               "HSA": float(np.median(_acct_hsa[:, i])) / 1e3})
+        _acct_df = pd.DataFrame(_acct_rows)
+        _acct_melt = _acct_df.melt("Age", var_name="Account", value_name="Balance ($K)")
+
+        _acct_chart = alt.Chart(_acct_melt).mark_area().encode(
+            x=alt.X("Age:Q", title="Age"),
+            y=alt.Y("Balance ($K):Q", title=f"Balance ($K {'real' if _acct_dollar == 'Real' else 'nominal'})", stack=True),
+            color=alt.Color("Account:N", scale=alt.Scale(
+                domain=["Taxable", "Traditional IRA", "Roth IRA", "HSA"],
+                range=["#1B2A4A", "#E57373", "#00897B", "#FF8F00"])),
+            tooltip=["Age:Q", "Account:N", alt.Tooltip("Balance ($K):Q", format=",.0f")]
+        ).properties(height=400)
+        st.altair_chart(_acct_chart, use_container_width=True)
+
+        # Milestone summary table
+        st.html('<div class="pro-section-title">Account Balances at Key Ages</div>')
+        _retire_a = int(cfg_run.get("retire_age", 62))
+        _end_a = int(cfg_run.get("end_age", 90))
+        _milestones = sorted(set([_retire_a, 65, 70, 75, 80, 85, 90, _end_a]) & set(int(a) for a in ages))
+        _ms_rows = []
+        for ma in _milestones:
+            mi = int(ma - ages[0])
+            if 0 <= mi < len(ages):
+                _ms_rows.append({
+                    "Age": ma,
+                    "Taxable": fmt_dollars(float(np.median(_acct_tax[:, mi]))),
+                    "Traditional": fmt_dollars(float(np.median(_acct_trad[:, mi]))),
+                    "Roth": fmt_dollars(float(np.median(_acct_roth[:, mi]))),
+                    "HSA": fmt_dollars(float(np.median(_acct_hsa[:, mi]))),
+                    "Total": fmt_dollars(float(np.median(_acct_tax[:, mi] + _acct_trad[:, mi] + _acct_roth[:, mi] + _acct_hsa[:, mi]))),
+                })
+        if _ms_rows:
+            st.dataframe(pd.DataFrame(_ms_rows), use_container_width=True, hide_index=True)
+
+    # ================================================================
+    # WITHDRAWAL RATE (Change 2)
+    # ================================================================
+    elif analysis == "Withdrawal Rate":
+        st.html('<div class="pro-section-title">Effective Withdrawal Rate Over Time</div>')
+
+        de = out["decomp"]
+        _liq = out["liquid"]
+        _ret_idx = max(0, int(cfg_run.get("retire_age", 62)) - int(ages[0]))
+
+        # Total withdrawals = taxable + trad + roth withdrawals
+        _total_wd = de["gross_tax_wd"] + de["gross_trad_wd"] + de["gross_roth_wd"]
+
+        _wr_rows = []
+        for i in range(_ret_idx, len(ages)):
+            if i > 0:
+                _beg_liq = _liq[:, i - 1]
+                _wd = _total_wd[:, i]
+                # Avoid division by zero
+                _safe_liq = np.maximum(_beg_liq, 1.0)
+                _wr = _wd / _safe_liq * 100  # as percentage
+                _wr_rows.append({
+                    "Age": int(ages[i]),
+                    "p25": float(np.percentile(_wr, 25)),
+                    "p50": float(np.percentile(_wr, 50)),
+                    "p75": float(np.percentile(_wr, 75)),
+                })
+
+        if _wr_rows:
+            _wr_df = pd.DataFrame(_wr_rows)
+
+            # Planned initial withdrawal rate
+            _spend_r = float(cfg_run.get("spend_real", 120000))
+            _start_liq = float(np.median(_liq[:, 0]))
+            _planned_wr = (_spend_r / max(_start_liq, 1.0)) * 100
+
+            _wr_band = alt.Chart(_wr_df).mark_area(opacity=0.2, color="#00897B").encode(
+                x=alt.X("Age:Q", title="Age"),
+                y=alt.Y("p25:Q", title="Withdrawal Rate (%)"),
+                y2="p75:Q",
+            )
+            _wr_line = alt.Chart(_wr_df).mark_line(color="#00897B", strokeWidth=3).encode(
+                x="Age:Q",
+                y=alt.Y("p50:Q"),
+                tooltip=["Age:Q", alt.Tooltip("p50:Q", title="Median WR %", format=".1f")]
+            )
+            _four_pct = alt.Chart(pd.DataFrame({"y": [4.0]})).mark_rule(
+                color="green", strokeDash=[6, 3], strokeWidth=1.5
+            ).encode(y="y:Q")
+            _four_label = alt.Chart(pd.DataFrame({"Age": [int(ages[_ret_idx]) + 1], "y": [4.3], "label": ["4% rule"]})).mark_text(
+                align="left", fontSize=11, color="green"
+            ).encode(x="Age:Q", y="y:Q", text="label:N")
+            _planned_rule = alt.Chart(pd.DataFrame({"y": [_planned_wr]})).mark_rule(
+                color="#FF8F00", strokeDash=[6, 3], strokeWidth=1.5
+            ).encode(y="y:Q")
+            _planned_label = alt.Chart(pd.DataFrame({"Age": [int(ages[_ret_idx]) + 1], "y": [_planned_wr + 0.3],
+                                                      "label": [f"Planned: {_planned_wr:.1f}%"]})).mark_text(
+                align="left", fontSize=11, color="#FF8F00"
+            ).encode(x="Age:Q", y="y:Q", text="label:N")
+
+            _wr_chart = (_wr_band + _wr_line + _four_pct + _four_label + _planned_rule + _planned_label).properties(height=400)
+            st.altair_chart(_wr_chart, use_container_width=True)
+            st.caption("Your effective withdrawal rate changes each year based on portfolio performance, spending adjustments from guardrails, "
+                       "and RMD requirements. The 4% line is a common benchmark, not a target. The shaded band shows the p25–p75 range.")
+        else:
+            st.info("No post-retirement years to analyze.")
 
     # ================================================================
     # SENSITIVITY
@@ -5108,6 +5362,140 @@ def deep_dive_page():
                 st.write(f"Success rate: **{baseline['success_rate']:.1f}%**")
                 st.write(f"Median legacy: **{fmt_dollars(baseline['median_legacy'])}**")
                 st.write(f"Median lifetime taxes: **{fmt_dollars(baseline['median_tax'])}**")
+
+    # ================================================================
+    # RETIRE WHEN? (Change 4)
+    # ================================================================
+    elif analysis == "Retire When?":
+        st.html('<div class="pro-section-title">Earliest Retirement Age Finder</div>')
+        st.caption("Find the earliest age you can retire and still hit your target success rate.")
+
+        _rw_target = st.slider("Target success rate (%)", 70, 99, 90, 1, key="dd_rw_target")
+
+        if st.button("▶ Find earliest retirement age", key="dd_rw_find"):
+            _rw_start = int(cfg_run.get("start_age", 55))
+            _rw_end = int(cfg_run.get("end_age", 90))
+            _rw_results = []
+
+            with st.spinner("Searching retirement ages..."):
+                # Linear scan (more informative than binary search since we show a table)
+                _rw_best = None
+                for _rw_age in range(_rw_start + 1, min(_rw_end, _rw_start + 30)):
+                    _rw_cfg = dict(cfg_run)
+                    _rw_cfg["retire_age"] = _rw_age
+                    _rw_cfg["n_sims"] = 1000
+                    _rw_out = simulate(_rw_cfg, hold)
+                    _rw_ruin = _rw_out["ruin_age"]
+                    _rw_pct = 100.0 - float((_rw_ruin <= _rw_end).sum()) / len(_rw_ruin) * 100
+                    _rw_results.append({"Retirement Age": _rw_age, "Success Rate": _rw_pct})
+                    if _rw_best is None and _rw_pct >= _rw_target:
+                        _rw_best = _rw_age
+
+            if _rw_best is not None:
+                st.html(_metric_card_html("You can retire at age", str(_rw_best),
+                    f"with {_rw_target}% success rate target", "metric-green"))
+            else:
+                st.warning(f"No retirement age found that achieves {_rw_target}% success rate within the plan horizon.")
+
+            # Show table around the best age
+            _rw_df = pd.DataFrame(_rw_results)
+            _rw_df["Success Rate"] = _rw_df["Success Rate"].map(lambda x: f"{x:.0f}%")
+            st.dataframe(_rw_df, use_container_width=True, hide_index=True)
+
+            # Line chart
+            _rw_chart_df = pd.DataFrame(_rw_results)
+            _rw_line = alt.Chart(_rw_chart_df).mark_line(color="#00897B", strokeWidth=3).encode(
+                x=alt.X("Retirement Age:Q", title="Retirement Age"),
+                y=alt.Y("Success Rate:Q", title="Success Rate (%)", scale=alt.Scale(domain=[0, 100])),
+                tooltip=["Retirement Age:Q", alt.Tooltip("Success Rate:Q", format=".0f")]
+            )
+            _rw_target_rule = alt.Chart(pd.DataFrame({"y": [float(_rw_target)]})).mark_rule(
+                color="#FF8F00", strokeDash=[6, 3], strokeWidth=1.5
+            ).encode(y="y:Q")
+            st.altair_chart((_rw_line + _rw_target_rule).properties(height=350), use_container_width=True)
+
+    # ================================================================
+    # FAILURE ANALYSIS (Change 5)
+    # ================================================================
+    elif analysis == "Failure Analysis":
+        st.html('<div class="pro-section-title">Failure Analysis</div>')
+
+        _fa_ruin = out["ruin_age"]
+        _fa_end = int(cfg_run.get("end_age", 90))
+        _fa_failed = _fa_ruin <= _fa_end
+        _fa_n_failed = int(_fa_failed.sum())
+        _fa_n_total = len(_fa_ruin)
+
+        if _fa_n_failed == 0:
+            st.success("No simulations ran out of money — nothing to analyze here. Your plan survives all tested scenarios.")
+        else:
+            _fa_pct = _fa_n_failed / _fa_n_total * 100
+            _fa_ruin_ages = _fa_ruin[_fa_failed]
+            _fa_med_ruin = int(np.median(_fa_ruin_ages))
+
+            _fa_ret_idx = max(0, int(cfg_run.get("retire_age", 62)) - int(ages[0]))
+            _fa_liq_at_ret = out["liquid"][_fa_failed, _fa_ret_idx] if _fa_ret_idx < out["liquid"].shape[1] else np.zeros(_fa_n_failed)
+            _fa_med_liq_ret = float(np.median(_fa_liq_at_ret))
+
+            # Metric cards
+            fm1, fm2, fm3 = st.columns(3, border=True)
+            with fm1:
+                st.html(_metric_card_html("Failed Simulations", f"{_fa_n_failed:,}",
+                    f"{_fa_pct:.1f}% of {_fa_n_total:,} total", "metric-coral"))
+            with fm2:
+                st.html(_metric_card_html("Median Failure Age", str(_fa_med_ruin),
+                    "age when money runs out", "metric-coral"))
+            with fm3:
+                st.html(_metric_card_html("Liquid at Retirement", f"${_fa_med_liq_ret/1e6:.1f}M",
+                    "median of failed sims", "metric-navy"))
+
+            # When do failures happen? - histogram
+            st.html('<div class="pro-section-title">When Do Failures Happen?</div>')
+            _fa_hist_df = pd.DataFrame({"Failure Age": _fa_ruin_ages.astype(int)})
+            _fa_hist = alt.Chart(_fa_hist_df).mark_bar(color="#E53935", opacity=0.8).encode(
+                x=alt.X("Failure Age:Q", bin=alt.Bin(maxbins=20), title="Age When Money Runs Out"),
+                y=alt.Y("count():Q", title="Number of Simulations"),
+                tooltip=["Failure Age:Q", "count():Q"]
+            ).properties(height=300)
+            st.altair_chart(_fa_hist, use_container_width=True)
+
+            # What went wrong? - sequence risk analysis
+            st.html('<div class="pro-section-title">What Went Wrong?</div>')
+            st.caption("Failed scenarios typically experience poor investment returns in the early retirement years — "
+                       "this is sequence-of-returns risk.")
+
+            _fa_success = ~_fa_failed
+            _fa_liq = out["liquid"]
+            _n_post_years = min(5, len(ages) - _fa_ret_idx - 1)
+            if _n_post_years > 0 and _fa_ret_idx > 0:
+                _fa_compare_rows = []
+                for yr in range(1, _n_post_years + 1):
+                    _idx = _fa_ret_idx + yr
+                    if _idx < _fa_liq.shape[1] and _fa_ret_idx < _fa_liq.shape[1]:
+                        _beg_failed = _fa_liq[_fa_failed, _fa_ret_idx]
+                        _end_failed = _fa_liq[_fa_failed, _idx]
+                        _cum_ret_failed = np.median((_end_failed / np.maximum(_beg_failed, 1.0) - 1.0) * 100)
+
+                        _beg_success = _fa_liq[_fa_success, _fa_ret_idx]
+                        _end_success = _fa_liq[_fa_success, _idx]
+                        _cum_ret_success = np.median((_end_success / np.maximum(_beg_success, 1.0) - 1.0) * 100)
+
+                        _fa_compare_rows.append({"Year After Retirement": yr, "Group": "Failed", "Cumulative Return (%)": _cum_ret_failed})
+                        _fa_compare_rows.append({"Year After Retirement": yr, "Group": "Survived", "Cumulative Return (%)": _cum_ret_success})
+
+                if _fa_compare_rows:
+                    _fa_cmp_df = pd.DataFrame(_fa_compare_rows)
+                    _fa_cmp_chart = alt.Chart(_fa_cmp_df).mark_bar().encode(
+                        x=alt.X("Year After Retirement:O", title="Year After Retirement"),
+                        y=alt.Y("Cumulative Return (%):Q", title="Cumulative Portfolio Change (%)"),
+                        color=alt.Color("Group:N", scale=alt.Scale(
+                            domain=["Failed", "Survived"],
+                            range=["#E53935", "#00897B"])),
+                        xOffset="Group:N",
+                        tooltip=["Year After Retirement:O", "Group:N",
+                                 alt.Tooltip("Cumulative Return (%):Q", format=".1f")]
+                    ).properties(height=300)
+                    st.altair_chart(_fa_cmp_chart, use_container_width=True)
 
     # ================================================================
     # REGIMES
