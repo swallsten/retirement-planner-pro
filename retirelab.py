@@ -4637,39 +4637,57 @@ def deep_dive_page():
         _ret_age_idx = max(0, int(cfg_run.get("retire_age", 62)) - int(ages[0]))
         _post_ret_ages = ages[_ret_age_idx:]
         if len(_post_ret_ages) > 1:
-            # Pick a single representative simulation (median-outcome) so income
-            # sources add up consistently — avoids the "marginal median" problem
-            # where independent p50s of each source can all be near zero.
-            _liq_end = out["liquid"][:, -1]
-            _median_val = float(np.median(_liq_end))
-            _rep_sim = int(np.argmin(np.abs(_liq_end - _median_val)))
+            # Use mean shares to break down the median total income by source.
+            # This avoids the "marginal median" problem (independent p50s per
+            # source can all be zero even when the median sim has money) and
+            # avoids picking a single sim that may be an outlier or go broke.
+            _src_keys = ["ss_inflow", "gross_rmd", "gross_tax_wd",
+                         "gross_trad_wd", "gross_roth_wd", "annuity_income"]
+            _src_labels = ["Social Security", "RMDs", "Taxable Withdrawals",
+                           "Trad IRA Withdrawals", "Roth Withdrawals", "Annuity Income"]
+
+            # Stack all income source arrays: shape (n_sources, n_sims, T+1)
+            _src_arrays = np.array([de[k] for k in _src_keys])
+            # Total income per sim per age: shape (n_sims, T+1)
+            _total_inc = _src_arrays.sum(axis=0)
 
             _income_rows = []
             _expense_rows = []
             for i, age in enumerate(_post_ret_ages):
                 idx = _ret_age_idx + i
+                # Median of total income across sims at this age
+                _med_total = float(np.percentile(_total_inc[:, idx], 50))
+                # Mean share of each source across sims at this age
+                _col_total = _total_inc[:, idx]
+                _col_total_safe = np.maximum(_col_total, 1e-6)
+                _shares = np.array([
+                    float(np.mean(de[k][:, idx] / _col_total_safe))
+                    for k in _src_keys
+                ])
+                # Normalize shares to sum to 1 (handle edge case)
+                _share_sum = _shares.sum()
+                if _share_sum > 0:
+                    _shares = _shares / _share_sum
+                _amounts = _shares * _med_total
+
                 _income_rows.append({
                     "Age": int(age),
-                    "Social Security": float(de["ss_inflow"][_rep_sim, idx]) / 1e3,
-                    "RMDs": float(de["gross_rmd"][_rep_sim, idx]) / 1e3,
-                    "Taxable Withdrawals": float(de["gross_tax_wd"][_rep_sim, idx]) / 1e3,
-                    "Trad IRA Withdrawals": float(de["gross_trad_wd"][_rep_sim, idx]) / 1e3,
-                    "Roth Withdrawals": float(de["gross_roth_wd"][_rep_sim, idx]) / 1e3,
-                    "Annuity Income": float(de["annuity_income"][_rep_sim, idx]) / 1e3,
+                    **{label: float(amt) / 1e3 for label, amt in zip(_src_labels, _amounts)}
                 })
-                _hc = (float(de["home_cost"][_rep_sim, idx]) +
-                       float(de["mort_pay"][_rep_sim, idx]) +
-                       float(de["rent"][_rep_sim, idx]))
-                _health_total = (float(de["health"][_rep_sim, idx]) +
-                                 float(de["medical_nom"][_rep_sim, idx]) +
-                                 float(de["ltc_cost"][_rep_sim, idx]))
+
+                _hc = (float(np.percentile(de["home_cost"][:, idx], 50)) +
+                       float(np.percentile(de["mort_pay"][:, idx], 50)) +
+                       float(np.percentile(de["rent"][:, idx], 50)))
+                _health_total = (float(np.percentile(de["health"][:, idx], 50)) +
+                                 float(np.percentile(de["medical_nom"][:, idx], 50)) +
+                                 float(np.percentile(de["ltc_cost"][:, idx], 50)))
                 _expense_rows.append({
                     "Age": int(age),
-                    "Core Spending": float(de["core_adjusted"][_rep_sim, idx]) / 1e3,
+                    "Core Spending": float(np.percentile(de["core_adjusted"][:, idx], 50)) / 1e3,
                     "Housing": _hc / 1e3,
                     "Healthcare": _health_total / 1e3,
-                    "Taxes": float(de["taxes_paid"][_rep_sim, idx]) / 1e3,
-                    "IRMAA": float(de["irmaa"][_rep_sim, idx]) / 1e3,
+                    "Taxes": float(np.percentile(de["taxes_paid"][:, idx], 50)) / 1e3,
+                    "IRMAA": float(np.percentile(de["irmaa"][:, idx], 50)) / 1e3,
                 })
 
             _inc_df = pd.DataFrame(_income_rows)
@@ -4681,7 +4699,7 @@ def deep_dive_page():
             _inc_colors = ["#FF8F00", "#AB47BC", "#1B2A4A", "#E57373", "#00897B", "#7E57C2"]
             _exp_colors = ["#1B2A4A", "#8D6E63", "#E57373", "#FF8F00", "#9E9E9E"]
 
-            st.caption("Showing a single representative simulation (median final wealth outcome) so income sources add up consistently.")
+            st.caption("Median total income broken down by average source share across all simulations.")
             ch_inc, ch_exp = st.columns(2)
             with ch_inc:
                 st.markdown("**Where the Money Comes From**")
