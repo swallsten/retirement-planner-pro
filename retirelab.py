@@ -4693,13 +4693,42 @@ def deep_dive_page():
             _inc_df = pd.DataFrame(_income_rows)
             _exp_df = pd.DataFrame(_expense_rows)
 
+            # Compare total income vs total expenses per age.
+            # Where expenses > income, scale down expense categories and add
+            # a "Shortfall" band so the user sees the unfunded gap.
+            _inc_src_cols = [c for c in _inc_df.columns if c != "Age"]
+            _exp_cat_cols = [c for c in _exp_df.columns if c != "Age"]
+            _inc_totals = _inc_df[_inc_src_cols].sum(axis=1)
+            _exp_totals = _exp_df[_exp_cat_cols].sum(axis=1)
+
+            # Build adjusted expense df: scale each category proportionally,
+            # add Shortfall for the unfunded portion
+            _exp_adj_rows = []
+            for r in range(_exp_df.shape[0]):
+                inc_t = _inc_totals.iloc[r]
+                exp_t = _exp_totals.iloc[r]
+                row = {"Age": _exp_df["Age"].iloc[r]}
+                if exp_t > 0 and inc_t < exp_t:
+                    scale = inc_t / exp_t
+                    for c in _exp_cat_cols:
+                        row[c] = _exp_df[c].iloc[r] * scale
+                    row["Shortfall"] = (exp_t - inc_t)
+                else:
+                    for c in _exp_cat_cols:
+                        row[c] = _exp_df[c].iloc[r]
+                    row["Shortfall"] = 0.0
+                _exp_adj_rows.append(row)
+            _exp_adj_df = pd.DataFrame(_exp_adj_rows)
+
             _inc_melt = _inc_df.melt("Age", var_name="Source", value_name="Amount ($K)")
-            _exp_melt = _exp_df.melt("Age", var_name="Category", value_name="Amount ($K)")
+            _exp_adj_melt = _exp_adj_df.melt("Age", var_name="Category", value_name="Amount ($K)")
 
             _inc_colors = ["#FF8F00", "#AB47BC", "#1B2A4A", "#E57373", "#00897B", "#7E57C2"]
-            _exp_colors = ["#1B2A4A", "#8D6E63", "#E57373", "#FF8F00", "#9E9E9E"]
+            _exp_domain = ["Core Spending", "Housing", "Healthcare", "Taxes", "IRMAA", "Shortfall"]
+            _exp_colors = ["#1B2A4A", "#8D6E63", "#E57373", "#FF8F00", "#9E9E9E", "#D32F2F"]
 
-            st.caption("Median total income broken down by average source share across all simulations.")
+            st.caption("Median total income broken down by average source share. "
+                       "Red 'Shortfall' on the expense chart shows planned spending that exceeds available income.")
             ch_inc, ch_exp = st.columns(2)
             with ch_inc:
                 st.markdown("**Where the Money Comes From**")
@@ -4714,11 +4743,11 @@ def deep_dive_page():
                 st.altair_chart(_inc_chart, use_container_width=True)
             with ch_exp:
                 st.markdown("**Where the Money Goes**")
-                _exp_chart = alt.Chart(_exp_melt).mark_area().encode(
+                _exp_chart = alt.Chart(_exp_adj_melt).mark_area().encode(
                     x=alt.X("Age:Q", title="Age"),
                     y=alt.Y("Amount ($K):Q", title="Amount ($K nominal)", stack=True),
                     color=alt.Color("Category:N", scale=alt.Scale(
-                        domain=["Core Spending", "Housing", "Healthcare", "Taxes", "IRMAA"],
+                        domain=_exp_domain,
                         range=_exp_colors)),
                     tooltip=["Age:Q", "Category:N", alt.Tooltip("Amount ($K):Q", format=",.0f")]
                 ).properties(height=350)
