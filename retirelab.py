@@ -1155,7 +1155,12 @@ def simulate(cfg: dict, hold: dict) -> dict:
     coast_contrib_ret = float(cfg.get("coast_contrib_ret", 0.0))
     coast_contrib_hsa = float(cfg.get("coast_contrib_hsa", 0.0))
 
+    # Spending events
+    spending_events = list(cfg.get("spending_events", []))
+
     # -------- Decomposition trackers (nominal) --------
+    event_expense_track = np.zeros((n, T+1))
+    event_income_track = np.zeros((n, T+1))
     ltc_cost_track = np.zeros((n, T+1))
     baseline_core_track = np.zeros((n, T+1))
     core_spend_track = np.zeros((n, T+1))
@@ -1476,8 +1481,29 @@ def simulate(cfg: dict, hold: dict) -> dict:
             ltc_nom[in_ltc] = ltc_cost_real * infl_index[in_ltc, t-1]
         ltc_cost_track[:, t] = ltc_nom
 
-        # Total outflow
-        outflow_nom = adjusted_core_nom + home_cost_nom + mort_pay_nom + rent_nom + health_nom + medical_short + ltc_nom
+        # Spending events: compute event expenses and income for this age
+        evt_expense_nom = np.zeros(n)
+        evt_income_nom = np.zeros(n)
+        evt_income_taxable_nom = np.zeros(n)
+        for evt in spending_events:
+            e_start = int(evt.get("start_age", 0))
+            e_end = int(evt.get("end_age", e_start))
+            if e_start <= age <= e_end:
+                amt_nom = float(evt.get("amount_real", 0.0)) * infl_index[:, t-1]
+                if mort_on:
+                    amt_nom[one_alive] *= (1 - spend_drop)
+                    amt_nom[none_alive] = 0.0
+                if evt.get("type", "expense") == "expense":
+                    evt_expense_nom += amt_nom
+                else:
+                    evt_income_nom += amt_nom
+                    if evt.get("taxable_income", False):
+                        evt_income_taxable_nom += amt_nom
+        event_expense_track[:, t] = evt_expense_nom
+        event_income_track[:, t] = evt_income_nom
+
+        # Total outflow (including event expenses)
+        outflow_nom = adjusted_core_nom + home_cost_nom + mort_pay_nom + rent_nom + health_nom + medical_short + ltc_nom + evt_expense_nom
         total_outflow_track[:, t] = outflow_nom
 
         # inheritance
@@ -1545,7 +1571,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
                 # Estimate ordinary income for bracket calculation
                 ss_est = ss_real * infl_index[:, t-1]
                 div_est = tax_prev * (float(cfg["div_yield"]) + float(cfg["dist_yield"]))
-                ordinary_est = ss_est + rmd_preview + div_est + ann_income_this_year
+                ordinary_est = ss_est + rmd_preview + div_est + ann_income_this_year + evt_income_taxable_nom
                 infl_factor_t = infl_index[:, t-1]
                 # Use median inflation factor for bracket inflation
                 median_infl = float(np.median(infl_factor_t))
@@ -1567,7 +1593,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
 
         ss_nom = ss_real * infl_index[:, t-1]
         ss_nom_track[:, t] = ss_nom
-        inflows_nom = ss_nom + ann_income_this_year
+        inflows_nom = ss_nom + ann_income_this_year + evt_income_nom
 
         need_before = np.maximum(0.0, outflow_nom - inflows_nom)
         if mort_on:
@@ -1603,7 +1629,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
         if gain_harvest_on and age >= retire_age:
             ss_for_tax = 0.85 * ss_nom
             div_inc = tax_prev * (div_yield_val + dist_yield_val)
-            ordinary_income_est = ss_for_tax + taxable_rmd + conv_gross + ann_income_this_year + div_inc
+            ordinary_income_est = ss_for_tax + taxable_rmd + conv_gross + ann_income_this_year + evt_income_taxable_nom + div_inc
             std_ded_adj = std_deduction * infl_factor_t
             taxable_income_est = np.maximum(0.0, ordinary_income_est - std_ded_adj)
             ltcg_threshold_adj = ltcg_0pct_threshold * infl_factor_t
@@ -1619,7 +1645,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
         # TAX ENGINE: compute taxes, then determine net RMD, IRMAA, and withdrawals
         # ================================================================
         # Phase 1 estimate (before knowing withdrawal amounts): use RMD + conversion income
-        ordinary_income_pre = taxable_rmd + conv_gross + ann_income_this_year
+        ordinary_income_pre = taxable_rmd + conv_gross + ann_income_this_year + evt_income_taxable_nom
         ltcg_pre = tax_prev * dist_yield_val  # cap gains distributions (not yet withdrawal gains)
 
         if use_tax_engine and age >= retire_age:
@@ -1642,6 +1668,11 @@ def simulate(cfg: dict, hold: dict) -> dict:
             tax_prev -= pay_from_tax
             remaining_conv_tax = conv_tax - pay_from_tax
             trad_prev = np.maximum(0.0, trad_prev - remaining_conv_tax)
+
+            # FICA on taxable event income (self-employment estimate: 15.3%)
+            evt_fica = evt_income_taxable_nom * 0.153
+            # Event income FICA added to spending need
+            need_before = need_before + evt_fica
 
             # Net RMD cash (after tax at marginal rate)
             rmd_tax_est = taxable_rmd * eff_ord_est
@@ -1730,7 +1761,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
 
             # --- Pass 2: recompute tax with actual withdrawal income ---
             ltcg_from_wd = gross_tax * gain_frac
-            ordinary_income_final = taxable_rmd + conv_gross + ann_income_this_year + gross_trad
+            ordinary_income_final = taxable_rmd + conv_gross + ann_income_this_year + gross_trad + evt_income_taxable_nom
             ltcg_final = ltcg_from_wd + ltcg_pre
             tax_result_2 = compute_federal_tax(
                 ordinary_income_final, qual_divs, ltcg_final, ss_nom,
@@ -1769,7 +1800,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
 
             # IRMAA (legacy)
             if irmaa_on and age >= medicare_age:
-                magi_est = taxable_rmd + conv_gross + ann_income_this_year + tax_prev * (div_yield_val + dist_yield_val)
+                magi_est = taxable_rmd + conv_gross + ann_income_this_year + evt_income_taxable_nom + tax_prev * (div_yield_val + dist_yield_val)
                 magi_track[:, t] = magi_est
                 prem = irmaa_monthly_per_person(magi_est, irmaa_base, irmaa_schedule)
                 irmaa_nom = prem * 12.0 * irmaa_people
@@ -1931,7 +1962,10 @@ def simulate(cfg: dict, hold: dict) -> dict:
             take_home = gross_income_nom - employee_401k_nom - hsa_contrib_nom - pre_ret_taxes
 
             # Surplus after spending → saved to taxable account
-            surplus = np.maximum(0.0, take_home - pre_ret_spend_nom)
+            # Include event expenses in pre-retirement spending, and event income in take-home
+            _pre_ret_total_spend = pre_ret_spend_nom + evt_expense_nom
+            _pre_ret_take_home = take_home + evt_income_nom
+            surplus = np.maximum(0.0, _pre_ret_take_home - _pre_ret_total_spend)
             # Explicit extra taxable savings (if user specified additional amount)
             explicit_taxable = contrib_taxable * ci
             total_new_taxable = surplus + explicit_taxable
@@ -2038,6 +2072,8 @@ def simulate(cfg: dict, hold: dict) -> dict:
             "earned_income": _f32(earned_income_track),
             "pre_ret_tax": _f32(pre_ret_tax_track),
             "pre_ret_savings": _f32(pre_ret_savings_track),
+            "event_expense": _f32(event_expense_track),
+            "event_income": _f32(event_income_track),
         },
         "infl_index": _f32(infl_index),
         "regime_states": regime_track,
@@ -2917,6 +2953,10 @@ def init_defaults():
     _d("coast_contrib_ret", 0.0)
     _d("coast_contrib_hsa", 0.0)
 
+    # Spending events (one-time and recurring income/expenses)
+    _d("spending_events", [])
+    _d("spending_floor", 80000.0)
+
     # Equity sub-buckets (Phase 5)
     _d("equity_granular_on", False)
     _d("equity_sub_weights", {k: v["weight"] for k, v in EQUITY_SUB_DEFAULTS.items()})
@@ -2962,9 +3002,9 @@ _SECTION_KEYS = {
     "Income": ["contrib_on", "pretax_income_1", "pretax_income_2", "income_growth_real",
                "contrib_ret_annual", "contrib_roth_401k_frac", "contrib_match_annual",
                "ss62_1", "claim1", "ss62_2", "claim2",
-               "coast_on", "coast_start_age", "coast_income_real"],
+               "coast_on", "coast_start_age", "coast_income_real", "spending_events"],
     "Spending": ["spend_real", "spend_split_on", "spend_essential_real", "spend_discretionary_real",
-                 "gk_on", "pre_ret_spend_real"],
+                 "gk_on", "pre_ret_spend_real", "spending_events"],
     "Home": ["home_on"],
     "Health": ["health_model", "ltc_on"],
     "Taxes": ["tax_engine_on", "filing_status", "conv_on", "rmd_on", "gain_harvest_on",
@@ -2984,6 +3024,7 @@ _SECTION_DEFAULTS = {
     "coast_on": False, "coast_start_age": 55, "coast_income_real": 50000.0,
     "spend_real": 300000.0, "spend_split_on": False, "spend_essential_real": 180000.0,
     "spend_discretionary_real": 120000.0, "gk_on": True, "pre_ret_spend_real": 0.0,
+    "spending_events": [],
     "home_on": False, "health_model": "aca_marketplace", "ltc_on": False,
     "tax_engine_on": True, "filing_status": "mfj", "conv_on": False, "rmd_on": True,
     "gain_harvest_on": False, "irmaa_on": False, "qcd_on": False,
@@ -3062,6 +3103,38 @@ def _generate_plan_interpretation(pct_success: float, funded_through: int, end_a
     if not bool(cfg.get("gk_on", False)):
         lines.append("Adaptive spending guardrails are off. Turning them on lets your spending flex with market performance, "
                      "which significantly improves plan survival in bad scenarios.")
+
+    # Spending floor note (when guardrails are on)
+    if bool(cfg.get("gk_on", False)):
+        _retire_age_interp = int(cfg.get("retire_age", 62))
+        _start_age_interp = int(cfg.get("start_age", 55))
+        _ri_interp = max(0, _retire_age_interp - _start_age_interp)
+        _spend_real_interp = out["decomp"]["spend_real_track"][:, _ri_interp:]
+        if _spend_real_interp.shape[1] > 1:
+            _floor_val_interp = float(cfg.get("spending_floor", 80000.0))
+            _min_spend_interp = np.min(_spend_real_interp, axis=1)
+            _pct_floor_interp = float((_min_spend_interp >= _floor_val_interp).mean()) * 100
+            if _pct_floor_interp < 80:
+                lines.append(f"With guardrails, you're unlikely to fully run out of money, but there's a "
+                             f"{100 - _pct_floor_interp:.0f}% chance your spending drops below "
+                             f"${_floor_val_interp:,.0f}/yr at some point.")
+
+    # Spending events summary
+    events = cfg.get("spending_events", [])
+    if events:
+        total_exp = sum(float(e.get("amount_real", 0)) for e in events if e.get("type") == "expense"
+                        and e.get("start_age") == e.get("end_age"))
+        recurring_exp = [e for e in events if e.get("type") == "expense" and e.get("start_age") != e.get("end_age")]
+        income_evts = [e for e in events if e.get("type") == "income"]
+        parts = []
+        if total_exp > 0:
+            parts.append(f"${total_exp:,.0f} in one-time expenses")
+        if recurring_exp:
+            parts.append(f"{len(recurring_exp)} recurring expense event(s)")
+        if income_evts:
+            parts.append(f"{len(income_evts)} additional income stream(s)")
+        if parts:
+            lines.append(f"Your plan includes {', '.join(parts)}.")
 
     return " ".join(lines)
 
@@ -3387,6 +3460,25 @@ def dashboard_page():
         _interp_icon = "🔴"
     st.info(f"{_interp_icon} {_interpretation}")
 
+    # ---- Spending floor probability ----
+    _retire_idx_dash = max(0, int(cfg["retire_age"]) - int(out["ages"][0]))
+    _spend_real_post_ret = out["decomp"]["spend_real_track"][:, _retire_idx_dash:]
+    if _spend_real_post_ret.shape[1] > 1:
+        _min_spend_per_sim = np.min(_spend_real_post_ret, axis=1)
+        _floor_val = float(cfg.get("spending_floor", 80000.0))
+        _pct_above_floor = float((_min_spend_per_sim >= _floor_val).mean()) * 100
+        _floor_col1, _floor_col2 = st.columns([1, 3])
+        with _floor_col1:
+            cfg["spending_floor"] = st.number_input("Spending floor (real $)",
+                value=_floor_val, step=5000.0, key="dash_floor",
+                help="Minimum acceptable annual spending in today's dollars. Shows the probability your core spending never drops below this level.")
+            _floor_val = float(cfg["spending_floor"])
+            _pct_above_floor = float((_min_spend_per_sim >= _floor_val).mean()) * 100
+        with _floor_col2:
+            _floor_color = "metric-green" if _pct_above_floor >= 90 else "metric-amber" if _pct_above_floor >= 75 else "metric-coral"
+            st.html(_metric_card_html("Spending Floor Probability", f"{_pct_above_floor:.0f}%",
+                f"chance core spending stays above {fmt_dollars(_floor_val)}/yr (real)", _floor_color))
+
     # ---- View toggles ----
     tc1, tc2 = st.columns(2)
     with tc1:
@@ -3457,6 +3549,184 @@ def dashboard_page():
         render_mini_tornado(cfg_run, hold, top_n=6)
 
 
+# ---- Event editor (reusable for both Spending and Income tabs) ----
+def _next_event_id(events: list) -> int:
+    """Return a unique integer ID not already used by any event."""
+    used = {ev.get("_id", 0) for ev in events}
+    _id = 1
+    while _id in used:
+        _id += 1
+    return _id
+
+
+def _render_event_editor(cfg: dict, filter_type: str):
+    """Render an add/remove event list filtered to 'expense' or 'income' type.
+
+    Events are stored in cfg["spending_events"] (list of dicts, all types mixed).
+    Each event is shown as an editable expander.  Preset buttons add a new event
+    with sensible defaults and open it for editing.  Every event carries a stable
+    ``_id`` used for widget keys so that adding/removing events never causes
+    widget-key collisions.
+    """
+    all_events = list(cfg.get("spending_events", []))
+    _cur_age = int(cfg.get("start_age", 55))
+    _ret_age = int(cfg.get("retire_age", 62))
+    _end_age_cfg = int(cfg.get("end_age", 90))
+    _prefix = "exp" if filter_type == "expense" else "inc"
+
+    # Ensure every event has a stable _id (backfill old configs)
+    _id_dirty = False
+    for ev in all_events:
+        if "_id" not in ev:
+            ev["_id"] = _next_event_id(all_events)
+            _id_dirty = True
+    if _id_dirty:
+        cfg["spending_events"] = all_events
+
+    # Which event _id was just added and should be open for editing?
+    _just_added_id = st.session_state.pop(f"_evt_just_added_{_prefix}", None)
+
+    # Show existing events of this type — each in an editable expander
+    filtered = [(i, ev) for i, ev in enumerate(all_events) if ev.get("type") == filter_type]
+    _dirty = False
+    if filtered:
+        for orig_idx, ev in filtered:
+            _eid = ev["_id"]
+            _age_range = (str(ev.get("start_age", ""))
+                          if ev.get("start_age") == ev.get("end_age")
+                          else f"{ev.get('start_age')}–{ev.get('end_age')}")
+            _tax_tag = ""
+            if filter_type == "income" and ev.get("taxable_income", False):
+                _tax_tag = " · taxable"
+            _icon = "💸" if filter_type == "expense" else "💰"
+            _label = f"{_icon} {ev.get('name', 'Event')} — ${ev.get('amount_real', 0):,.0f}/yr · ages {_age_range}{_tax_tag}"
+            _open = (_eid == _just_added_id)
+            with st.expander(_label, expanded=_open):
+                _ec1, _ec2 = st.columns(2)
+                with _ec1:
+                    _ed_name = st.text_input("Name", value=ev.get("name", ""),
+                                             key=f"ev_n_{_prefix}_{_eid}")
+                    _ed_amt = st.number_input("Annual amount (today's $)",
+                                              value=float(ev.get("amount_real", 0)),
+                                              step=1000.0, min_value=0.0,
+                                              key=f"ev_a_{_prefix}_{_eid}")
+                with _ec2:
+                    _ed_sa = st.number_input("Start age",
+                                             value=int(ev.get("start_age", _cur_age)),
+                                             step=1, key=f"ev_sa_{_prefix}_{_eid}")
+                    _ed_ea = st.number_input("End age (same = one-time)",
+                                             value=int(ev.get("end_age", _cur_age)),
+                                             step=1, key=f"ev_ea_{_prefix}_{_eid}")
+                _ed_tax = ev.get("taxable_income", False)
+                if filter_type == "income":
+                    _ed_tax = st.toggle("Taxable earned income (income tax + FICA)",
+                                        value=bool(ev.get("taxable_income", True)),
+                                        key=f"ev_tx_{_prefix}_{_eid}")
+
+                # Apply edits back into the event dict
+                _updated = {
+                    "_id": _eid,
+                    "name": _ed_name.strip() or ev.get("name", "Event"),
+                    "type": filter_type,
+                    "amount_real": _ed_amt,
+                    "start_age": _ed_sa,
+                    "end_age": max(_ed_sa, _ed_ea),
+                    "taxable_income": _ed_tax if filter_type == "income" else False,
+                }
+                if _updated != all_events[orig_idx]:
+                    all_events[orig_idx] = _updated
+                    _dirty = True
+
+                if st.button("Remove", key=f"evt_rm_{_prefix}_{_eid}",
+                             use_container_width=True):
+                    all_events.pop(orig_idx)
+                    cfg["spending_events"] = all_events
+                    st.rerun()
+    else:
+        st.caption(f"No {'expense' if filter_type == 'expense' else 'income'} events yet.")
+
+    if _dirty:
+        cfg["spending_events"] = all_events
+
+    # ---- Presets (add event with defaults, open for editing) ----
+    if filter_type == "expense":
+        _presets = {
+            "🚗 New car": {"name": "New car", "amount_real": 45000.0,
+                        "start_age": _cur_age + 5, "end_age": _cur_age + 5},
+            "🏠 Renovation": {"name": "Home renovation", "amount_real": 80000.0,
+                           "start_age": _cur_age + 3, "end_age": _cur_age + 3},
+            "🎓 College": {"name": "College tuition", "amount_real": 50000.0,
+                        "start_age": _cur_age + 5, "end_age": _cur_age + 8},
+            "🏥 Long-term care": {"name": "Long-term care", "amount_real": 24000.0,
+                               "start_age": 80, "end_age": _end_age_cfg},
+        }
+    else:
+        _presets = {
+            "🏦 Pension": {"name": "Pension", "amount_real": 24000.0,
+                        "start_age": 65, "end_age": _end_age_cfg, "taxable_income": True},
+            "💼 Consulting": {"name": "Consulting income", "amount_real": 60000.0,
+                           "start_age": _ret_age, "end_age": _ret_age + 5, "taxable_income": True},
+            "🏘️ Rental": {"name": "Rental income", "amount_real": 24000.0,
+                       "start_age": _cur_age, "end_age": 75, "taxable_income": True},
+            "⏰ Part-time": {"name": "Part-time work", "amount_real": 30000.0,
+                          "start_age": _ret_age, "end_age": _ret_age + 8, "taxable_income": True},
+        }
+
+    st.caption("Quick-add a preset (click to add, then edit details):")
+    _pr_cols = st.columns(len(_presets))
+    for i, (pk, pv) in enumerate(_presets.items()):
+        with _pr_cols[i]:
+            if st.button(pk, key=f"evt_pr_{_prefix}_{pk}", use_container_width=True):
+                _new_id = _next_event_id(all_events)
+                _new_evt = {
+                    "_id": _new_id,
+                    "name": pv["name"],
+                    "type": filter_type,
+                    "amount_real": pv["amount_real"],
+                    "start_age": pv["start_age"],
+                    "end_age": max(pv["start_age"], pv["end_age"]),
+                    "taxable_income": pv.get("taxable_income", False) if filter_type == "income" else False,
+                }
+                all_events.append(_new_evt)
+                cfg["spending_events"] = all_events
+                # Store the _id so the new event's expander opens
+                st.session_state[f"_evt_just_added_{_prefix}"] = _new_id
+                st.rerun()
+
+    # ---- Blank "add custom" ----
+    with st.expander("Add a custom event", expanded=False):
+        ae_c1, ae_c2 = st.columns(2)
+        with ae_c1:
+            _new_name = st.text_input("Event name", key=f"evt_name_{_prefix}")
+            _new_amount = st.number_input("Annual amount (today's $)",
+                value=25000.0, step=1000.0, min_value=0.0, key=f"evt_amt_{_prefix}")
+        with ae_c2:
+            _new_start = st.number_input("Start age", value=(_cur_age + 5), step=1, key=f"evt_sa_{_prefix}")
+            _new_end = st.number_input("End age (same as start = one-time)",
+                value=(_cur_age + 5), step=1, key=f"evt_ea_{_prefix}")
+            _new_taxable = False
+            if filter_type == "income":
+                _new_taxable = st.toggle("Taxable earned income (income tax + FICA)",
+                    value=True, key=f"evt_tax_{_prefix}")
+
+        if st.button("Add event", key=f"evt_add_{_prefix}", type="primary"):
+            if _new_name.strip():
+                _new_id = _next_event_id(all_events)
+                all_events.append({
+                    "_id": _new_id,
+                    "name": _new_name.strip(),
+                    "type": filter_type,
+                    "amount_real": _new_amount,
+                    "start_age": _new_start,
+                    "end_age": max(_new_start, _new_end),
+                    "taxable_income": _new_taxable if filter_type == "income" else False,
+                })
+                cfg["spending_events"] = all_events
+                st.rerun()
+            else:
+                st.warning("Please enter an event name.")
+
+
 # ---- 8b: Plan Setup page ----
 def plan_setup_page():
     cfg = st.session_state["cfg"]
@@ -3467,12 +3737,25 @@ def plan_setup_page():
     # Section names with completion indicators (Feature 4)
     _section_names = ["Basics", "Income", "Spending", "Home", "Health", "Taxes", "Market", "Allocation", "Stress Tests", "Advanced"]
     _section_labels = []
+    _name_to_label = {}
     for sn in _section_names:
         if _section_is_customized(cfg, sn):
-            _section_labels.append(f"✓ {sn}")
+            _lbl = f"✓ {sn}"
         else:
-            _section_labels.append(sn)
+            _lbl = sn
+        _section_labels.append(_lbl)
+        _name_to_label[sn] = _lbl
     _label_to_name = dict(zip(_section_labels, _section_names))
+
+    # Fix up the stored widget value if the checkmark prefix changed
+    # (e.g. "Income" → "✓ Income" after adding an event).  Without this,
+    # st.segmented_control can't find the old label and falls back to default.
+    _stored = st.session_state.get("setup_section")
+    if _stored is not None and _stored not in _section_labels:
+        # Try to match the bare name (strip any existing checkmark)
+        _bare = _stored.lstrip("✓ ").strip() if _stored.startswith("✓") else _stored
+        if _bare in _name_to_label:
+            st.session_state["setup_section"] = _name_to_label[_bare]
 
     section_label = st.segmented_control(
         "Section",
@@ -3856,6 +4139,12 @@ def plan_setup_page():
             ann2_annual = float(cfg["ann2_purchase_amount"]) * float(cfg["ann2_payout_rate"])
             st.info(f"Estimated annual income: **${ann2_annual:,.0f}** (today's dollars) starting at age {cfg['ann2_income_start_age']}.")
 
+        # ---- Additional Income Events ----
+        st.html('<div class="pro-section-title">Additional Income Streams</div>')
+        st.caption("Model recurring or one-time income at specific ages: pension, consulting, rental income, part-time work, etc. "
+                   "Taxable income flows through the tax engine (income tax + 15.3% self-employment FICA).")
+        _render_event_editor(cfg, "income")
+
     # ================================================================
     # SPENDING
     # ================================================================
@@ -3938,6 +4227,13 @@ def plan_setup_page():
                     int(round(float(cfg["gk_lower_pct"]) * 100)), 5, format="%d%%", key="ps_gk_lower")
                 cfg["gk_lower_pct"] = gk_lower_int / 100.0
                 cfg["gk_raise"] = st.number_input("Raise %", value=float(cfg["gk_raise"]), step=0.01, format="%.2f", key="ps_gk_raise")
+
+        # ---- Spending Events (expenses only) ----
+        st.html('<div class="pro-section-title">Spending Events</div>')
+        st.caption("Model one-time or recurring expenses at specific ages: a new car, home renovation, college tuition, etc. "
+                   "For additional income streams (pension, consulting, rental), see the **Income** tab.")
+
+        _render_event_editor(cfg, "expense")
 
     # ================================================================
     # HOME
@@ -4641,30 +4937,39 @@ def deep_dive_page():
             # This avoids the "marginal median" problem (independent p50s per
             # source can all be zero even when the median sim has money) and
             # avoids picking a single sim that may be an outlier or go broke.
-            _src_keys = ["ss_inflow", "gross_rmd", "gross_tax_wd",
-                         "gross_trad_wd", "gross_roth_wd", "annuity_income"]
-            _src_labels = ["Social Security", "RMDs", "Taxable Withdrawals",
-                           "Trad IRA Withdrawals", "Roth Withdrawals", "Annuity Income"]
+            # Combine the three portfolio withdrawal types + RMDs into a single
+            # "Portfolio Withdrawals" category so the chart is easier to read.
+            _raw_keys = ["ss_inflow", "gross_rmd", "gross_tax_wd",
+                         "gross_trad_wd", "gross_roth_wd", "annuity_income", "event_income"]
+            # Merged groups: portfolio = RMDs + taxable + trad + roth
+            _src_groups = {
+                "Social Security": ["ss_inflow"],
+                "Portfolio Withdrawals": ["gross_rmd", "gross_tax_wd", "gross_trad_wd", "gross_roth_wd"],
+                "Annuity Income": ["annuity_income"],
+                "Event Income": ["event_income"],
+            }
+            _src_labels = list(_src_groups.keys())
 
-            # Stack all income source arrays: shape (n_sources, n_sims, T+1)
-            _src_arrays = np.array([de[k] for k in _src_keys])
-            # Total income per sim per age: shape (n_sims, T+1)
-            _total_inc = _src_arrays.sum(axis=0)
+            # Total income per sim per age (all raw sources)
+            _raw_arrays = np.array([de[k] for k in _raw_keys])
+            _total_inc = _raw_arrays.sum(axis=0)  # shape (n_sims, T+1)
+
+            # Pre-sum each group per sim: shape (n_groups, n_sims, T+1)
+            _group_arrays = np.array([
+                sum(de[k] for k in keys) for keys in _src_groups.values()
+            ])
 
             _income_rows = []
             _expense_rows = []
             for i, age in enumerate(_post_ret_ages):
                 idx = _ret_age_idx + i
-                # Median of total income across sims at this age
                 _med_total = float(np.percentile(_total_inc[:, idx], 50))
-                # Mean share of each source across sims at this age
                 _col_total = _total_inc[:, idx]
                 _col_total_safe = np.maximum(_col_total, 1e-6)
                 _shares = np.array([
-                    float(np.mean(de[k][:, idx] / _col_total_safe))
-                    for k in _src_keys
+                    float(np.mean(_group_arrays[g, :, idx] / _col_total_safe))
+                    for g in range(len(_src_labels))
                 ])
-                # Normalize shares to sum to 1 (handle edge case)
                 _share_sum = _shares.sum()
                 if _share_sum > 0:
                     _shares = _shares / _share_sum
@@ -4688,6 +4993,7 @@ def deep_dive_page():
                     "Healthcare": _health_total / 1e3,
                     "Taxes": float(np.percentile(de["taxes_paid"][:, idx], 50)) / 1e3,
                     "IRMAA": float(np.percentile(de["irmaa"][:, idx], 50)) / 1e3,
+                    "Event Expenses": float(np.percentile(de["event_expense"][:, idx], 50)) / 1e3,
                 })
 
             _inc_df = pd.DataFrame(_income_rows)
@@ -4723,11 +5029,13 @@ def deep_dive_page():
             _inc_melt = _inc_df.melt("Age", var_name="Source", value_name="Amount ($K)")
             _exp_adj_melt = _exp_adj_df.melt("Age", var_name="Category", value_name="Amount ($K)")
 
-            _inc_colors = ["#FF8F00", "#AB47BC", "#1B2A4A", "#E57373", "#00897B", "#7E57C2"]
-            _exp_domain = ["Core Spending", "Housing", "Healthcare", "Taxes", "IRMAA", "Shortfall"]
-            _exp_colors = ["#1B2A4A", "#8D6E63", "#E57373", "#FF8F00", "#9E9E9E", "#D32F2F"]
+            _inc_domain = ["Social Security", "Portfolio Withdrawals", "Annuity Income", "Event Income"]
+            _inc_colors = ["#FF8F00", "#1B2A4A", "#7E57C2", "#4CAF50"]
+            _exp_domain = ["Core Spending", "Housing", "Healthcare", "Taxes", "IRMAA", "Event Expenses", "Shortfall"]
+            _exp_colors = ["#1B2A4A", "#8D6E63", "#E57373", "#FF8F00", "#9E9E9E", "#AB47BC", "#D32F2F"]
 
             st.caption("Median total income broken down by average source share. "
+                       "'Portfolio Withdrawals' includes RMDs, taxable, traditional IRA, and Roth withdrawals. "
                        "Red 'Shortfall' on the expense chart shows planned spending that exceeds available income.")
             ch_inc, ch_exp = st.columns(2)
             with ch_inc:
@@ -4736,7 +5044,7 @@ def deep_dive_page():
                     x=alt.X("Age:Q", title="Age"),
                     y=alt.Y("Amount ($K):Q", title="Amount ($K nominal)", stack=True),
                     color=alt.Color("Source:N", scale=alt.Scale(
-                        domain=["Social Security", "RMDs", "Taxable Withdrawals", "Trad IRA Withdrawals", "Roth Withdrawals", "Annuity Income"],
+                        domain=_inc_domain,
                         range=_inc_colors)),
                     tooltip=["Age:Q", "Source:N", alt.Tooltip("Amount ($K):Q", format=",.0f")]
                 ).properties(height=350)
@@ -4780,6 +5088,8 @@ def deep_dive_page():
                     "SS Income": float(np.percentile(de["ss_inflow"][:, idx], 50)),
                     "RMDs (gross)": float(np.percentile(de["gross_rmd"][:, idx], 50)),
                     "Annuity Income": float(np.percentile(de["annuity_income"][:, idx], 50)),
+                    "Event Income": float(np.percentile(de["event_income"][:, idx], 50)),
+                    "Event Expenses": float(np.percentile(de["event_expense"][:, idx], 50)),
                     "Roth Conversions": float(np.percentile(de["conv_gross"][:, idx], 50)),
                     "IRMAA": float(np.percentile(de["irmaa"][:, idx], 50)),
                     "Taxable WD": float(np.percentile(de["gross_tax_wd"][:, idx], 50)),
@@ -4796,6 +5106,34 @@ def deep_dive_page():
                 if c != "Age":
                     de_df[c] = de_df[c].apply(fmt_dollars)
             st.dataframe(de_df, use_container_width=True, hide_index=True, height=500)
+
+        # Spending floor distribution chart
+        _spend_real_dd = de["spend_real_track"]
+        _ret_idx_dd = max(0, int(cfg_run.get("retire_age", 62)) - int(ages[0]))
+        _spend_real_post = _spend_real_dd[:, _ret_idx_dd:]
+        if _spend_real_post.shape[1] > 1:
+            with st.expander("Spending floor risk — minimum real spending distribution", expanded=False):
+                _min_spend_dd = np.min(_spend_real_post, axis=1) / 1e3
+                _hist_df = pd.DataFrame({"Minimum Real Spending ($K)": _min_spend_dd})
+                _hist_chart = alt.Chart(_hist_df).mark_bar(color="#1B2A4A", opacity=0.7).encode(
+                    alt.X("Minimum Real Spending ($K):Q", bin=alt.Bin(maxbins=40), title="Minimum Real Spending ($K)"),
+                    alt.Y("count():Q", title="Number of Simulations"),
+                    tooltip=[alt.Tooltip("Minimum Real Spending ($K):Q", bin=alt.Bin(maxbins=40), title="Spending ($K)"),
+                             alt.Tooltip("count():Q", title="Simulations")]
+                ).properties(height=250)
+
+                _floor_dd = float(cfg_run.get("spending_floor", 80000.0)) / 1e3
+                _floor_rule = alt.Chart(pd.DataFrame({"x": [_floor_dd]})).mark_rule(
+                    color="#D32F2F", strokeDash=[6, 3], strokeWidth=2
+                ).encode(x="x:Q")
+                _floor_label = alt.Chart(pd.DataFrame({"x": [_floor_dd + 2], "y": [0], "label": [f"Floor: ${_floor_dd:.0f}K"]})).mark_text(
+                    align="left", fontSize=11, color="#D32F2F", dy=-10
+                ).encode(x="x:Q", y="y:Q", text="label:N")
+
+                st.altair_chart(_hist_chart + _floor_rule + _floor_label, use_container_width=True)
+                _pct_below = float((_min_spend_dd < _floor_dd).mean()) * 100
+                st.caption(f"**{_pct_below:.1f}%** of simulations have at least one year where real core spending drops below the ${_floor_dd:.0f}K floor. "
+                           "This captures the tail risk from guardrail spending cuts.")
 
     # ================================================================
     # ACCOUNTS (Change 1)
@@ -5710,6 +6048,7 @@ _DIFF_KEYS = [
     ("crash_on", "Crash Overlay"), ("seq_on", "Sequence Stress"), ("seq_start_age", "Shock Start Age"),
     ("legacy_on", "Legacy"),
     ("equity_granular_on", "Equity Sub-Buckets"), ("tech_bubble_on", "Tech/AI Bubble"),
+    ("spending_events", "Spending Events"), ("spending_floor", "Spending Floor"),
 ]
 
 
@@ -5717,6 +6056,10 @@ def _fmt_val(v):
     """Format a config value for display in the diff table."""
     if isinstance(v, bool):
         return "Yes" if v else "No"
+    if isinstance(v, list):
+        if not v:
+            return "None"
+        return f"{len(v)} event(s)"
     if isinstance(v, float):
         if abs(v) >= 1000:
             return f"${v:,.0f}"
@@ -5873,7 +6216,7 @@ def compare_page():
     _ATTRIB_GROUPS = [
         ("Ages", ["start_age", "end_age", "retire_age"]),
         ("Household", ["has_spouse", "spouse_age"]),
-        ("Spending", ["spend_real", "spend_split_on", "spend_essential_real", "spend_discretionary_real"]),
+        ("Spending", ["spend_real", "spend_split_on", "spend_essential_real", "spend_discretionary_real", "spending_events"]),
         ("Spending Phases", ["phase1_end", "phase2_end", "phase1_mult", "phase2_mult", "phase3_mult"]),
         ("Guardrails", ["gk_on", "gk_upper_pct", "gk_lower_pct", "gk_cut", "gk_raise"]),
         ("Market Outlook", ["scenario", "manual_override", "override_params"]),
