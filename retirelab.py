@@ -3933,13 +3933,13 @@ def plan_setup_page():
 
     # Quick Setup vs All Sections mode
     _all_sections = ["Basics", "Income", "Spending", "Home", "Health", "Taxes", "Market", "Allocation", "Stress Tests", "Advanced"]
-    _quick_sections = ["Basics", "Income", "Spending", "Allocation"]
+    _quick_sections = ["Basics", "Income", "Spending", "Market", "Allocation"]
 
     _setup_mode = st.segmented_control(
         "Setup mode",
         ["Quick Setup", "All Sections"],
         default="Quick Setup", key="setup_mode",
-        help="Quick Setup shows the 4 sections that drive ~90% of your results. Switch to All Sections for fine-tuning."
+        help="Quick Setup shows the 5 sections that drive ~90% of your results. Switch to All Sections for fine-tuning."
     )
     _section_names = _quick_sections if _setup_mode == "Quick Setup" else _all_sections
 
