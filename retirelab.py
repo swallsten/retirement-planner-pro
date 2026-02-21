@@ -3336,7 +3336,9 @@ def dashboard_page():
                         help="Your estimated monthly benefit at age 62. Find yours at ssa.gov/myaccount. Set to 0 if unknown.")
                 cfg["spend_real"] = st.number_input("Annual spending in retirement ($)", value=float(cfg["spend_real"]),
                     step=10000.0, key="gs_spend_real",
-                    help="Total annual living expenses in today's dollars. Don't include mortgage (tracked separately).")
+                    help="Everyday costs: groceries, dining, utilities, travel, entertainment, etc. "
+                         "Do NOT include housing or medical — those are modeled separately in Assumptions.")
+                st.caption("Excludes housing & medical (tracked separately).")
 
             with gs_right:
                 st.markdown("**Your starting portfolio**")
