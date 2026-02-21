@@ -3231,7 +3231,7 @@ def dashboard_page():
     _saved_names = [s["name"] for s in _saved_scenarios]
     _active_sc = st.session_state.get("_active_scenario_name")
 
-    hdr_left, hdr_switch, hdr_save_sc, hdr_mid, hdr_right = st.columns([3, 1, 1, 1, 1])
+    hdr_left, hdr_switch, hdr_save_sc, hdr_portfolio, hdr_mid, hdr_right = st.columns([3, 1, 1, 1, 1, 1])
     with hdr_left:
         outlook_name = cfg.get("scenario", "Base")
         badges = f"""<span style="display:inline-block; background:#00897B; color:white; padding:2px 12px;
@@ -3296,6 +3296,48 @@ def dashboard_page():
                         })
                     st.session_state["_active_scenario_name"] = _sc_name
                     st.rerun()
+    with hdr_portfolio:
+        with st.popover(":material/account_balance: Portfolio", use_container_width=True):
+            st.caption("Upload brokerage CSV exports to set your starting portfolio. "
+                       "Upload both files, then close this panel.")
+            dash_tax_file = st.file_uploader(
+                "Taxable account CSV", type=["csv", "txt", "tsv"], key="dash_tax_up",
+                help="CSV export from your taxable brokerage (Schwab, Fidelity, Vanguard, etc.)",
+            )
+            dash_ret_file = st.file_uploader(
+                "Retirement account CSV", type=["csv", "txt", "tsv"], key="dash_ret_up",
+                help="CSV export from your 401(k), IRA, 403(b), or similar retirement account",
+            )
+            dash_tax_ok, dash_ret_ok = False, False
+            if dash_tax_file:
+                try:
+                    tax_df, tax_val = load_snapshot(dash_tax_file)
+                    w_tax_u, total_tax_u, dollars_tax_u = weights_and_dollars(tax_df, tax_val)
+                    dash_tax_ok = True
+                except Exception as e:
+                    st.error(f"Error parsing taxable CSV: {e}")
+            if dash_ret_file:
+                try:
+                    ret_df, ret_val = load_snapshot(dash_ret_file)
+                    w_ret_u, total_ret_u, dollars_ret_u = weights_and_dollars(ret_df, ret_val)
+                    dash_ret_ok = True
+                except Exception as e:
+                    st.error(f"Error parsing retirement CSV: {e}")
+            if dash_tax_ok or dash_ret_ok:
+                final_hold = dict(hold)
+                if dash_tax_ok:
+                    final_hold["total_tax"] = total_tax_u
+                    final_hold["w_tax"] = w_tax_u
+                    final_hold["dollars_tax"] = dollars_tax_u
+                if dash_ret_ok:
+                    final_hold["total_ret"] = total_ret_u
+                    final_hold["w_ret"] = w_ret_u
+                    final_hold["dollars_ret"] = dollars_ret_u
+                st.session_state["hold"] = final_hold
+                st.session_state["_portfolio_uploaded"] = True
+                hold = final_hold
+                st.success(f"Taxable: {fmt_dollars(final_hold['total_tax'])} | "
+                           f"Retirement: {fmt_dollars(final_hold['total_ret'])}")
     with hdr_mid:
         st.download_button(
             ":material/download: Save Settings",
@@ -3312,7 +3354,7 @@ def dashboard_page():
                 st.session_state["cfg"] = json.loads(up.read().decode("utf-8"))
                 st.rerun()
 
-    # ---- Getting Started / Portfolio upload ----
+    # ---- Getting Started panel ----
     _using_defaults = (abs(hold["total_tax"] - 1_000_000.0) < 1.0 and abs(hold["total_ret"] - 2_000_000.0) < 1.0
                        and not st.session_state.get("_portfolio_uploaded", False))
     # Check if core inputs are still at defaults (first-time user signal)
@@ -3359,50 +3401,6 @@ def dashboard_page():
                 final_hold["dollars_ret"] = {k: _gs_ret * hold["w_ret"][k] for k in ASSET_CLASSES}
                 st.session_state["hold"] = final_hold
                 hold = final_hold
-
-            # CSV upload option
-            with st.popover("📎 Or upload brokerage CSVs instead"):
-                uc1, uc2 = st.columns(2)
-                with uc1:
-                    dash_tax_file = st.file_uploader(
-                        "Taxable account CSV", type=["csv", "txt", "tsv"], key="dash_tax_up",
-                        help="CSV export from your taxable brokerage (Schwab, Fidelity, Vanguard, etc.)",
-                    )
-                with uc2:
-                    dash_ret_file = st.file_uploader(
-                        "Retirement account CSV", type=["csv", "txt", "tsv"], key="dash_ret_up",
-                        help="CSV export from your 401(k), IRA, 403(b), or similar retirement account",
-                    )
-                dash_tax_ok, dash_ret_ok = False, False
-                if dash_tax_file:
-                    try:
-                        tax_df, tax_val = load_snapshot(dash_tax_file)
-                        w_tax_u, total_tax_u, dollars_tax_u = weights_and_dollars(tax_df, tax_val)
-                        dash_tax_ok = True
-                    except Exception as e:
-                        st.error(f"Error parsing taxable CSV: {e}")
-                if dash_ret_file:
-                    try:
-                        ret_df, ret_val = load_snapshot(dash_ret_file)
-                        w_ret_u, total_ret_u, dollars_ret_u = weights_and_dollars(ret_df, ret_val)
-                        dash_ret_ok = True
-                    except Exception as e:
-                        st.error(f"Error parsing retirement CSV: {e}")
-                if dash_tax_ok or dash_ret_ok:
-                    final_hold = dict(hold)
-                    if dash_tax_ok:
-                        final_hold["total_tax"] = total_tax_u
-                        final_hold["w_tax"] = w_tax_u
-                        final_hold["dollars_tax"] = dollars_tax_u
-                    if dash_ret_ok:
-                        final_hold["total_ret"] = total_ret_u
-                        final_hold["w_ret"] = w_ret_u
-                        final_hold["dollars_ret"] = dollars_ret_u
-                    st.session_state["hold"] = final_hold
-                    st.session_state["_portfolio_uploaded"] = True
-                    hold = final_hold
-                    st.success(f"Portfolio loaded — Taxable: {fmt_dollars(final_hold['total_tax'])} | "
-                               f"Retirement: {fmt_dollars(final_hold['total_ret'])}")
 
             if st.button("✓ I've entered my basics — dismiss this panel", key="gs_dismiss"):
                 st.session_state["_onboarding_dismissed"] = True
