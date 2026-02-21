@@ -1491,7 +1491,12 @@ def simulate(cfg: dict, hold: dict) -> dict:
             if e_start <= age <= e_end:
                 amt_nom = float(evt.get("amount_real", 0.0)) * infl_index[:, t-1]
                 if mort_on:
-                    amt_nom[one_alive] *= (1 - spend_drop)
+                    # Only apply spend_drop to multi-year expense events (ongoing lifestyle costs).
+                    # Discrete one-time expenses (car, tuition) and income events are not reduced.
+                    _is_discrete = (e_start == e_end)
+                    _is_income = evt.get("type", "expense") != "expense"
+                    if not _is_discrete and not _is_income:
+                        amt_nom[one_alive] *= (1 - spend_drop)
                     amt_nom[none_alive] = 0.0
                 if evt.get("type", "expense") == "expense":
                     evt_expense_nom += amt_nom
@@ -1893,7 +1898,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
 
         # Pre-retirement income, taxes, contributions, and surplus savings
         if contrib_on and age < retire_age:
-            ci = infl_index[:, t]
+            ci = infl_index[:, t-1]  # beginning-of-year prices, consistent with spending/events
             _in_coast = coast_on and age >= coast_start_age
 
             if _in_coast:
@@ -1933,11 +1938,19 @@ def simulate(cfg: dict, hold: dict) -> dict:
             # (Roth 401k is post-tax, so not deducted)
             taxable_wages = np.maximum(0.0, gross_income_nom - trad_401k_nom - match_nom - hsa_contrib_nom)
 
-            # Estimate federal + state tax on working income
+            # Add taxable event income to the tax base (e.g., rental, consulting)
+            # Event income marked taxable also owes self-employment FICA (15.3%)
+            _pre_ret_taxable_event = evt_income_taxable_nom  # already computed above
+            _pre_ret_evt_fica = _pre_ret_taxable_event * 0.153  # self-employment tax
+
+            # Total ordinary income for tax purposes = wages + taxable event income
+            _pre_ret_total_ordinary = taxable_wages + _pre_ret_taxable_event
+
+            # Estimate federal + state tax on working income (including taxable events)
             if use_tax_engine:
                 # compute_federal_tax handles standard deduction internally
                 pre_ret_tax_result = compute_federal_tax(
-                    ordinary_income=taxable_wages,
+                    ordinary_income=_pre_ret_total_ordinary,
                     qualified_dividends=np.zeros(n),
                     ltcg_realized=np.zeros(n),
                     ss_gross=np.zeros(n),
@@ -1946,12 +1959,12 @@ def simulate(cfg: dict, hold: dict) -> dict:
                     niit_on=False,
                 )
                 fed_tax_working = pre_ret_tax_result["fed_total"]
-                state_tax_working = taxable_wages * state_rate_ord
+                state_tax_working = _pre_ret_total_ordinary * state_rate_ord
                 pre_ret_taxes = fed_tax_working + state_tax_working
             else:
-                pre_ret_taxes = taxable_wages * eff_ord  # Flat effective rate fallback
-            # Also subtract Roth 401k and FICA (~7.65%) from take-home
-            fica = gross_income_nom * 0.0765
+                pre_ret_taxes = _pre_ret_total_ordinary * eff_ord  # Flat effective rate fallback
+            # Also subtract Roth 401k and FICA (~7.65% on wages, 15.3% on event income)
+            fica = gross_income_nom * 0.0765 + _pre_ret_evt_fica
             pre_ret_taxes = pre_ret_taxes + fica
             pre_ret_tax_track[:, t] = pre_ret_taxes
 
@@ -1962,7 +1975,8 @@ def simulate(cfg: dict, hold: dict) -> dict:
             take_home = gross_income_nom - employee_401k_nom - hsa_contrib_nom - pre_ret_taxes
 
             # Surplus after spending → saved to taxable account
-            # Include event expenses in pre-retirement spending, and event income in take-home
+            # Event income (after its taxes, already included in pre_ret_taxes) adds to take-home
+            # Non-taxable event income is fully added; taxable event income's taxes are already deducted above
             _pre_ret_total_spend = pre_ret_spend_nom + evt_expense_nom
             _pre_ret_take_home = take_home + evt_income_nom
             surplus = np.maximum(0.0, _pre_ret_take_home - _pre_ret_total_spend)
@@ -1990,7 +2004,8 @@ def simulate(cfg: dict, hold: dict) -> dict:
         idx = min(max(d - start_age, 0), T)
         legacy[i] = net_worth[i, idx]
 
-    ruin_age = np.full(n, end_age + 1, dtype=int)
+    _RUIN_SENTINEL = end_age + 1  # sentinel: sim never ran out of money
+    ruin_age = np.full(n, _RUIN_SENTINEL, dtype=int)
     for i in range(n):
         for t_idx in range(1, T + 1):
             a = int(ages[t_idx])
@@ -3734,11 +3749,22 @@ def plan_setup_page():
 
     st.html('<div style="font-size:1.8rem; font-weight:700; color:#1B2A4A; margin-bottom:0.5rem;">Plan Setup</div>')
 
-    # Section names with completion indicators (Feature 4)
-    # Use bare names for the widget (no checkmarks in labels) to avoid
-    # label-mismatch issues that cause the tab to jump back to Basics.
-    # Instead, show a small "✓" via a caption below.
-    _section_names = ["Basics", "Income", "Spending", "Home", "Health", "Taxes", "Market", "Allocation", "Stress Tests", "Advanced"]
+    # Quick Setup vs All Sections mode
+    _all_sections = ["Basics", "Income", "Spending", "Home", "Health", "Taxes", "Market", "Allocation", "Stress Tests", "Advanced"]
+    _quick_sections = ["Basics", "Income", "Spending", "Allocation"]
+
+    _setup_mode = st.segmented_control(
+        "Setup mode",
+        ["Quick Setup", "All Sections"],
+        default="Quick Setup", key="setup_mode",
+        help="Quick Setup shows the 4 sections that drive ~90% of your results. Switch to All Sections for fine-tuning."
+    )
+    _section_names = _quick_sections if _setup_mode == "Quick Setup" else _all_sections
+
+    # If currently-selected section is not in the visible list, reset
+    _prev_section = st.session_state.get("setup_section")
+    if _prev_section is not None and _prev_section not in _section_names:
+        st.session_state["setup_section"] = "Basics"
 
     section = st.segmented_control(
         "Section",
@@ -4126,7 +4152,8 @@ def plan_setup_page():
         # ---- Additional Income Events ----
         st.html('<div class="pro-section-title">Additional Income Streams</div>')
         st.caption("Model recurring or one-time income at specific ages: pension, consulting, rental income, part-time work, etc. "
-                   "Taxable income flows through the tax engine (income tax + 15.3% self-employment FICA).")
+                   "Taxable income flows through the tax engine (income tax + 15.3% self-employment FICA). "
+                   "For one-time or recurring *expenses* (car, renovation, tuition), see the **Spending** tab.")
         _render_event_editor(cfg, "income")
 
     # ================================================================
@@ -4218,6 +4245,15 @@ def plan_setup_page():
                    "For additional income streams (pension, consulting, rental), see the **Income** tab.")
 
         _render_event_editor(cfg, "expense")
+
+        # ---- Spending Floor ----
+        st.html('<div class="pro-section-title">Spending Floor</div>')
+        st.caption("The minimum annual spending (in today's dollars) you'd consider acceptable. "
+                   "The Results page shows the probability your spending never drops below this. "
+                   "This is a display-time metric — changing it does **not** require re-running the simulation.")
+        cfg["spending_floor"] = st.number_input("Spending floor (real $)",
+            value=float(cfg.get("spending_floor", 80000.0)), step=5000.0, key="ps_spend_floor",
+            help="Minimum acceptable annual spending in today's dollars.")
 
     # ================================================================
     # HOME
@@ -4901,9 +4937,52 @@ def deep_dive_page():
     cfg_run = st.session_state["cfg_run"]
     ages = out["ages"]
 
+    # Stale-results indicator: compare current assumptions to what was simulated
+    _current_cfg_run = build_cfg_run(cfg)
+    _cfg_changed = False
+    for _ck in _current_cfg_run:
+        if _ck in ("scenario_params", "irmaa_schedule"):
+            continue  # derived fields
+        _cv = _current_cfg_run.get(_ck)
+        _rv = cfg_run.get(_ck)
+        try:
+            if _cv != _rv:
+                _cfg_changed = True
+                break
+        except (ValueError, TypeError):
+            # numpy arrays or complex objects — use str comparison
+            if str(_cv) != str(_rv):
+                _cfg_changed = True
+                break
+    if _cfg_changed:
+        st.warning("⚠️ Your assumptions have changed since the last simulation. "
+                   "Go to **Results** to re-run with the updated settings.")
+
+    # Build tab list dynamically — hide tabs that don't apply to the current config
+    _dd_tabs = ["Cashflows", "Accounts", "Withdrawal Rate", "Sensitivity"]
+    if bool(cfg_run.get("irmaa_on", False)):
+        _dd_tabs.append("IRMAA")
+    _dd_tabs.append("Legacy")
+    if bool(cfg_run.get("ann1_on", False)) or bool(cfg_run.get("ann2_on", False)):
+        _dd_tabs.append("Annuity")
+    if bool(cfg_run.get("conv_on", False)):
+        _dd_tabs.append("Roth Strategy")
+    _dd_tabs.append("Tax Brackets")
+    if str(cfg_run.get("aca_mode", "simple")) == "aca":
+        _dd_tabs.append("ACA")
+    _dd_tabs.extend(["Optimizer", "Retire When?", "Failure Analysis"])
+    if str(cfg_run.get("return_model", "standard")) == "regime":
+        _dd_tabs.append("Regimes")
+    _dd_tabs.append("Reallocation")
+
+    # If previously-selected tab was hidden, reset to default
+    _prev_dd = st.session_state.get("dd_analysis")
+    if _prev_dd is not None and _prev_dd not in _dd_tabs:
+        st.session_state["dd_analysis"] = "Cashflows"
+
     analysis = st.segmented_control(
         "Analysis",
-        ["Cashflows", "Accounts", "Withdrawal Rate", "Sensitivity", "IRMAA", "Legacy", "Annuity", "Roth Strategy", "Tax Brackets", "ACA", "Optimizer", "Retire When?", "Failure Analysis", "Regimes", "Reallocation"],
+        _dd_tabs,
         default="Cashflows", key="dd_analysis"
     )
 
@@ -5027,9 +5106,10 @@ def deep_dive_page():
             _exp_domain = ["Core Spending", "Housing", "Healthcare", "Taxes", "IRMAA", "Event Expenses", "Shortfall"]
             _exp_colors = ["#1B2A4A", "#8D6E63", "#E57373", "#FF8F00", "#9E9E9E", "#AB47BC", "#D32F2F"]
 
-            st.caption("Median total income broken down by average source share. "
-                       "'Portfolio Withdrawals' includes RMDs, taxable, traditional IRA, and Roth withdrawals. "
-                       "Red 'Shortfall' on the expense chart shows planned spending that exceeds available income.")
+            st.caption("Each bar shows the median total across all simulations, split by average source proportions. "
+                       "No single simulation path looks exactly like this — it's a composite picture of the typical outcome. "
+                       "'Portfolio Withdrawals' combines RMDs + taxable + traditional + Roth. "
+                       "Red 'Shortfall' on the expense chart shows planned spending exceeding available income.")
             ch_inc, ch_exp = st.columns(2)
             with ch_inc:
                 st.markdown("**Where the Money Comes From**")
@@ -5218,10 +5298,10 @@ def deep_dive_page():
         if _wr_rows:
             _wr_df = pd.DataFrame(_wr_rows)
 
-            # Planned initial withdrawal rate
+            # Planned initial withdrawal rate (spending at retirement / liquid assets at retirement)
             _spend_r = float(cfg_run.get("spend_real", 120000))
-            _start_liq = float(np.median(_liq[:, 0]))
-            _planned_wr = (_spend_r / max(_start_liq, 1.0)) * 100
+            _ret_liq = float(np.median(_liq[:, _ret_idx])) if _ret_idx < _liq.shape[1] else float(np.median(_liq[:, 0]))
+            _planned_wr = (_spend_r / max(_ret_liq, 1.0)) * 100
 
             _wr_band = alt.Chart(_wr_df).mark_area(opacity=0.2, color="#00897B").encode(
                 x=alt.X("Age:Q", title="Age"),
@@ -5769,8 +5849,10 @@ def deep_dive_page():
             _rw_results = []
 
             with st.spinner("Searching retirement ages..."):
-                # Linear scan (more informative than binary search since we show a table)
+                # Two-phase scan: once we find the target age, run 5 more ages for chart context then stop
                 _rw_best = None
+                _rw_extra = 0  # count of ages scanned after finding target
+                _RW_EXTRA_MAX = 5  # how many extra ages to scan after finding target
                 for _rw_age in range(_rw_start + 1, min(_rw_end, _rw_start + 30)):
                     _rw_cfg = dict(cfg_run)
                     _rw_cfg["retire_age"] = _rw_age
@@ -5781,6 +5863,10 @@ def deep_dive_page():
                     _rw_results.append({"Retirement Age": _rw_age, "Success Rate": _rw_pct})
                     if _rw_best is None and _rw_pct >= _rw_target:
                         _rw_best = _rw_age
+                    if _rw_best is not None:
+                        _rw_extra += 1
+                        if _rw_extra >= _RW_EXTRA_MAX:
+                            break
 
             if _rw_best is not None:
                 st.html(_metric_card_html("You can retire at age", str(_rw_best),
@@ -5852,8 +5938,9 @@ def deep_dive_page():
 
             # What went wrong? - sequence risk analysis
             st.html('<div class="pro-section-title">What Went Wrong?</div>')
-            st.caption("Failed scenarios typically experience poor investment returns in the early retirement years — "
-                       "this is sequence-of-returns risk.")
+            st.caption("Failed scenarios typically see sharper portfolio declines in the early retirement years. "
+                       "This reflects both investment returns *and* withdrawals — "
+                       "when poor returns coincide with drawdowns, the portfolio erodes faster (sequence-of-returns risk).")
 
             _fa_success = ~_fa_failed
             _fa_liq = out["liquid"]
@@ -5871,20 +5958,20 @@ def deep_dive_page():
                         _end_success = _fa_liq[_fa_success, _idx]
                         _cum_ret_success = np.median((_end_success / np.maximum(_beg_success, 1.0) - 1.0) * 100)
 
-                        _fa_compare_rows.append({"Year After Retirement": yr, "Group": "Failed", "Cumulative Return (%)": _cum_ret_failed})
-                        _fa_compare_rows.append({"Year After Retirement": yr, "Group": "Survived", "Cumulative Return (%)": _cum_ret_success})
+                        _fa_compare_rows.append({"Year After Retirement": yr, "Group": "Failed", "Portfolio Change (%)": _cum_ret_failed})
+                        _fa_compare_rows.append({"Year After Retirement": yr, "Group": "Survived", "Portfolio Change (%)": _cum_ret_success})
 
                 if _fa_compare_rows:
                     _fa_cmp_df = pd.DataFrame(_fa_compare_rows)
                     _fa_cmp_chart = alt.Chart(_fa_cmp_df).mark_bar().encode(
                         x=alt.X("Year After Retirement:O", title="Year After Retirement"),
-                        y=alt.Y("Cumulative Return (%):Q", title="Cumulative Portfolio Change (%)"),
+                        y=alt.Y("Portfolio Change (%):Q", title="Cumulative Portfolio Change (%)"),
                         color=alt.Color("Group:N", scale=alt.Scale(
                             domain=["Failed", "Survived"],
                             range=["#E53935", "#00897B"])),
                         xOffset="Group:N",
                         tooltip=["Year After Retirement:O", "Group:N",
-                                 alt.Tooltip("Cumulative Return (%):Q", format=".1f")]
+                                 alt.Tooltip("Portfolio Change (%):Q", format=".1f")]
                     ).properties(height=300)
                     st.altair_chart(_fa_cmp_chart, use_container_width=True)
 
