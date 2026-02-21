@@ -60,9 +60,9 @@ BASE_CORR = {
 # Regime-switching model: 3-state Markov (Bull / Normal / Bear)
 REGIME_NAMES = ["Bull", "Normal", "Bear"]
 DEFAULT_REGIME_PARAMS = {
-    "Bull":   {"eq_mu": 0.15, "eq_vol": 0.12, "reit_mu": 0.14, "reit_vol": 0.14, "bond_mu": 0.04, "bond_vol": 0.04, "alt_mu": 0.10, "alt_vol": 0.10, "cash_mu": 0.03},
+    "Bull":   {"eq_mu": 0.10, "eq_vol": 0.12, "reit_mu": 0.10, "reit_vol": 0.14, "bond_mu": 0.035, "bond_vol": 0.04, "alt_mu": 0.07, "alt_vol": 0.10, "cash_mu": 0.03},
     "Normal": {"eq_mu": 0.07, "eq_vol": 0.16, "reit_mu": 0.07, "reit_vol": 0.18, "bond_mu": 0.03, "bond_vol": 0.06, "alt_mu": 0.05, "alt_vol": 0.14, "cash_mu": 0.02},
-    "Bear":   {"eq_mu": -0.10, "eq_vol": 0.28, "reit_mu": -0.08, "reit_vol": 0.30, "bond_mu": 0.02, "bond_vol": 0.10, "alt_mu": -0.03, "alt_vol": 0.22, "cash_mu": 0.02},
+    "Bear":   {"eq_mu": -0.05, "eq_vol": 0.25, "reit_mu": -0.05, "reit_vol": 0.25, "bond_mu": 0.02, "bond_vol": 0.08, "alt_mu": -0.01, "alt_vol": 0.18, "cash_mu": 0.015},
 }
 # Transition matrix: rows = from-state, cols = to-state [Bull, Normal, Bear]
 DEFAULT_TRANSITION_MATRIX = [
@@ -3142,46 +3142,46 @@ def _generate_plan_interpretation(pct_success: float, funded_through: int, end_a
 # ---- Regime-switching market presets (Feature 5) ----
 _REGIME_PRESETS = {
     "Historical Average": {
-        "desc": "Based on long-run historical market behavior. Moderate bull/bear cycle frequencies.",
+        "desc": "Calibrated to match the Base scenario's ~7% equity expected return, but with realistic bull/bear clustering.",
         "params": dict(DEFAULT_REGIME_PARAMS),
         "transition": [list(row) for row in DEFAULT_TRANSITION_MATRIX],
         "initial": list(DEFAULT_REGIME_INITIAL_PROBS),
     },
     "Conservative": {
-        "desc": "Lower returns across all states. Longer bear markets, shorter bulls. Good for stress-testing.",
+        "desc": "Lower returns (~4-5% equity). Longer bear markets, shorter bulls. Good for stress-testing.",
         "params": {
-            "Bull":   {"eq_mu": 0.10, "eq_vol": 0.14, "bond_mu": 0.02, "bond_vol": 0.04,
-                       "reit_mu": 0.08, "reit_vol": 0.16, "alt_mu": 0.04, "alt_vol": 0.08, "cash_mu": 0.01},
-            "Normal": {"eq_mu": 0.04, "eq_vol": 0.18, "bond_mu": 0.015, "bond_vol": 0.05,
-                       "reit_mu": 0.04, "reit_vol": 0.18, "alt_mu": 0.03, "alt_vol": 0.10, "cash_mu": 0.005},
-            "Bear":   {"eq_mu": -0.15, "eq_vol": 0.30, "bond_mu": 0.01, "bond_vol": 0.06,
-                       "reit_mu": -0.12, "reit_vol": 0.28, "alt_mu": -0.02, "alt_vol": 0.15, "cash_mu": 0.003},
+            "Bull":   {"eq_mu": 0.09, "eq_vol": 0.14, "bond_mu": 0.03, "bond_vol": 0.04,
+                       "reit_mu": 0.08, "reit_vol": 0.16, "alt_mu": 0.06, "alt_vol": 0.10, "cash_mu": 0.02},
+            "Normal": {"eq_mu": 0.06, "eq_vol": 0.18, "bond_mu": 0.025, "bond_vol": 0.05,
+                       "reit_mu": 0.06, "reit_vol": 0.18, "alt_mu": 0.04, "alt_vol": 0.12, "cash_mu": 0.015},
+            "Bear":   {"eq_mu": -0.04, "eq_vol": 0.26, "bond_mu": 0.015, "bond_vol": 0.07,
+                       "reit_mu": -0.04, "reit_vol": 0.24, "alt_mu": -0.01, "alt_vol": 0.16, "cash_mu": 0.005},
         },
         "transition": [[0.80, 0.15, 0.05], [0.10, 0.70, 0.20], [0.08, 0.32, 0.60]],
         "initial": [0.20, 0.50, 0.30],
     },
     "Optimistic": {
-        "desc": "Higher returns, shorter bear markets. Reflects a favorable economic outlook.",
+        "desc": "Higher returns (~10% equity), shorter bear markets. Reflects a favorable economic outlook.",
         "params": {
-            "Bull":   {"eq_mu": 0.18, "eq_vol": 0.11, "bond_mu": 0.04, "bond_vol": 0.035,
-                       "reit_mu": 0.16, "reit_vol": 0.13, "alt_mu": 0.08, "alt_vol": 0.07, "cash_mu": 0.03},
-            "Normal": {"eq_mu": 0.10, "eq_vol": 0.15, "bond_mu": 0.035, "bond_vol": 0.04,
-                       "reit_mu": 0.09, "reit_vol": 0.14, "alt_mu": 0.06, "alt_vol": 0.09, "cash_mu": 0.025},
-            "Bear":   {"eq_mu": -0.06, "eq_vol": 0.25, "bond_mu": 0.02, "bond_vol": 0.05,
-                       "reit_mu": -0.05, "reit_vol": 0.22, "alt_mu": 0.00, "alt_vol": 0.12, "cash_mu": 0.015},
+            "Bull":   {"eq_mu": 0.12, "eq_vol": 0.11, "bond_mu": 0.04, "bond_vol": 0.035,
+                       "reit_mu": 0.12, "reit_vol": 0.13, "alt_mu": 0.08, "alt_vol": 0.08, "cash_mu": 0.03},
+            "Normal": {"eq_mu": 0.08, "eq_vol": 0.15, "bond_mu": 0.035, "bond_vol": 0.04,
+                       "reit_mu": 0.08, "reit_vol": 0.15, "alt_mu": 0.06, "alt_vol": 0.10, "cash_mu": 0.025},
+            "Bear":   {"eq_mu": -0.03, "eq_vol": 0.22, "bond_mu": 0.02, "bond_vol": 0.05,
+                       "reit_mu": -0.03, "reit_vol": 0.20, "alt_mu": 0.00, "alt_vol": 0.12, "cash_mu": 0.015},
         },
         "transition": [[0.92, 0.06, 0.02], [0.20, 0.72, 0.08], [0.15, 0.40, 0.45]],
         "initial": [0.40, 0.45, 0.15],
     },
     "Volatile": {
-        "desc": "More frequent regime changes and higher volatility. Tests plan resilience to market whipsaws.",
+        "desc": "Similar expected returns (~5%) but more frequent regime changes and higher volatility within each state.",
         "params": {
-            "Bull":   {"eq_mu": 0.18, "eq_vol": 0.18, "bond_mu": 0.03, "bond_vol": 0.05,
-                       "reit_mu": 0.16, "reit_vol": 0.20, "alt_mu": 0.07, "alt_vol": 0.12, "cash_mu": 0.02},
-            "Normal": {"eq_mu": 0.05, "eq_vol": 0.22, "bond_mu": 0.02, "bond_vol": 0.06,
-                       "reit_mu": 0.04, "reit_vol": 0.22, "alt_mu": 0.03, "alt_vol": 0.14, "cash_mu": 0.01},
-            "Bear":   {"eq_mu": -0.18, "eq_vol": 0.35, "bond_mu": 0.01, "bond_vol": 0.07,
-                       "reit_mu": -0.15, "reit_vol": 0.32, "alt_mu": -0.05, "alt_vol": 0.20, "cash_mu": 0.005},
+            "Bull":   {"eq_mu": 0.14, "eq_vol": 0.18, "bond_mu": 0.035, "bond_vol": 0.05,
+                       "reit_mu": 0.13, "reit_vol": 0.20, "alt_mu": 0.09, "alt_vol": 0.14, "cash_mu": 0.025},
+            "Normal": {"eq_mu": 0.06, "eq_vol": 0.20, "bond_mu": 0.025, "bond_vol": 0.06,
+                       "reit_mu": 0.06, "reit_vol": 0.20, "alt_mu": 0.04, "alt_vol": 0.14, "cash_mu": 0.015},
+            "Bear":   {"eq_mu": -0.06, "eq_vol": 0.30, "bond_mu": 0.015, "bond_vol": 0.08,
+                       "reit_mu": -0.06, "reit_vol": 0.28, "alt_mu": -0.02, "alt_vol": 0.20, "cash_mu": 0.005},
         },
         "transition": [[0.75, 0.15, 0.10], [0.15, 0.60, 0.25], [0.12, 0.28, 0.60]],
         "initial": [0.25, 0.45, 0.30],
@@ -4541,7 +4541,7 @@ def plan_setup_page():
                        "This better captures real market behavior — long expansions punctuated by sharp downturns — "
                        "compared to a single fixed return assumption.")
 
-            # Preset buttons
+            # Preset buttons — write directly to widget keys so Streamlit picks up the values
             st.html('<div class="pro-section-title">Quick Presets</div>')
             st.caption("Pick a preset to populate all parameters, or customize below.")
             preset_cols = st.columns(len(_REGIME_PRESETS))
@@ -4553,6 +4553,17 @@ def plan_setup_page():
                         cfg["regime_params"] = _cp.deepcopy(pdata["params"])
                         cfg["regime_transition"] = _cp.deepcopy(pdata["transition"])
                         cfg["regime_initial_probs"] = list(pdata["initial"])
+                        # Write directly into widget keys (Streamlit ignores value= after first render)
+                        for _sn in REGIME_NAMES:
+                            _sp = pdata["params"][_sn]
+                            for _fld in ["eq_mu", "eq_vol", "reit_mu", "reit_vol", "bond_mu", "bond_vol",
+                                         "alt_mu", "alt_vol", "cash_mu"]:
+                                st.session_state[f"ps_reg_{_sn}_{_fld}"] = float(_sp[_fld])
+                        for _si in range(3):
+                            for _ci in range(3):
+                                st.session_state[f"ps_trans_{_si}_{_ci}"] = float(pdata["transition"][_si][_ci])
+                        for _ci in range(3):
+                            st.session_state[f"ps_init_{_ci}"] = float(pdata["initial"][_ci])
                         st.rerun()
 
             r_params = cfg.get("regime_params", dict(DEFAULT_REGIME_PARAMS))
