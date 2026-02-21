@@ -3616,6 +3616,34 @@ def dashboard_page():
     pct_success = 100.0 - float(ran_out_while_alive) / len(ruin_age) * 100
     funded_through = out["funded_through_age"]
 
+    # ---- Scenario summary bar ----
+    _rm = str(cfg_run.get("return_model", "standard"))
+    if _rm == "historical":
+        _hist_yr = int(cfg_run.get("hist_start_year", 0))
+        if _hist_yr == 0:
+            _scenario_label = f"Historical cycling — every period (1928–{max(HISTORICAL_RETURNS.keys())})"
+        else:
+            _notable = HISTORICAL_NOTABLE_YEARS.get(_hist_yr, "")
+            _scenario_label = f"Historical cycling — starting {_hist_yr}" + (f" ({_notable})" if _notable else "")
+    elif _rm == "regime":
+        _scenario_label = "Regime-switching (Bull / Normal / Bear cycles)"
+    else:
+        _scen_name = str(cfg_run.get("scenario", "Base"))
+        if bool(cfg_run.get("manual_override", False)):
+            _scenario_label = f"{_scen_name} outlook (custom overrides)"
+        else:
+            _scenario_label = f"{_scen_name} outlook"
+    _extras = []
+    if bool(cfg_run.get("gk_on", False)):
+        _extras.append("guardrails on")
+    if bool(cfg_run.get("conv_on", False)):
+        _extras.append("Roth conversions")
+    if bool(cfg_run.get("crash_on", False)) and _rm != "historical":
+        _extras.append("crash overlay")
+    _extra_str = f" · {', '.join(_extras)}" if _extras else ""
+    st.caption(f"**Scenario:** {_scenario_label}{_extra_str} · {int(cfg_run.get('n_sims', 3000)):,} simulations · "
+               f"ages {int(cfg_run.get('start_age', 55))}–{int(cfg_run.get('end_age', 90))}, retiring at {int(cfg_run.get('retire_age', 62))}")
+
     # ---- 4 metric cards ----
     if pct_success >= 90:
         sr_color = "metric-green"
