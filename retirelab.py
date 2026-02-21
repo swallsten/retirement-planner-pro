@@ -3313,15 +3313,10 @@ def dashboard_page():
                 st.rerun()
 
     # ---- Getting Started panel ----
-    _using_defaults = (abs(hold["total_tax"] - 1_000_000.0) < 1.0 and abs(hold["total_ret"] - 2_000_000.0) < 1.0
-                       and not st.session_state.get("_portfolio_uploaded", False))
-    # Check if core inputs are still at defaults (first-time user signal)
-    _basics_at_defaults = (int(cfg.get("start_age", 55)) == 55
-                           and abs(float(cfg.get("spend_real", 300000)) - 300000.0) < 1.0
-                           and float(cfg.get("ss62_1", 0)) == 0.0)
-    _show_getting_started = _using_defaults or _basics_at_defaults
-
-    if _show_getting_started and not st.session_state.get("_onboarding_dismissed", False):
+    # Show until the user explicitly dismisses it. Don't auto-hide based on
+    # portfolio uploads or changed values — that caused file uploaders to vanish
+    # mid-upload when the panel condition flipped between reruns.
+    if not st.session_state.get("_onboarding_dismissed", False):
         with st.expander("🚀 **Getting Started — enter your key numbers** (everything else has smart defaults)", expanded=True):
             st.markdown("Fill in these inputs to get a meaningful projection. "
                         "You can fine-tune everything else later in the **Assumptions** tab.")
@@ -3389,8 +3384,18 @@ def dashboard_page():
                         st.session_state["hold"] = final_hold
                         st.session_state["_portfolio_uploaded"] = True
                         hold = final_hold
-                        st.success(f"Taxable: {fmt_dollars(final_hold['total_tax'])} | "
-                                   f"Retirement: {fmt_dollars(final_hold['total_ret'])}")
+                        _loaded_parts = []
+                        if dash_tax_ok:
+                            _loaded_parts.append(f"Taxable: {fmt_dollars(final_hold['total_tax'])}")
+                        if dash_ret_ok:
+                            _loaded_parts.append(f"Retirement: {fmt_dollars(final_hold['total_ret'])}")
+                        st.success("Loaded " + " | ".join(_loaded_parts))
+                        if not dash_tax_ok:
+                            st.info(f"Taxable account still using previous value: {fmt_dollars(final_hold['total_tax'])}. "
+                                    "Upload a taxable CSV above to update it.")
+                        if not dash_ret_ok:
+                            st.info(f"Retirement account still using previous value: {fmt_dollars(final_hold['total_ret'])}. "
+                                    "Upload a retirement CSV above to update it.")
                     elif not dash_tax_file and not dash_ret_file:
                         st.caption("Export a CSV from your brokerage (Schwab, Fidelity, Vanguard, etc.) "
                                    "and drag it into the boxes above.")
