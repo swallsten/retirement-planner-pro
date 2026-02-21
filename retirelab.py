@@ -3151,6 +3151,14 @@ def init_defaults():
     if "saved_scenarios" not in st.session_state:
         st.session_state["saved_scenarios"] = []
 
+    # Simulation lifecycle — explicit run control
+    if "_has_ever_run" not in st.session_state:
+        st.session_state["_has_ever_run"] = False
+    if "_cfg_at_last_run" not in st.session_state:
+        st.session_state["_cfg_at_last_run"] = None
+    if "_hold_at_last_run" not in st.session_state:
+        st.session_state["_hold_at_last_run"] = None
+
     if "hold" not in st.session_state:
         eq_pct_tax = 60
         eq_pct_ret = 70
@@ -3183,13 +3191,15 @@ _SECTION_KEYS = {
                "ss62_1", "claim1", "ss62_2", "claim2",
                "coast_on", "coast_start_age", "coast_income_real", "spending_events"],
     "Spending": ["spend_real", "spend_split_on", "spend_essential_real", "spend_discretionary_real",
-                 "gk_on", "pre_ret_spend_real", "spending_events"],
+                 "pre_ret_spend_real", "spending_events"],
     "Home": ["home_on"],
     "Health": ["health_model", "ltc_on"],
-    "Taxes": ["tax_engine_on", "filing_status", "conv_on", "rmd_on", "gain_harvest_on",
+    "Taxes": ["tax_engine_on", "filing_status", "rmd_on", "gain_harvest_on",
               "irmaa_on", "qcd_on"],
     "Market": ["return_model", "scenario", "manual_override", "hist_start_year"],
     "Allocation": ["glide_on", "equity_granular_on"],
+    "Guardrails": ["gk_on"],
+    "Roth Conversions": ["conv_on"],
     "Stress Tests": ["crash_on", "seq_on"],
     "Advanced": ["n_sims", "seed", "dist_type", "t_df"],
 }
@@ -3385,17 +3395,65 @@ def build_cfg_run(cfg: dict) -> dict:
 # SECTION 8: Page functions
 # ============================================================
 
-# ---- 8a: Dashboard page ----
-def dashboard_page():
+# ---- Simulation lifecycle helpers ----
+
+def _assumptions_changed() -> bool:
+    """Return True if cfg or hold differ from the last simulation run."""
+    cfg = st.session_state["cfg"]
+    hold = st.session_state["hold"]
+    prev_cfg = st.session_state.get("_cfg_at_last_run")
+    prev_hold = st.session_state.get("_hold_at_last_run")
+    if prev_cfg is None or prev_hold is None:
+        return True  # never run yet
+    # Compare cfg
+    for k in set(list(cfg.keys()) + list(prev_cfg.keys())):
+        cv = cfg.get(k)
+        rv = prev_cfg.get(k)
+        try:
+            if cv != rv:
+                return True
+        except (ValueError, TypeError):
+            if str(cv) != str(rv):
+                return True
+    # Compare hold
+    for k in set(list(hold.keys()) + list(prev_hold.keys())):
+        cv = hold.get(k)
+        rv = prev_hold.get(k)
+        try:
+            if cv != rv:
+                return True
+        except (ValueError, TypeError):
+            if str(cv) != str(rv):
+                return True
+    return False
+
+
+def _run_and_store_simulation():
+    """Build cfg_run, run simulation, store results + snapshot for change detection."""
+    cfg = st.session_state["cfg"]
+    hold = st.session_state["hold"]
+    cfg_run = build_cfg_run(cfg)
+    with st.spinner("Running simulation..."):
+        out = simulate(cfg_run, hold)
+    st.session_state["sim_result"] = out
+    st.session_state["cfg_run"] = cfg_run
+    st.session_state["_cfg_at_last_run"] = copy.deepcopy(dict(cfg))
+    st.session_state["_hold_at_last_run"] = copy.deepcopy(dict(hold))
+    st.session_state["_has_ever_run"] = True
+    return cfg_run, out
+
+
+# ---- 8a: My Plan page ----
+def my_plan_page():
     cfg = st.session_state["cfg"]
     hold = st.session_state["hold"]
 
-    # Header row — compact, with save/load in popovers instead of file_uploader
+    # ---- Header row — 3-column layout ----
     _saved_scenarios = st.session_state["saved_scenarios"]
     _saved_names = [s["name"] for s in _saved_scenarios]
     _active_sc = st.session_state.get("_active_scenario_name")
 
-    hdr_left, hdr_switch, hdr_save_sc, hdr_mid, hdr_right = st.columns([3, 1, 1, 1, 1])
+    hdr_left, hdr_mid, hdr_right = st.columns([4, 2, 1])
     with hdr_left:
         _hdr_rm = str(cfg.get("return_model", "standard"))
         if _hdr_rm == "historical":
@@ -3415,7 +3473,7 @@ def dashboard_page():
         if _active_sc:
             badges += f"""<span style="display:inline-block; background:#1B2A4A; color:white; padding:2px 12px;
                          border-radius:12px; font-size:0.8rem; font-weight:600; margin-left:6px;
-                         vertical-align:middle;">📋 {_active_sc}</span>"""
+                         vertical-align:middle;">{_active_sc}</span>"""
         st.html(f"""
         <div style="margin-bottom:0.2rem;">
             <span style="font-size:1.8rem; font-weight:700; color:#1B2A4A;">RetireLab</span>
@@ -3423,193 +3481,211 @@ def dashboard_page():
         </div>
         """)
         st.caption("By Scott Wallsten · For educational and informational purposes only. Not financial, tax, or investment advice.")
-    with hdr_switch:
-        if _saved_names:
-            _switch_opts = ["— Unsaved —"] + _saved_names
-            _cur_idx = (_switch_opts.index(_active_sc) if _active_sc in _switch_opts else 0)
-            _switch_pick = st.selectbox("Switch scenario", _switch_opts, index=_cur_idx,
-                                        key="hdr_switch_sc", label_visibility="collapsed")
-            if _switch_pick != "— Unsaved —" and _switch_pick != _active_sc:
-                sc_load = next(s for s in _saved_scenarios if s["name"] == _switch_pick)
-                st.session_state["cfg"] = copy.deepcopy(sc_load["cfg"])
-                st.session_state["hold"] = copy.deepcopy(sc_load["hold"])
-                st.session_state["_active_scenario_name"] = _switch_pick
-                st.rerun()
-            elif _switch_pick == "— Unsaved —" and _active_sc is not None:
-                st.session_state.pop("_active_scenario_name", None)
-                st.rerun()
-    with hdr_save_sc:
-        _saved = st.session_state["saved_scenarios"]
-        _n_saved = len(_saved)
-        _existing_names = [s["name"] for s in _saved]
-        with st.popover(":material/add_circle: Save as Scenario", use_container_width=True):
-            # Show what's already saved
-            if _existing_names:
-                st.caption(f"Saved: {', '.join(_existing_names)}")
-            _default_name = st.session_state.get("_active_scenario_name", f"Scenario {_n_saved + 1}")
-            _sc_name = st.text_input("Scenario name", value=_default_name, key="save_sc_name")
-            _is_overwrite = _sc_name in _existing_names
-            if _n_saved >= 4 and not _is_overwrite:
-                st.warning("Maximum 4 saved scenarios. Use an existing name to update, or delete one on the Compare page.")
-            else:
-                _btn_label = f"Update '{_sc_name}'" if _is_overwrite else "Save"
-                if st.button(_btn_label, key="save_sc_btn", use_container_width=True):
-                    if _is_overwrite:
-                        for i, s in enumerate(_saved):
-                            if s["name"] == _sc_name:
-                                _saved[i] = {
-                                    "name": _sc_name,
-                                    "cfg": copy.deepcopy(dict(cfg)),
-                                    "hold": copy.deepcopy(dict(hold)),
-                                }
-                                break
-                    else:
-                        _saved.append({
-                            "name": _sc_name,
-                            "cfg": copy.deepcopy(dict(cfg)),
-                            "hold": copy.deepcopy(dict(hold)),
-                        })
-                    st.session_state["_active_scenario_name"] = _sc_name
-                    st.rerun()
     with hdr_mid:
-        st.download_button(
-            ":material/download: Save Settings",
-            json.dumps(cfg, indent=2), "retirelab_config.json", "application/json",
-            use_container_width=True, key="dash_save",
-        )
-    with hdr_right:
-        with st.popover(":material/upload: Load Settings", use_container_width=True):
-            up = st.file_uploader(
-                "Upload a saved .json config", type=["json", "txt"], key="dash_load",
-                label_visibility="collapsed",
-            )
-            if up is not None:
-                st.session_state["cfg"] = json.loads(up.read().decode("utf-8"))
-                st.rerun()
-
-    # ---- Getting Started panel ----
-    # Show until the user explicitly dismisses it. Don't auto-hide based on
-    # portfolio uploads or changed values — that caused file uploaders to vanish
-    # mid-upload when the panel condition flipped between reruns.
-    if not st.session_state.get("_onboarding_dismissed", False):
-        with st.expander("🚀 **Getting Started — enter your key numbers** (everything else has smart defaults)", expanded=True):
-            st.markdown("Fill in these inputs to get a meaningful projection. "
-                        "You can fine-tune everything else later in the **Assumptions** tab.")
-
-            gs_left, gs_right = st.columns([1, 1], border=True)
-
-            with gs_left:
-                st.markdown("**Your ages & spending**")
-                _gs_ac1, _gs_ac2 = st.columns(2)
-                with _gs_ac1:
-                    cfg["start_age"] = st.number_input("Current age", value=int(cfg["start_age"]), step=1, key="gs_start_age")
-                    cfg["retire_age"] = st.number_input("Retirement age", value=int(cfg["retire_age"]), step=1, key="gs_retire_age")
-                with _gs_ac2:
-                    cfg["end_age"] = st.number_input("Plan through age", value=int(cfg["end_age"]), step=1, key="gs_end_age")
-                    cfg["ss62_1"] = st.number_input("Monthly SS at 62 ($)", value=float(cfg["ss62_1"]),
-                        step=100.0, key="gs_ss62",
-                        help="Your estimated monthly benefit at age 62. Find yours at ssa.gov/myaccount. Set to 0 if unknown.")
-                cfg["spend_real"] = st.number_input("Annual spending in retirement ($)", value=float(cfg["spend_real"]),
-                    step=10000.0, key="gs_spend_real",
-                    help="Everyday costs: groceries, dining, utilities, travel, entertainment, etc. "
-                         "Do NOT include housing or medical — those are modeled separately in Assumptions.")
-                st.caption("Excludes housing & medical (tracked separately).")
-
-            with gs_right:
-                st.markdown("**Your starting portfolio**")
-                _gs_portfolio_mode = st.segmented_control(
-                    "How to enter your portfolio",
-                    ["Enter totals", "Upload CSVs"],
-                    default="Enter totals", key="gs_portfolio_mode",
-                )
-
-                if _gs_portfolio_mode == "Upload CSVs":
-                    st.caption("Upload brokerage CSV exports. The tool auto-detects holdings and classifies them into asset classes.")
-                    dash_tax_file = st.file_uploader(
-                        "Taxable account CSV", type=["csv", "txt", "tsv"], key="dash_tax_up",
-                        help="CSV export from your taxable brokerage (Schwab, Fidelity, Vanguard, etc.)",
-                    )
-                    dash_ret_file = st.file_uploader(
-                        "Retirement account CSV", type=["csv", "txt", "tsv"], key="dash_ret_up",
-                        help="CSV export from your 401(k), IRA, 403(b), or similar retirement account",
-                    )
-                    dash_tax_ok, dash_ret_ok = False, False
-                    if dash_tax_file:
-                        try:
-                            tax_df, tax_val = load_snapshot(dash_tax_file)
-                            w_tax_u, total_tax_u, dollars_tax_u = weights_and_dollars(tax_df, tax_val)
-                            dash_tax_ok = True
-                        except Exception as e:
-                            st.error(f"Error parsing taxable CSV: {e}")
-                    if dash_ret_file:
-                        try:
-                            ret_df, ret_val = load_snapshot(dash_ret_file)
-                            w_ret_u, total_ret_u, dollars_ret_u = weights_and_dollars(ret_df, ret_val)
-                            dash_ret_ok = True
-                        except Exception as e:
-                            st.error(f"Error parsing retirement CSV: {e}")
-                    if dash_tax_ok or dash_ret_ok:
-                        final_hold = dict(hold)
-                        if dash_tax_ok:
-                            final_hold["total_tax"] = total_tax_u
-                            final_hold["w_tax"] = w_tax_u
-                            final_hold["dollars_tax"] = dollars_tax_u
-                        if dash_ret_ok:
-                            final_hold["total_ret"] = total_ret_u
-                            final_hold["w_ret"] = w_ret_u
-                            final_hold["dollars_ret"] = dollars_ret_u
-                        st.session_state["hold"] = final_hold
-                        st.session_state["_portfolio_uploaded"] = True
-                        hold = final_hold
-                        _loaded_parts = []
-                        if dash_tax_ok:
-                            _loaded_parts.append(f"Taxable: {fmt_dollars(final_hold['total_tax'])}")
-                        if dash_ret_ok:
-                            _loaded_parts.append(f"Retirement: {fmt_dollars(final_hold['total_ret'])}")
-                        st.success("Loaded " + " | ".join(_loaded_parts))
-                        if not dash_tax_ok:
-                            st.info(f"Taxable account still using previous value: {fmt_dollars(final_hold['total_tax'])}. "
-                                    "Upload a taxable CSV above to update it.")
-                        if not dash_ret_ok:
-                            st.info(f"Retirement account still using previous value: {fmt_dollars(final_hold['total_ret'])}. "
-                                    "Upload a retirement CSV above to update it.")
-                    elif not dash_tax_file and not dash_ret_file:
-                        st.caption("Export a CSV from your brokerage (Schwab, Fidelity, Vanguard, etc.) "
-                                   "and drag it into the boxes above.")
+        # Scenario switcher + save
+        _hdr_mid_l, _hdr_mid_r = st.columns(2)
+        with _hdr_mid_l:
+            if _saved_names:
+                _switch_opts = ["— Unsaved —"] + _saved_names
+                _cur_idx = (_switch_opts.index(_active_sc) if _active_sc in _switch_opts else 0)
+                _switch_pick = st.selectbox("Switch scenario", _switch_opts, index=_cur_idx,
+                                            key="hdr_switch_sc", label_visibility="collapsed")
+                if _switch_pick != "— Unsaved —" and _switch_pick != _active_sc:
+                    sc_load = next(s for s in _saved_scenarios if s["name"] == _switch_pick)
+                    st.session_state["cfg"] = copy.deepcopy(sc_load["cfg"])
+                    st.session_state["hold"] = copy.deepcopy(sc_load["hold"])
+                    st.session_state["_active_scenario_name"] = _switch_pick
+                    st.rerun()
+                elif _switch_pick == "— Unsaved —" and _active_sc is not None:
+                    st.session_state.pop("_active_scenario_name", None)
+                    st.rerun()
+        with _hdr_mid_r:
+            _saved = st.session_state["saved_scenarios"]
+            _n_saved = len(_saved)
+            _existing_names = [s["name"] for s in _saved]
+            with st.popover(":material/add_circle: Save", use_container_width=True):
+                if _existing_names:
+                    st.caption(f"Saved: {', '.join(_existing_names)}")
+                _default_name = st.session_state.get("_active_scenario_name", f"Scenario {_n_saved + 1}")
+                _sc_name = st.text_input("Scenario name", value=_default_name, key="save_sc_name")
+                _is_overwrite = _sc_name in _existing_names
+                if _n_saved >= 4 and not _is_overwrite:
+                    st.warning("Maximum 4 saved scenarios. Use an existing name to update, or delete one on the Compare page.")
                 else:
-                    # Enter totals manually
-                    _gs_tax = st.number_input("Taxable account balance ($)", value=float(hold["total_tax"]),
-                        step=50000.0, key="gs_total_tax",
-                        help="Brokerage accounts, savings, CDs — anything outside retirement accounts.")
-                    _gs_ret = st.number_input("Retirement account balance ($)", value=float(hold["total_ret"]),
-                        step=50000.0, key="gs_total_ret",
-                        help="401(k), IRA, 403(b), TSP, Roth IRA — all retirement accounts combined.")
-                    st.caption("For detailed asset-class breakdown from holdings, use **Upload CSVs** "
-                               "or go to **Assumptions → Basics → Portfolio**.")
+                    _btn_label = f"Update '{_sc_name}'" if _is_overwrite else "Save"
+                    if st.button(_btn_label, key="save_sc_btn", use_container_width=True):
+                        if _is_overwrite:
+                            for i, s in enumerate(_saved):
+                                if s["name"] == _sc_name:
+                                    _saved[i] = {
+                                        "name": _sc_name,
+                                        "cfg": copy.deepcopy(dict(cfg)),
+                                        "hold": copy.deepcopy(dict(hold)),
+                                    }
+                                    break
+                        else:
+                            _saved.append({
+                                "name": _sc_name,
+                                "cfg": copy.deepcopy(dict(cfg)),
+                                "hold": copy.deepcopy(dict(hold)),
+                            })
+                        st.session_state["_active_scenario_name"] = _sc_name
+                        st.rerun()
+    with hdr_right:
+        _hdr_r_l, _hdr_r_r = st.columns(2)
+        with _hdr_r_l:
+            st.download_button(
+                ":material/download:",
+                json.dumps(cfg, indent=2), "retirelab_config.json", "application/json",
+                use_container_width=True, key="dash_save",
+                help="Download current settings as JSON",
+            )
+        with _hdr_r_r:
+            with st.popover(":material/upload:", use_container_width=True):
+                up = st.file_uploader(
+                    "Upload a saved .json config", type=["json", "txt"], key="dash_load",
+                    label_visibility="collapsed",
+                )
+                if up is not None:
+                    st.session_state["cfg"] = json.loads(up.read().decode("utf-8"))
+                    st.rerun()
 
-                    # Process manual portfolio entry
-                    if abs(_gs_tax - hold["total_tax"]) > 1.0 or abs(_gs_ret - hold["total_ret"]) > 1.0:
-                        final_hold = dict(hold)
-                        final_hold["total_tax"] = _gs_tax
-                        final_hold["dollars_tax"] = {k: _gs_tax * hold["w_tax"][k] for k in ASSET_CLASSES}
-                        final_hold["total_ret"] = _gs_ret
-                        final_hold["dollars_ret"] = {k: _gs_ret * hold["w_ret"][k] for k in ASSET_CLASSES}
-                        st.session_state["hold"] = final_hold
-                        hold = final_hold
+    # ==================================================================
+    # ONBOARDING WIZARD — shown on first visit (never run yet)
+    # ==================================================================
+    if not st.session_state.get("_has_ever_run", False):
+        st.html('<div style="font-size:1.3rem; font-weight:600; color:#1B2A4A; margin:1rem 0 0.5rem 0;">'
+                'Welcome to RetireLab — enter your key numbers to get started</div>')
+        st.markdown("Everything else has smart defaults. You can fine-tune in the **Assumptions** tab later.")
 
-            if st.button("✓ I've entered my basics — dismiss this panel", key="gs_dismiss"):
-                st.session_state["_onboarding_dismissed"] = True
+        gs_left, gs_right = st.columns([1, 1], border=True)
+
+        with gs_left:
+            st.markdown("**Your ages & spending**")
+            _gs_ac1, _gs_ac2 = st.columns(2)
+            with _gs_ac1:
+                cfg["start_age"] = st.number_input("Current age", value=int(cfg["start_age"]), step=1, key="gs_start_age")
+                cfg["retire_age"] = st.number_input("Retirement age", value=int(cfg["retire_age"]), step=1, key="gs_retire_age")
+            with _gs_ac2:
+                cfg["end_age"] = st.number_input("Plan through age", value=int(cfg["end_age"]), step=1, key="gs_end_age")
+                cfg["ss62_1"] = st.number_input("Monthly SS at 62 ($)", value=float(cfg["ss62_1"]),
+                    step=100.0, key="gs_ss62",
+                    help="Your estimated monthly benefit at age 62. Find yours at ssa.gov/myaccount. Set to 0 if unknown.")
+            cfg["spend_real"] = st.number_input("Annual spending in retirement ($)", value=float(cfg["spend_real"]),
+                step=10000.0, key="gs_spend_real",
+                help="Everyday costs: groceries, dining, utilities, travel, entertainment, etc. "
+                     "Do NOT include housing or medical — those are modeled separately in Assumptions.")
+            st.caption("Excludes housing & medical (tracked separately).")
+
+        with gs_right:
+            st.markdown("**Your starting portfolio**")
+            _gs_portfolio_mode = st.segmented_control(
+                "How to enter your portfolio",
+                ["Enter totals", "Upload CSVs"],
+                default="Enter totals", key="gs_portfolio_mode",
+            )
+
+            if _gs_portfolio_mode == "Upload CSVs":
+                st.caption("Upload brokerage CSV exports. The tool auto-detects holdings and classifies them into asset classes.")
+                dash_tax_file = st.file_uploader(
+                    "Taxable account CSV", type=["csv", "txt", "tsv"], key="dash_tax_up",
+                    help="CSV export from your taxable brokerage (Schwab, Fidelity, Vanguard, etc.)",
+                )
+                dash_ret_file = st.file_uploader(
+                    "Retirement account CSV", type=["csv", "txt", "tsv"], key="dash_ret_up",
+                    help="CSV export from your 401(k), IRA, 403(b), or similar retirement account",
+                )
+                dash_tax_ok, dash_ret_ok = False, False
+                if dash_tax_file:
+                    try:
+                        tax_df, tax_val = load_snapshot(dash_tax_file)
+                        w_tax_u, total_tax_u, dollars_tax_u = weights_and_dollars(tax_df, tax_val)
+                        dash_tax_ok = True
+                    except Exception as e:
+                        st.error(f"Error parsing taxable CSV: {e}")
+                if dash_ret_file:
+                    try:
+                        ret_df, ret_val = load_snapshot(dash_ret_file)
+                        w_ret_u, total_ret_u, dollars_ret_u = weights_and_dollars(ret_df, ret_val)
+                        dash_ret_ok = True
+                    except Exception as e:
+                        st.error(f"Error parsing retirement CSV: {e}")
+                if dash_tax_ok or dash_ret_ok:
+                    final_hold = dict(hold)
+                    if dash_tax_ok:
+                        final_hold["total_tax"] = total_tax_u
+                        final_hold["w_tax"] = w_tax_u
+                        final_hold["dollars_tax"] = dollars_tax_u
+                    if dash_ret_ok:
+                        final_hold["total_ret"] = total_ret_u
+                        final_hold["w_ret"] = w_ret_u
+                        final_hold["dollars_ret"] = dollars_ret_u
+                    st.session_state["hold"] = final_hold
+                    st.session_state["_portfolio_uploaded"] = True
+                    hold = final_hold
+                    _loaded_parts = []
+                    if dash_tax_ok:
+                        _loaded_parts.append(f"Taxable: {fmt_dollars(final_hold['total_tax'])}")
+                    if dash_ret_ok:
+                        _loaded_parts.append(f"Retirement: {fmt_dollars(final_hold['total_ret'])}")
+                    st.success("Loaded " + " | ".join(_loaded_parts))
+                    if not dash_tax_ok:
+                        st.info(f"Taxable account still using previous value: {fmt_dollars(final_hold['total_tax'])}. "
+                                "Upload a taxable CSV above to update it.")
+                    if not dash_ret_ok:
+                        st.info(f"Retirement account still using previous value: {fmt_dollars(final_hold['total_ret'])}. "
+                                "Upload a retirement CSV above to update it.")
+                elif not dash_tax_file and not dash_ret_file:
+                    st.caption("Export a CSV from your brokerage (Schwab, Fidelity, Vanguard, etc.) "
+                               "and drag it into the boxes above.")
+            else:
+                # Enter totals manually
+                _gs_tax = st.number_input("Taxable account balance ($)", value=float(hold["total_tax"]),
+                    step=50000.0, key="gs_total_tax",
+                    help="Brokerage accounts, savings, CDs — anything outside retirement accounts.")
+                _gs_ret = st.number_input("Retirement account balance ($)", value=float(hold["total_ret"]),
+                    step=50000.0, key="gs_total_ret",
+                    help="401(k), IRA, 403(b), TSP, Roth IRA — all retirement accounts combined.")
+                st.caption("For detailed asset-class breakdown from holdings, use **Upload CSVs** "
+                           "or go to **Assumptions → Basics → Portfolio**.")
+
+                # Process manual portfolio entry
+                if abs(_gs_tax - hold["total_tax"]) > 1.0 or abs(_gs_ret - hold["total_ret"]) > 1.0:
+                    final_hold = dict(hold)
+                    final_hold["total_tax"] = _gs_tax
+                    final_hold["dollars_tax"] = {k: _gs_tax * hold["w_tax"][k] for k in ASSET_CLASSES}
+                    final_hold["total_ret"] = _gs_ret
+                    final_hold["dollars_ret"] = {k: _gs_ret * hold["w_ret"][k] for k in ASSET_CLASSES}
+                    st.session_state["hold"] = final_hold
+                    hold = final_hold
+
+        if st.button("Run My Plan →", key="gs_run_plan", type="primary", use_container_width=True):
+            _run_and_store_simulation()
+            st.rerun()
+        return  # Don't render results below on first visit
+
+    # ==================================================================
+    # RETURNING VISIT — show results (with optional Update button)
+    # ==================================================================
+
+    # Check if assumptions have changed since last run
+    _changed = _assumptions_changed()
+    if _changed:
+        _upd_l, _upd_r = st.columns([3, 1])
+        with _upd_l:
+            st.warning("Your assumptions have changed since the last simulation.")
+        with _upd_r:
+            if st.button("Update Results", key="update_results_btn", type="primary", use_container_width=True):
+                _run_and_store_simulation()
                 st.rerun()
 
-    # Build cfg_run and simulate
-    cfg_run = build_cfg_run(cfg)
-    with st.spinner("Running simulation..."):
-        out = simulate(cfg_run, hold)
+    # Ensure we have results (e.g. if session restored but sim_result missing)
+    if "sim_result" not in st.session_state or "cfg_run" not in st.session_state:
+        _run_and_store_simulation()
+        st.rerun()
 
-    # Store result for deep dive
-    st.session_state["sim_result"] = out
-    st.session_state["cfg_run"] = cfg_run
-
+    out = st.session_state["sim_result"]
+    cfg_run = st.session_state["cfg_run"]
     ages = out["ages"]
     liquid = out["liquid"]
     net_worth = out["net_worth"]
@@ -3622,10 +3698,26 @@ def dashboard_page():
     sNr = summarize_end(net_worth_real)
 
     ruin_age = out["ruin_age"]
-    end_age_val = int(cfg["end_age"])
+    end_age_val = int(cfg_run.get("end_age", int(cfg["end_age"])))
     ran_out_while_alive = (ruin_age <= end_age_val).sum()
     pct_success = 100.0 - float(ran_out_while_alive) / len(ruin_age) * 100
     funded_through = out["funded_through_age"]
+
+    # ---- Plan Summary one-pager ----
+    _total_portfolio = float(hold.get("total_tax", 0)) + float(hold.get("total_ret", 0))
+    _plan_summary_parts = [
+        f"You plan to retire at **{int(cfg_run.get('retire_age', 62))}** ",
+        f"with **{fmt_dollars(_total_portfolio)}** in savings, ",
+        f"spending **{fmt_dollars(float(cfg_run.get('spend_real', 300000)))}**/year.",
+    ]
+    _plan_summary = "".join(_plan_summary_parts)
+    _plan_summary += f"  \nYour plan succeeds in **{pct_success:.0f}%** of {int(cfg_run.get('n_sims', 3000)):,} simulations."
+    _plan_summary += f" Median liquid assets at {end_age_val}: **${sLr['p50']/1e6:.1f}M** (today's dollars)."
+    if pct_success < 75:
+        _plan_summary += "  \n**Heads up:** Your plan has a high failure rate. Consider adjusting spending, retirement age, or savings."
+    elif funded_through < end_age_val:
+        _plan_summary += f"  \nIn a bad-luck scenario (p10), money lasts through age **{funded_through}**."
+    st.info(_plan_summary)
 
     # ---- Scenario summary bar ----
     _rm = str(cfg_run.get("return_model", "standard"))
@@ -3780,7 +3872,7 @@ def dashboard_page():
 
     # ---- What Matters Most (mini tornado) ----
     st.html('<div class="pro-section-title">What Matters Most</div>')
-    st.caption("Top factors affecting your median ending net worth. Full analysis available in Deep Dive.")
+    st.caption("Top factors affecting your median ending net worth. Full analysis available in **Analysis**.")
     if st.button("▶ Analyze sensitivity", key="dash_sensitivity"):
         render_mini_tornado(cfg_run, hold, top_n=6)
 
@@ -3968,32 +4060,49 @@ def plan_setup_page():
     cfg = st.session_state["cfg"]
     hold = st.session_state["hold"]
 
-    st.html('<div style="font-size:1.8rem; font-weight:700; color:#1B2A4A; margin-bottom:0.5rem;">Plan Setup</div>')
+    st.html('<div style="font-size:1.8rem; font-weight:700; color:#1B2A4A; margin-bottom:0.5rem;">Assumptions</div>')
 
-    # Quick Setup vs All Sections mode
-    _all_sections = ["Basics", "Income", "Spending", "Home", "Health", "Taxes", "Market", "Allocation", "Stress Tests", "Advanced"]
-    _quick_sections = ["Basics", "Income", "Spending", "Market", "Allocation"]
+    # Three-group hierarchy
+    _assumption_groups = {
+        "Your Situation": ["Basics", "Income", "Home"],
+        "Plan Strategy": ["Spending", "Market", "Allocation", "Guardrails", "Roth Conversions"],
+        "Fine Tuning": ["Taxes", "Health", "Stress Tests", "Advanced"],
+    }
+    _group_help = {
+        "Your Situation": "Who you are and what you have",
+        "Plan Strategy": "What you'll do in retirement",
+        "Fine Tuning": "Advanced modeling dials",
+    }
+    _group_names = list(_assumption_groups.keys())
 
-    _setup_mode = st.segmented_control(
-        "Setup mode",
-        ["Quick Setup", "All Sections"],
-        default="Quick Setup", key="setup_mode",
-        help="Quick Setup shows the 5 sections that drive ~90% of your results. Switch to All Sections for fine-tuning."
+    _prev_group = st.session_state.get("setup_group", "Your Situation")
+    if _prev_group not in _group_names:
+        _prev_group = "Your Situation"
+    group = st.radio(
+        "Category",
+        _group_names,
+        index=_group_names.index(_prev_group),
+        key="setup_group",
+        horizontal=True,
+        help=" · ".join(f"**{g}** — {h}" for g, h in _group_help.items()),
     )
-    _section_names = _quick_sections if _setup_mode == "Quick Setup" else _all_sections
+    if group is None:
+        group = "Your Situation"
+
+    _section_names = _assumption_groups[group]
 
     # If currently-selected section is not in the visible list, reset
     _prev_section = st.session_state.get("setup_section")
     if _prev_section is not None and _prev_section not in _section_names:
-        st.session_state["setup_section"] = "Basics"
+        st.session_state["setup_section"] = _section_names[0]
 
     section = st.segmented_control(
         "Section",
         _section_names,
-        default="Basics", key="setup_section"
+        default=_section_names[0], key="setup_section"
     )
     if section is None:
-        section = "Basics"
+        section = _section_names[0]
 
     # ================================================================
     # BASICS
@@ -4438,28 +4547,6 @@ def plan_setup_page():
             st.caption("Continues to end of plan")
             cfg["phase3_mult"] = st.number_input("Multiplier", min_value=0.0, max_value=2.0, value=float(cfg["phase3_mult"]), step=0.05, format="%.2f", key="ps_p3_mult")
 
-        st.html('<div class="pro-section-title">Adaptive Spending Guardrails (Guyton-Klinger)</div>')
-        cfg["gk_on"] = st.toggle("Enable adaptive spending", value=bool(cfg["gk_on"]), key="ps_gk_on",
-            help="If the market drops early in retirement, this automatically reduces your spending to preserve your portfolio. "
-                 "If the market booms, it lets you spend a bit more. Most planners recommend this over fixed withdrawals "
-                 "because it dramatically improves the chance your money lasts.")
-        if not cfg["gk_on"]:
-            st.caption("**Recommended.** Without guardrails, you withdraw the same amount regardless of market performance. "
-                       "With them, your spending flexes with your portfolio — cutting ~10% after bad years and raising ~5% after good ones. "
-                       "This simple rule can improve your plan's survival rate by 10–15 percentage points.")
-        if cfg["gk_on"]:
-            gc1, gc2 = st.columns(2, border=True)
-            with gc1:
-                gk_upper_int = st.slider("Upper guardrail (% above initial WR)", 5, 50,
-                    int(round(float(cfg["gk_upper_pct"]) * 100)), 5, format="%d%%", key="ps_gk_upper")
-                cfg["gk_upper_pct"] = gk_upper_int / 100.0
-                cfg["gk_cut"] = st.number_input("Cut %", value=float(cfg["gk_cut"]), step=0.01, format="%.2f", key="ps_gk_cut")
-            with gc2:
-                gk_lower_int = st.slider("Lower guardrail (% below initial WR)", 5, 50,
-                    int(round(float(cfg["gk_lower_pct"]) * 100)), 5, format="%d%%", key="ps_gk_lower")
-                cfg["gk_lower_pct"] = gk_lower_int / 100.0
-                cfg["gk_raise"] = st.number_input("Raise %", value=float(cfg["gk_raise"]), step=0.01, format="%.2f", key="ps_gk_raise")
-
         # ---- Spending Events (expenses only) ----
         st.html('<div class="pro-section-title">Spending Events</div>')
         st.caption("Model one-time or recurring expenses at specific ages: a new car, home renovation, college tuition, etc. "
@@ -4470,7 +4557,7 @@ def plan_setup_page():
         # ---- Spending Floor ----
         st.html('<div class="pro-section-title">Spending Floor</div>')
         st.caption("The minimum annual spending (in today's dollars) you'd consider acceptable. "
-                   "The Results page shows the probability your spending never drops below this. "
+                   "The My Plan page shows the probability your spending never drops below this. "
                    "This is a display-time metric — changing it does **not** require re-running the simulation.")
         cfg["spending_floor"] = st.number_input("Spending floor (real $)",
             value=float(cfg.get("spending_floor", 80000.0)), step=5000.0, key="ps_spend_floor",
@@ -4692,49 +4779,10 @@ def plan_setup_page():
             else:
                 st.caption("Toggle on to model QCDs that reduce taxable RMD income and IRMAA exposure.")
 
-        st.html('<div class="pro-section-title">RMDs & Roth Conversions</div>')
-        rc1, rc2 = st.columns(2, border=True)
-        with rc1:
-            cfg["rmd_on"] = st.toggle("Include RMDs", value=bool(cfg["rmd_on"]), key="ps_rmd_on")
-            if cfg["rmd_on"]:
-                cfg["rmd_start_age"] = st.number_input("RMD start age", value=int(cfg["rmd_start_age"]), step=1, key="ps_rmd_age")
-        with rc2:
-            cfg["conv_on"] = st.toggle("Plan Roth conversions", value=bool(cfg["conv_on"]), key="ps_conv_on",
-                help="Convert traditional IRA/401k money to Roth, paying taxes now at today's rates to avoid higher taxes later. "
-                     "Especially valuable in the 'gap years' between retirement and Social Security/RMDs when your income is low. "
-                     "The bracket-fill strategy automatically converts just enough to stay within a target tax bracket.")
-            if cfg["conv_on"]:
-                cfg["conv_start"] = st.number_input("Start age", value=int(cfg["conv_start"]), step=1, key="ps_conv_start")
-                cfg["conv_end"] = st.number_input("End age", value=int(cfg["conv_end"]), step=1, key="ps_conv_end")
-                cfg["conv_type"] = st.selectbox("Conversion strategy",
-                    ["fixed", "bracket_fill"],
-                    index=["fixed", "bracket_fill"].index(str(cfg["conv_type"])),
-                    format_func=lambda x: "Fixed annual amount" if x == "fixed" else "Fill to tax bracket",
-                    key="ps_conv_type",
-                    help="Fixed: convert a set dollar amount each year. Bracket fill: dynamically convert up to a target federal tax bracket each year.")
-                if cfg["conv_type"] == "fixed":
-                    cfg["conv_real"] = st.number_input("Annual amount (today's $)", value=float(cfg["conv_real"]), step=10000.0, key="ps_conv_amt")
-                else:
-                    bracket_options = {0.12: "12% bracket", 0.22: "22% bracket", 0.24: "24% bracket", 0.32: "32% bracket", 0.35: "35% bracket"}
-                    bracket_vals = list(bracket_options.keys())
-                    current_bracket = float(cfg["conv_target_bracket"])
-                    bracket_idx = bracket_vals.index(current_bracket) if current_bracket in bracket_vals else 2
-                    cfg["conv_target_bracket"] = st.selectbox("Fill up to bracket",
-                        bracket_vals, index=bracket_idx,
-                        format_func=lambda x: bracket_options[x],
-                        key="ps_conv_bracket",
-                        help="Convert enough each year to fill ordinary income up to the top of this bracket.")
-                    if not cfg.get("tax_engine_on", True):
-                        cfg["conv_filing_status"] = st.selectbox("Filing status",
-                            ["mfj", "single"],
-                            index=["mfj", "single"].index(str(cfg["conv_filing_status"])),
-                            format_func=lambda x: "Married Filing Jointly" if x == "mfj" else "Single",
-                            key="ps_conv_filing")
-                    else:
-                        st.caption(f"Using global filing status: {'MFJ' if cfg.get('filing_status', 'mfj') == 'mfj' else 'Single'}")
-                    cfg["conv_irmaa_aware"] = st.toggle("Cap conversions to avoid IRMAA",
-                        value=bool(cfg["conv_irmaa_aware"]), key="ps_conv_irmaa",
-                        help="Limit conversions so total MAGI stays below the lowest IRMAA threshold.")
+        st.html('<div class="pro-section-title">RMDs</div>')
+        cfg["rmd_on"] = st.toggle("Include RMDs", value=bool(cfg["rmd_on"]), key="ps_rmd_on")
+        if cfg["rmd_on"]:
+            cfg["rmd_start_age"] = st.number_input("RMD start age", value=int(cfg["rmd_start_age"]), step=1, key="ps_rmd_age")
 
         st.html('<div class="pro-section-title">Fees</div>')
         fc1, fc2 = st.columns(2, border=True)
@@ -4802,7 +4850,7 @@ def plan_setup_page():
                      "For example, some sims replay the markets starting in 1928, others starting in 1929, and so on. "
                      "This tells you what fraction of all historical periods your plan would have survived — "
                      "the same question tools like cFIREsim and FIRECalc answer. "
-                     "The Deep Dive tab shows which specific periods failed.\n\n"
+                     "The Analysis tab shows which specific periods failed.\n\n"
                      "**Single starting year** — All simulations replay the exact same historical return sequence "
                      "starting from one year you choose (e.g., 1966). This shows precisely what would have happened "
                      "to your plan if you'd retired into that specific market environment. "
@@ -5198,82 +5246,158 @@ def plan_setup_page():
 
         cfg["legacy_on"] = st.toggle("Show legacy analysis", value=bool(cfg["legacy_on"]), key="ps_legacy_on")
 
+    # ================================================================
+    # GUARDRAILS (promoted from Spending)
+    # ================================================================
+    elif section == "Guardrails":
+        st.html('<div class="pro-section-title">Adaptive Spending Guardrails (Guyton-Klinger)</div>')
+        st.caption("Guardrails automatically adjust your spending based on market performance — cutting in bad years "
+                   "and raising in good years. Most planners recommend this over fixed withdrawals.")
+        cfg["gk_on"] = st.toggle("Enable adaptive spending", value=bool(cfg["gk_on"]), key="ps_gk_on",
+            help="If the market drops early in retirement, this automatically reduces your spending to preserve your portfolio. "
+                 "If the market booms, it lets you spend a bit more. Most planners recommend this over fixed withdrawals "
+                 "because it dramatically improves the chance your money lasts.")
+        if not cfg["gk_on"]:
+            st.caption("**Recommended.** Without guardrails, you withdraw the same amount regardless of market performance. "
+                       "With them, your spending flexes with your portfolio — cutting ~10% after bad years and raising ~5% after good ones. "
+                       "This simple rule can improve your plan's survival rate by 10–15 percentage points.")
+        if cfg["gk_on"]:
+            gc1, gc2 = st.columns(2, border=True)
+            with gc1:
+                gk_upper_int = st.slider("Upper guardrail (% above initial WR)", 5, 50,
+                    int(round(float(cfg["gk_upper_pct"]) * 100)), 5, format="%d%%", key="ps_gk_upper")
+                cfg["gk_upper_pct"] = gk_upper_int / 100.0
+                cfg["gk_cut"] = st.number_input("Cut %", value=float(cfg["gk_cut"]), step=0.01, format="%.2f", key="ps_gk_cut")
+            with gc2:
+                gk_lower_int = st.slider("Lower guardrail (% below initial WR)", 5, 50,
+                    int(round(float(cfg["gk_lower_pct"]) * 100)), 5, format="%d%%", key="ps_gk_lower")
+                cfg["gk_lower_pct"] = gk_lower_int / 100.0
+                cfg["gk_raise"] = st.number_input("Raise %", value=float(cfg["gk_raise"]), step=0.01, format="%.2f", key="ps_gk_raise")
+
+    # ================================================================
+    # ROTH CONVERSIONS (promoted from Taxes)
+    # ================================================================
+    elif section == "Roth Conversions":
+        st.html('<div class="pro-section-title">Roth Conversion Strategy</div>')
+        st.caption("Convert traditional IRA/401(k) money to Roth, paying taxes now at today's rates to avoid higher taxes later. "
+                   "Especially valuable in the 'gap years' between retirement and Social Security/RMDs when your income is low.")
+        cfg["conv_on"] = st.toggle("Plan Roth conversions", value=bool(cfg["conv_on"]), key="ps_conv_on",
+            help="Convert traditional IRA/401k money to Roth, paying taxes now at today's rates to avoid higher taxes later. "
+                 "Especially valuable in the 'gap years' between retirement and Social Security/RMDs when your income is low. "
+                 "The bracket-fill strategy automatically converts just enough to stay within a target tax bracket.")
+        if cfg["conv_on"]:
+            cfg["conv_start"] = st.number_input("Start age", value=int(cfg["conv_start"]), step=1, key="ps_conv_start")
+            cfg["conv_end"] = st.number_input("End age", value=int(cfg["conv_end"]), step=1, key="ps_conv_end")
+            cfg["conv_type"] = st.selectbox("Conversion strategy",
+                ["fixed", "bracket_fill"],
+                index=["fixed", "bracket_fill"].index(str(cfg["conv_type"])),
+                format_func=lambda x: "Fixed annual amount" if x == "fixed" else "Fill to tax bracket",
+                key="ps_conv_type",
+                help="Fixed: convert a set dollar amount each year. Bracket fill: dynamically convert up to a target federal tax bracket each year.")
+            if cfg["conv_type"] == "fixed":
+                cfg["conv_real"] = st.number_input("Annual amount (today's $)", value=float(cfg["conv_real"]), step=10000.0, key="ps_conv_amt")
+            else:
+                bracket_options = {0.12: "12% bracket", 0.22: "22% bracket", 0.24: "24% bracket", 0.32: "32% bracket", 0.35: "35% bracket"}
+                bracket_vals = list(bracket_options.keys())
+                current_bracket = float(cfg["conv_target_bracket"])
+                bracket_idx = bracket_vals.index(current_bracket) if current_bracket in bracket_vals else 2
+                cfg["conv_target_bracket"] = st.selectbox("Fill up to bracket",
+                    bracket_vals, index=bracket_idx,
+                    format_func=lambda x: bracket_options[x],
+                    key="ps_conv_bracket",
+                    help="Convert enough each year to fill ordinary income up to the top of this bracket.")
+                if not cfg.get("tax_engine_on", True):
+                    cfg["conv_filing_status"] = st.selectbox("Filing status",
+                        ["mfj", "single"],
+                        index=["mfj", "single"].index(str(cfg["conv_filing_status"])),
+                        format_func=lambda x: "Married Filing Jointly" if x == "mfj" else "Single",
+                        key="ps_conv_filing")
+                else:
+                    st.caption(f"Using global filing status: {'MFJ' if cfg.get('filing_status', 'mfj') == 'mfj' else 'Single'}")
+                cfg["conv_irmaa_aware"] = st.toggle("Cap conversions to avoid IRMAA",
+                    value=bool(cfg["conv_irmaa_aware"]), key="ps_conv_irmaa",
+                    help="Limit conversions so total MAGI stays below the lowest IRMAA threshold.")
+        else:
+            st.info("Toggle on to plan a Roth conversion ladder. This is one of the most powerful tax optimization strategies "
+                    "available during the gap years between retirement and RMDs.")
+
     st.session_state["cfg"] = cfg
 
 
-# ---- 8c: Deep Dive page ----
-def deep_dive_page():
+# ---- 8c: Analysis page ----
+def analysis_page():
     cfg = st.session_state["cfg"]
     hold = st.session_state["hold"]
 
-    st.html('<div style="font-size:1.8rem; font-weight:700; color:#1B2A4A; margin-bottom:0.5rem;">Deep Dive Analysis</div>')
+    st.html('<div style="font-size:1.8rem; font-weight:700; color:#1B2A4A; margin-bottom:0.5rem;">Analysis</div>')
 
     if "sim_result" not in st.session_state or "cfg_run" not in st.session_state:
-        st.warning("Run a simulation from **Results** first to see detailed analysis.")
+        st.warning("Run a simulation from **My Plan** first to see detailed analysis.")
         return
 
     out = st.session_state["sim_result"]
     cfg_run = st.session_state["cfg_run"]
     ages = out["ages"]
 
-    # Stale-results indicator: compare current assumptions to what was simulated
-    _current_cfg_run = build_cfg_run(cfg)
-    _cfg_changed = False
-    for _ck in _current_cfg_run:
-        if _ck in ("scenario_params", "irmaa_schedule"):
-            continue  # derived fields
-        _cv = _current_cfg_run.get(_ck)
-        _rv = cfg_run.get(_ck)
-        try:
-            if _cv != _rv:
-                _cfg_changed = True
-                break
-        except (ValueError, TypeError):
-            # numpy arrays or complex objects — use str comparison
-            if str(_cv) != str(_rv):
-                _cfg_changed = True
-                break
-    if _cfg_changed:
+    # Stale-results indicator
+    if _assumptions_changed():
         st.warning("⚠️ Your assumptions have changed since the last simulation. "
-                   "Go to **Results** to re-run with the updated settings.")
+                   "Go to **My Plan** to update results.")
 
-    # Build tab list dynamically — hide tabs that don't apply to the current config
-    _dd_tabs = ["Cashflows", "Accounts", "Withdrawal Rate", "Sensitivity"]
+    # ---- Three-group tab hierarchy ----
+    _core_tabs = ["Cashflows", "Accounts", "Withdrawal Rate", "Tax Brackets"]
+    _whatif_tabs = ["Sensitivity", "Optimizer", "Retire When?", "Failure Analysis"]
+
+    # Extras: conditionally built
+    _extras_tabs = []
     if bool(cfg_run.get("irmaa_on", False)):
-        _dd_tabs.append("IRMAA")
-    _dd_tabs.append("Legacy")
+        _extras_tabs.append("IRMAA")
+    _extras_tabs.append("Legacy")
     if bool(cfg_run.get("ann1_on", False)) or bool(cfg_run.get("ann2_on", False)):
-        _dd_tabs.append("Annuity")
+        _extras_tabs.append("Annuity")
     if bool(cfg_run.get("conv_on", False)):
-        _dd_tabs.append("Roth Strategy")
-    _dd_tabs.append("Tax Brackets")
+        _extras_tabs.append("Roth Strategy")
     if str(cfg_run.get("aca_mode", "simple")) == "aca":
-        _dd_tabs.append("ACA")
-    _dd_tabs.extend(["Optimizer", "Retire When?", "Failure Analysis"])
+        _extras_tabs.append("ACA")
     if str(cfg_run.get("return_model", "standard")) == "regime":
-        _dd_tabs.append("Regimes")
+        _extras_tabs.append("Regimes")
     if str(cfg_run.get("return_model", "standard")) == "historical":
-        _dd_tabs.append("Historical")
-    _dd_tabs.append("Reallocation")
+        _extras_tabs.append("Historical")
+    _extras_tabs.append("Reallocation")
+
+    _analysis_groups = {"Core Results": _core_tabs, "What-If": _whatif_tabs, "Extras": _extras_tabs}
+    _group_names = list(_analysis_groups.keys())
+
+    _prev_agroup = st.session_state.get("dd_group", "Core Results")
+    if _prev_agroup not in _group_names:
+        _prev_agroup = "Core Results"
+    dd_group = st.radio(
+        "Category",
+        _group_names,
+        index=_group_names.index(_prev_agroup),
+        key="dd_group",
+        horizontal=True,
+    )
+    if dd_group is None:
+        dd_group = "Core Results"
+
+    _dd_tabs = _analysis_groups[dd_group]
 
     # If previously-selected tab was hidden, reset to default
     _prev_dd = st.session_state.get("dd_analysis")
     if _prev_dd is not None and _prev_dd not in _dd_tabs:
-        st.session_state["dd_analysis"] = "Cashflows"
+        st.session_state["dd_analysis"] = _dd_tabs[0]
 
     analysis = st.segmented_control(
         "Analysis",
         _dd_tabs,
-        default="Cashflows", key="dd_analysis"
+        default=_dd_tabs[0], key="dd_analysis"
     )
 
     # ================================================================
     # CASHFLOWS
     # ================================================================
     if analysis == "Cashflows":
-        st.html('<div class="pro-section-title">Income Sources & Expenses</div>')
-        st.caption("Median (50th percentile) values across all simulations, in nominal dollars. Post-retirement years only.")
-
         de = out["decomp"]
         liq = out["liquid"]
         nw = out["net_worth"]
@@ -5281,10 +5405,68 @@ def deep_dive_page():
         mb = out["mortgage"]
         home_eq = np.maximum(0.0, hv - mb)
         hsa_bal = out["hsa"]
-
-        # ---- Stacked area charts: income sources and expenses ----
         _ret_age_idx = max(0, int(cfg_run.get("retire_age", 62)) - int(ages[0]))
         _post_ret_ages = ages[_ret_age_idx:]
+
+        # ---- HERO: Year-by-Year Action Plan table ----
+        st.html('<div class="pro-section-title">Year-by-Year Plan (Median Scenario)</div>')
+        st.caption("Median values across all simulations. Use this as a starting-point plan — "
+                   "actual amounts will depend on market performance. All amounts in nominal dollars.")
+
+        _yy_ctrl1, _yy_ctrl2 = st.columns(2)
+        with _yy_ctrl1:
+            _yy_include_pre = st.toggle("Include pre-retirement years", value=False, key="dd_yy_pre_ret")
+        with _yy_ctrl2:
+            _yy_dollars = st.segmented_control("Dollar basis", ["Nominal", "Real"],
+                                                default="Nominal", key="dd_yy_real")
+
+        _yy_start_idx = 0 if _yy_include_pre else _ret_age_idx
+        _yy_infl = out["infl_index"]  # shape (n_sims, T+1)
+
+        # Check if events exist to decide whether to show those columns
+        _has_events = (np.any(de["event_income"] > 0) or np.any(de["event_expense"] > 0))
+
+        _yy_rows = []
+        for idx in range(_yy_start_idx, len(ages)):
+            _age = int(ages[idx])
+            _deflator = float(np.median(_yy_infl[:, idx])) if _yy_dollars == "Real" else 1.0
+            _deflator = max(_deflator, 1e-6)
+
+            row = {
+                "Age": _age,
+                "Total Spending": float(np.median(de["outflow_total"][:, idx])) / _deflator,
+                "SS Income": float(np.median(de["ss_inflow"][:, idx])) / _deflator,
+                "From Taxable": float(np.median(de["gross_tax_wd"][:, idx])) / _deflator,
+                "From Trad IRA": float(np.median(de["gross_trad_wd"][:, idx] + de["gross_rmd"][:, idx])) / _deflator,
+                "From Roth": float(np.median(de["gross_roth_wd"][:, idx])) / _deflator,
+                "Roth Convert": float(np.median(de["conv_gross"][:, idx])) / _deflator,
+            }
+            if _has_events:
+                row["Event Income"] = float(np.median(de["event_income"][:, idx])) / _deflator
+                row["Event Expenses"] = float(np.median(de["event_expense"][:, idx])) / _deflator
+            row["Taxes"] = float(np.median(de["taxes_paid"][:, idx])) / _deflator
+            row["MAGI"] = float(np.median(out["magi"][:, idx])) / _deflator
+            row["Marginal Rate"] = float(np.median(de["marginal_bracket"][:, idx]))
+            row["Eff. Rate"] = float(np.median(de["effective_rate"][:, idx]))
+            _yy_rows.append(row)
+
+        _yy_df = pd.DataFrame(_yy_rows)
+        # Format dollar columns
+        _yy_dollar_cols = [c for c in _yy_df.columns if c not in ("Age", "Marginal Rate", "Eff. Rate")]
+        for c in _yy_dollar_cols:
+            _yy_df[c] = _yy_df[c].apply(fmt_dollars)
+        # Format rate columns as percentages
+        _yy_df["Marginal Rate"] = _yy_df["Marginal Rate"].apply(lambda x: f"{x*100:.0f}%")
+        _yy_df["Eff. Rate"] = _yy_df["Eff. Rate"].apply(lambda x: f"{x*100:.1f}%")
+
+        st.dataframe(_yy_df, use_container_width=True, hide_index=True, height=400)
+        st.caption("This table shows the median path. In practice, amounts will vary with market returns. "
+                   "The **Withdrawal Rate** and **Accounts** tabs show the range of outcomes.")
+
+        # ---- Income & Expense Charts ----
+        st.html('<div class="pro-section-title">Income Sources & Expenses</div>')
+        st.caption("Median (50th percentile) values across all simulations, in nominal dollars. Post-retirement years only.")
+
         if len(_post_ret_ages) > 1:
             # Change 1: 6-category income chart with account-level breakdown
             _raw_keys = ["ss_inflow", "gross_tax_wd", "gross_trad_wd",
@@ -5407,61 +5589,6 @@ def deep_dive_page():
                     tooltip=["Age:Q", "Category:N", alt.Tooltip("Amount ($K):Q", format=",.0f")]
                 ).properties(height=350)
                 st.altair_chart(_exp_chart, use_container_width=True)
-
-        # ---- Change 2: Year-by-Year Action Plan table ----
-        st.html('<div class="pro-section-title">Year-by-Year Plan (Median Scenario)</div>')
-        st.caption("Median values across all simulations. Use this as a starting-point plan — "
-                   "actual amounts will depend on market performance. All amounts in nominal dollars.")
-
-        _yy_ctrl1, _yy_ctrl2 = st.columns(2)
-        with _yy_ctrl1:
-            _yy_include_pre = st.toggle("Include pre-retirement years", value=False, key="dd_yy_pre_ret")
-        with _yy_ctrl2:
-            _yy_dollars = st.segmented_control("Dollar basis", ["Nominal", "Real"],
-                                                default="Nominal", key="dd_yy_real")
-
-        _yy_start_idx = 0 if _yy_include_pre else _ret_age_idx
-        _yy_infl = out["infl_index"]  # shape (n_sims, T+1)
-
-        # Check if events exist to decide whether to show those columns
-        _has_events = (np.any(de["event_income"] > 0) or np.any(de["event_expense"] > 0))
-
-        _yy_rows = []
-        for idx in range(_yy_start_idx, len(ages)):
-            _age = int(ages[idx])
-            _deflator = float(np.median(_yy_infl[:, idx])) if _yy_dollars == "Real" else 1.0
-            _deflator = max(_deflator, 1e-6)
-
-            row = {
-                "Age": _age,
-                "Total Spending": float(np.median(de["outflow_total"][:, idx])) / _deflator,
-                "SS Income": float(np.median(de["ss_inflow"][:, idx])) / _deflator,
-                "From Taxable": float(np.median(de["gross_tax_wd"][:, idx])) / _deflator,
-                "From Trad IRA": float(np.median(de["gross_trad_wd"][:, idx] + de["gross_rmd"][:, idx])) / _deflator,
-                "From Roth": float(np.median(de["gross_roth_wd"][:, idx])) / _deflator,
-                "Roth Convert": float(np.median(de["conv_gross"][:, idx])) / _deflator,
-            }
-            if _has_events:
-                row["Event Income"] = float(np.median(de["event_income"][:, idx])) / _deflator
-                row["Event Expenses"] = float(np.median(de["event_expense"][:, idx])) / _deflator
-            row["Taxes"] = float(np.median(de["taxes_paid"][:, idx])) / _deflator
-            row["MAGI"] = float(np.median(out["magi"][:, idx])) / _deflator
-            row["Marginal Rate"] = float(np.median(de["marginal_bracket"][:, idx]))
-            row["Eff. Rate"] = float(np.median(de["effective_rate"][:, idx]))
-            _yy_rows.append(row)
-
-        _yy_df = pd.DataFrame(_yy_rows)
-        # Format dollar columns
-        _yy_dollar_cols = [c for c in _yy_df.columns if c not in ("Age", "Marginal Rate", "Eff. Rate")]
-        for c in _yy_dollar_cols:
-            _yy_df[c] = _yy_df[c].apply(fmt_dollars)
-        # Format rate columns as percentages
-        _yy_df["Marginal Rate"] = _yy_df["Marginal Rate"].apply(lambda x: f"{x*100:.0f}%")
-        _yy_df["Eff. Rate"] = _yy_df["Eff. Rate"].apply(lambda x: f"{x*100:.1f}%")
-
-        st.dataframe(_yy_df, use_container_width=True, hide_index=True, height=400)
-        st.caption("This table shows the median path. In practice, amounts will vary with market returns. "
-                   "The **Withdrawal Rate** and **Accounts** tabs show the range of outcomes.")
 
         # ---- Spending floor distribution chart ----
         _spend_real_dd = de["spend_real_track"]
@@ -6704,7 +6831,7 @@ def compare_page():
     saved = st.session_state["saved_scenarios"]
     if len(saved) < 2:
         st.info(
-            f"You have **{len(saved)}** saved scenario(s). Save at least **2** from the Results page "
+            f"You have **{len(saved)}** saved scenario(s). Save at least **2** from the **My Plan** page "
             "using the **:material/add_circle: Save as Scenario** button, then return here to compare."
         )
         if saved:
@@ -6713,15 +6840,15 @@ def compare_page():
                 st.markdown(f"- {s['name']}")
         return
 
-    # ---- Scenario selector (pick exactly 2) ----
+    # ---- Scenario selector (pick 2–4) ----
     names = [s["name"] for s in saved]
     sel_col, load_col, del_col = st.columns([3, 1, 1])
     with sel_col:
-        picked = st.multiselect("Select exactly 2 scenarios to compare", names, default=names[:2],
-                                max_selections=2, key="compare_pick")
+        picked = st.multiselect("Select 2–4 scenarios to compare", names, default=names[:min(2, len(names))],
+                                max_selections=4, key="compare_pick")
     with load_col:
         st.markdown("")  # spacing
-        load_name = st.selectbox("Load into Results", ["—"] + names, key="compare_load",
+        load_name = st.selectbox("Load into My Plan", ["—"] + names, key="compare_load",
                                  help="Load a saved scenario's settings so you can edit and re-save it")
         if load_name != "—":
             sc_load = next(s for s in saved if s["name"] == load_name)
@@ -6739,39 +6866,45 @@ def compare_page():
                 st.session_state.pop("_active_scenario_name", None)
             st.rerun()
 
-    if len(picked) != 2:
-        st.warning("Select exactly 2 scenarios to compare.")
+    if len(picked) < 2:
+        st.warning("Select at least 2 scenarios to compare.")
         return
 
-    sc_a = next(s for s in saved if s["name"] == picked[0])
-    sc_b = next(s for s in saved if s["name"] == picked[1])
+    sc_list = [next(s for s in saved if s["name"] == p) for p in picked]
 
     # ---- Assumptions diff table ----
     st.html('<div class="pro-section-title">Assumptions That Differ</div>')
     diff_rows = []
     for key, label in _DIFF_KEYS:
-        va = sc_a["cfg"].get(key)
-        vb = sc_b["cfg"].get(key)
-        if va != vb:
-            diff_rows.append({"Assumption": label, picked[0]: _fmt_val(va), picked[1]: _fmt_val(vb)})
+        vals = [sc["cfg"].get(key) for sc in sc_list]
+        if len(set(str(v) for v in vals)) > 1:
+            row = {"Assumption": label}
+            for i, p in enumerate(picked):
+                row[p] = _fmt_val(vals[i])
+            diff_rows.append(row)
     # Also compare holdings
     for hkey, hlabel in [("total_tax", "Taxable Balance"), ("total_ret", "Retirement Balance")]:
-        va = sc_a["hold"].get(hkey)
-        vb = sc_b["hold"].get(hkey)
-        if va != vb:
-            diff_rows.append({"Assumption": hlabel, picked[0]: _fmt_val(va), picked[1]: _fmt_val(vb)})
+        vals = [sc["hold"].get(hkey) for sc in sc_list]
+        if len(set(str(v) for v in vals)) > 1:
+            row = {"Assumption": hlabel}
+            for i, p in enumerate(picked):
+                row[p] = _fmt_val(vals[i])
+            diff_rows.append(row)
 
     if diff_rows:
         st.dataframe(pd.DataFrame(diff_rows), use_container_width=True, hide_index=True)
     else:
-        st.success("These two scenarios have identical assumptions.")
+        st.success("These scenarios have identical assumptions.")
 
-    # ---- Run both simulations ----
-    with st.spinner("Running simulations for both scenarios..."):
-        cfg_a = build_cfg_run(sc_a["cfg"])
-        cfg_b = build_cfg_run(sc_b["cfg"])
-        out_a = simulate(cfg_a, sc_a["hold"])
-        out_b = simulate(cfg_b, sc_b["hold"])
+    # ---- Run simulations ----
+    with st.spinner(f"Running simulations for {len(picked)} scenarios..."):
+        cfg_runs = [build_cfg_run(sc["cfg"]) for sc in sc_list]
+        outs = [simulate(cr, sc["hold"]) for cr, sc in zip(cfg_runs, sc_list)]
+
+    # Legacy aliases for 2-scenario code paths
+    sc_a, sc_b = sc_list[0], sc_list[1]
+    cfg_a, cfg_b = cfg_runs[0], cfg_runs[1]
+    out_a, out_b = outs[0], outs[1]
 
     # ---- Side-by-side metric cards ----
     st.html('<div class="pro-section-title">Key Metrics</div>')
@@ -6797,11 +6930,10 @@ def compare_page():
             "end_age": end_age_val,
         }
 
-    met_a = _compute_metrics(out_a, sc_a["cfg"])
-    met_b = _compute_metrics(out_b, sc_b["cfg"])
+    mets = [_compute_metrics(o, sc["cfg"]) for o, sc in zip(outs, sc_list)]
 
-    col_a, col_b = st.columns(2, border=True)
-    for col, met, name in [(col_a, met_a, picked[0]), (col_b, met_b, picked[1])]:
+    met_cols = st.columns(len(picked), border=True)
+    for col, met, name in zip(met_cols, mets, picked):
         with col:
             st.markdown(f"**{name}**")
             sr_color = "metric-green" if met["pct_success"] >= 90 else ("metric-amber" if met["pct_success"] >= 75 else "metric-coral")
@@ -6815,26 +6947,31 @@ def compare_page():
             st.html(_metric_card_html(f"Net Worth at {met['end_age']}", f"${met['nw_p50']/1e6:.1f}M",
                                       f"median nominal · real: ${met['nw_real_p50']/1e6:.1f}M", "metric-navy"))
 
+    # Legacy aliases for 2-scenario attribution
+    met_a, met_b = mets[0], mets[1]
+
     # ---- Success rate comparison bar ----
     st.html('<div class="pro-section-title">Success Rate Comparison</div>')
+    _compare_colors = ["#1B2A4A", "#00897B", "#FF8F00", "#7E57C2"]
     bar_df = pd.DataFrame({
-        "Scenario": [picked[0], picked[1]],
-        "Success Rate (%)": [met_a["pct_success"], met_b["pct_success"]],
+        "Scenario": picked,
+        "Success Rate (%)": [m["pct_success"] for m in mets],
     })
     bar_chart = alt.Chart(bar_df).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
-        x=alt.X("Scenario:N", title=None, axis=alt.Axis(labelAngle=0)),
+        x=alt.X("Scenario:N", title=None, axis=alt.Axis(labelAngle=0),
+                 sort=picked),
         y=alt.Y("Success Rate (%):Q", scale=alt.Scale(domain=[0, 100]), title="Success Rate (%)"),
         color=alt.Color("Scenario:N", scale=alt.Scale(
-            domain=[picked[0], picked[1]], range=["#1B2A4A", "#00897B"]
+            domain=picked, range=_compare_colors[:len(picked)]
         ), legend=None),
         tooltip=["Scenario:N", alt.Tooltip("Success Rate (%):Q", format=".1f")],
     ).properties(height=250)
     bar_text = alt.Chart(bar_df).mark_text(dy=-12, fontSize=16, fontWeight="bold").encode(
-        x="Scenario:N",
+        x=alt.X("Scenario:N", sort=picked),
         y="Success Rate (%):Q",
         text=alt.Text("Success Rate (%):Q", format=".0f"),
         color=alt.Color("Scenario:N", scale=alt.Scale(
-            domain=[picked[0], picked[1]], range=["#1B2A4A", "#00897B"]
+            domain=picked, range=_compare_colors[:len(picked)]
         ), legend=None),
     )
     st.altair_chart(bar_chart + bar_text, use_container_width=True)
@@ -6988,47 +7125,37 @@ def compare_page():
     st.html('<div class="pro-section-title">Wealth Projections (Liquid Assets, Nominal)</div>')
 
     # Compute shared y_max for wealth charts
-    p95_a = np.percentile(out_a["liquid"], 95, axis=0).max() / 1e6
-    p95_b = np.percentile(out_b["liquid"], 95, axis=0).max() / 1e6
-    wealth_y_max = max(p95_a, p95_b) * 1.05
+    wealth_y_max = max(np.percentile(o["liquid"], 95, axis=0).max() / 1e6 for o in outs) * 1.05
 
-    fc_a, fc_b = st.columns(2)
-    with fc_a:
-        st.markdown(f"**{picked[0]}**")
-        render_wealth_fan_chart(out_a["liquid"], out_a["ages"],
-                                title_label="Liquid ($M)",
-                                retire_age=int(sc_a["cfg"]["retire_age"]),
-                                y_max=wealth_y_max)
-    with fc_b:
-        st.markdown(f"**{picked[1]}**")
-        render_wealth_fan_chart(out_b["liquid"], out_b["ages"],
-                                title_label="Liquid ($M)",
-                                retire_age=int(sc_b["cfg"]["retire_age"]),
-                                y_max=wealth_y_max)
+    fc_cols = st.columns(len(picked))
+    for col, sc, o, name in zip(fc_cols, sc_list, outs, picked):
+        with col:
+            st.markdown(f"**{name}**")
+            render_wealth_fan_chart(o["liquid"], o["ages"],
+                                    title_label="Liquid ($M)",
+                                    retire_age=int(sc["cfg"]["retire_age"]),
+                                    y_max=wealth_y_max)
 
     # ---- Side-by-side spending fan charts ----
     st.html('<div class="pro-section-title">Spending Projections (Real Dollars)</div>')
 
     # Compute shared y_max for spending charts
-    def _spending_p90_max(out, cfg):
-        spend = out["decomp"]["spend_real_track"]
-        ridx = max(0, int(cfg["retire_age"]) - int(cfg["start_age"]))
+    def _spending_p90_max(out_s, cfg_s):
+        spend = out_s["decomp"]["spend_real_track"]
+        ridx = max(0, int(cfg_s["retire_age"]) - int(cfg_s["start_age"]))
         post = spend[:, ridx:]
         if post.shape[1] < 2:
             return 0
         return np.percentile(post, 90, axis=0).max() / 1e3
 
-    sp_max_a = _spending_p90_max(out_a, sc_a["cfg"])
-    sp_max_b = _spending_p90_max(out_b, sc_b["cfg"])
-    spend_y_max = max(sp_max_a, sp_max_b) * 1.10 if max(sp_max_a, sp_max_b) > 0 else None
+    _sp_maxes = [_spending_p90_max(o, sc["cfg"]) for o, sc in zip(outs, sc_list)]
+    spend_y_max = max(_sp_maxes) * 1.10 if max(_sp_maxes) > 0 else None
 
-    sc_a_col, sc_b_col = st.columns(2)
-    with sc_a_col:
-        st.markdown(f"**{picked[0]}**")
-        render_spending_fan_chart(out_a, cfg_a, y_max=spend_y_max)
-    with sc_b_col:
-        st.markdown(f"**{picked[1]}**")
-        render_spending_fan_chart(out_b, cfg_b, y_max=spend_y_max)
+    sp_cols = st.columns(len(picked))
+    for col, sc, cr, o, name in zip(sp_cols, sc_list, cfg_runs, outs, picked):
+        with col:
+            st.markdown(f"**{name}**")
+            render_spending_fan_chart(o, cr, y_max=spend_y_max)
 
 
 
@@ -7154,9 +7281,9 @@ init_defaults()
 
 pg = st.navigation(
     [
-        st.Page(dashboard_page, title="Results", icon=":material/dashboard:", default=True),
+        st.Page(my_plan_page, title="My Plan", icon=":material/dashboard:", default=True),
         st.Page(plan_setup_page, title="Assumptions", icon=":material/tune:"),
-        st.Page(deep_dive_page, title="Deep Dive", icon=":material/analytics:"),
+        st.Page(analysis_page, title="Analysis", icon=":material/analytics:"),
         st.Page(compare_page, title="Compare", icon=":material/compare_arrows:"),
         st.Page(methodology_page, title="How It Works", icon=":material/help_outline:"),
     ],
