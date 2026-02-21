@@ -3231,7 +3231,7 @@ def dashboard_page():
     _saved_names = [s["name"] for s in _saved_scenarios]
     _active_sc = st.session_state.get("_active_scenario_name")
 
-    hdr_left, hdr_switch, hdr_save_sc, hdr_portfolio, hdr_mid, hdr_right = st.columns([3, 1, 1, 1, 1, 1])
+    hdr_left, hdr_switch, hdr_save_sc, hdr_mid, hdr_right = st.columns([3, 1, 1, 1, 1])
     with hdr_left:
         outlook_name = cfg.get("scenario", "Base")
         badges = f"""<span style="display:inline-block; background:#00897B; color:white; padding:2px 12px;
@@ -3296,48 +3296,6 @@ def dashboard_page():
                         })
                     st.session_state["_active_scenario_name"] = _sc_name
                     st.rerun()
-    with hdr_portfolio:
-        with st.popover(":material/account_balance: Portfolio", use_container_width=True):
-            st.caption("Upload brokerage CSV exports to set your starting portfolio. "
-                       "Upload both files, then close this panel.")
-            dash_tax_file = st.file_uploader(
-                "Taxable account CSV", type=["csv", "txt", "tsv"], key="dash_tax_up",
-                help="CSV export from your taxable brokerage (Schwab, Fidelity, Vanguard, etc.)",
-            )
-            dash_ret_file = st.file_uploader(
-                "Retirement account CSV", type=["csv", "txt", "tsv"], key="dash_ret_up",
-                help="CSV export from your 401(k), IRA, 403(b), or similar retirement account",
-            )
-            dash_tax_ok, dash_ret_ok = False, False
-            if dash_tax_file:
-                try:
-                    tax_df, tax_val = load_snapshot(dash_tax_file)
-                    w_tax_u, total_tax_u, dollars_tax_u = weights_and_dollars(tax_df, tax_val)
-                    dash_tax_ok = True
-                except Exception as e:
-                    st.error(f"Error parsing taxable CSV: {e}")
-            if dash_ret_file:
-                try:
-                    ret_df, ret_val = load_snapshot(dash_ret_file)
-                    w_ret_u, total_ret_u, dollars_ret_u = weights_and_dollars(ret_df, ret_val)
-                    dash_ret_ok = True
-                except Exception as e:
-                    st.error(f"Error parsing retirement CSV: {e}")
-            if dash_tax_ok or dash_ret_ok:
-                final_hold = dict(hold)
-                if dash_tax_ok:
-                    final_hold["total_tax"] = total_tax_u
-                    final_hold["w_tax"] = w_tax_u
-                    final_hold["dollars_tax"] = dollars_tax_u
-                if dash_ret_ok:
-                    final_hold["total_ret"] = total_ret_u
-                    final_hold["w_ret"] = w_ret_u
-                    final_hold["dollars_ret"] = dollars_ret_u
-                st.session_state["hold"] = final_hold
-                st.session_state["_portfolio_uploaded"] = True
-                hold = final_hold
-                st.success(f"Taxable: {fmt_dollars(final_hold['total_tax'])} | "
-                           f"Retirement: {fmt_dollars(final_hold['total_ret'])}")
     with hdr_mid:
         st.download_button(
             ":material/download: Save Settings",
@@ -3365,42 +3323,97 @@ def dashboard_page():
 
     if _show_getting_started and not st.session_state.get("_onboarding_dismissed", False):
         with st.expander("🚀 **Getting Started — enter your key numbers** (everything else has smart defaults)", expanded=True):
-            st.markdown("Fill in these 5–6 inputs to get a meaningful projection. "
+            st.markdown("Fill in these inputs to get a meaningful projection. "
                         "You can fine-tune everything else later in the **Assumptions** tab.")
 
-            gs_c1, gs_c2, gs_c3 = st.columns(3, border=True)
-            with gs_c1:
-                st.markdown("**Your ages**")
-                cfg["start_age"] = st.number_input("Current age", value=int(cfg["start_age"]), step=1, key="gs_start_age")
-                cfg["retire_age"] = st.number_input("Planned retirement age", value=int(cfg["retire_age"]), step=1, key="gs_retire_age")
-                cfg["end_age"] = st.number_input("Plan through age", value=int(cfg["end_age"]), step=1, key="gs_end_age")
-            with gs_c2:
-                st.markdown("**Your money**")
-                _gs_tax = st.number_input("Taxable account balance ($)", value=float(hold["total_tax"]),
-                    step=50000.0, key="gs_total_tax",
-                    help="Brokerage accounts, savings, CDs — anything outside retirement accounts.")
-                _gs_ret = st.number_input("Retirement account balance ($)", value=float(hold["total_ret"]),
-                    step=50000.0, key="gs_total_ret",
-                    help="401(k), IRA, 403(b), TSP, Roth IRA — all retirement accounts combined.")
-            with gs_c3:
-                st.markdown("**Your spending & income**")
+            gs_left, gs_right = st.columns([1, 1], border=True)
+
+            with gs_left:
+                st.markdown("**Your ages & spending**")
+                _gs_ac1, _gs_ac2 = st.columns(2)
+                with _gs_ac1:
+                    cfg["start_age"] = st.number_input("Current age", value=int(cfg["start_age"]), step=1, key="gs_start_age")
+                    cfg["retire_age"] = st.number_input("Retirement age", value=int(cfg["retire_age"]), step=1, key="gs_retire_age")
+                with _gs_ac2:
+                    cfg["end_age"] = st.number_input("Plan through age", value=int(cfg["end_age"]), step=1, key="gs_end_age")
+                    cfg["ss62_1"] = st.number_input("Monthly SS at 62 ($)", value=float(cfg["ss62_1"]),
+                        step=100.0, key="gs_ss62",
+                        help="Your estimated monthly benefit at age 62. Find yours at ssa.gov/myaccount. Set to 0 if unknown.")
                 cfg["spend_real"] = st.number_input("Annual spending in retirement ($)", value=float(cfg["spend_real"]),
                     step=10000.0, key="gs_spend_real",
                     help="Total annual living expenses in today's dollars. Don't include mortgage (tracked separately).")
-                cfg["ss62_1"] = st.number_input("Monthly Social Security at 62 ($)", value=float(cfg["ss62_1"]),
-                    step=100.0, key="gs_ss62",
-                    help="Your estimated monthly benefit at age 62. Find yours at ssa.gov/myaccount. Set to 0 if unknown.")
 
-            # Process manual portfolio entry from Getting Started
-            if abs(_gs_tax - hold["total_tax"]) > 1.0 or abs(_gs_ret - hold["total_ret"]) > 1.0:
-                # User changed balances — update holdings with existing allocation weights
-                final_hold = dict(hold)
-                final_hold["total_tax"] = _gs_tax
-                final_hold["dollars_tax"] = {k: _gs_tax * hold["w_tax"][k] for k in ASSET_CLASSES}
-                final_hold["total_ret"] = _gs_ret
-                final_hold["dollars_ret"] = {k: _gs_ret * hold["w_ret"][k] for k in ASSET_CLASSES}
-                st.session_state["hold"] = final_hold
-                hold = final_hold
+            with gs_right:
+                st.markdown("**Your starting portfolio**")
+                _gs_portfolio_mode = st.segmented_control(
+                    "How to enter your portfolio",
+                    ["Enter totals", "Upload CSVs"],
+                    default="Enter totals", key="gs_portfolio_mode",
+                )
+
+                if _gs_portfolio_mode == "Upload CSVs":
+                    st.caption("Upload brokerage CSV exports. The tool auto-detects holdings and classifies them into asset classes.")
+                    dash_tax_file = st.file_uploader(
+                        "Taxable account CSV", type=["csv", "txt", "tsv"], key="dash_tax_up",
+                        help="CSV export from your taxable brokerage (Schwab, Fidelity, Vanguard, etc.)",
+                    )
+                    dash_ret_file = st.file_uploader(
+                        "Retirement account CSV", type=["csv", "txt", "tsv"], key="dash_ret_up",
+                        help="CSV export from your 401(k), IRA, 403(b), or similar retirement account",
+                    )
+                    dash_tax_ok, dash_ret_ok = False, False
+                    if dash_tax_file:
+                        try:
+                            tax_df, tax_val = load_snapshot(dash_tax_file)
+                            w_tax_u, total_tax_u, dollars_tax_u = weights_and_dollars(tax_df, tax_val)
+                            dash_tax_ok = True
+                        except Exception as e:
+                            st.error(f"Error parsing taxable CSV: {e}")
+                    if dash_ret_file:
+                        try:
+                            ret_df, ret_val = load_snapshot(dash_ret_file)
+                            w_ret_u, total_ret_u, dollars_ret_u = weights_and_dollars(ret_df, ret_val)
+                            dash_ret_ok = True
+                        except Exception as e:
+                            st.error(f"Error parsing retirement CSV: {e}")
+                    if dash_tax_ok or dash_ret_ok:
+                        final_hold = dict(hold)
+                        if dash_tax_ok:
+                            final_hold["total_tax"] = total_tax_u
+                            final_hold["w_tax"] = w_tax_u
+                            final_hold["dollars_tax"] = dollars_tax_u
+                        if dash_ret_ok:
+                            final_hold["total_ret"] = total_ret_u
+                            final_hold["w_ret"] = w_ret_u
+                            final_hold["dollars_ret"] = dollars_ret_u
+                        st.session_state["hold"] = final_hold
+                        st.session_state["_portfolio_uploaded"] = True
+                        hold = final_hold
+                        st.success(f"Taxable: {fmt_dollars(final_hold['total_tax'])} | "
+                                   f"Retirement: {fmt_dollars(final_hold['total_ret'])}")
+                    elif not dash_tax_file and not dash_ret_file:
+                        st.caption("Export a CSV from your brokerage (Schwab, Fidelity, Vanguard, etc.) "
+                                   "and drag it into the boxes above.")
+                else:
+                    # Enter totals manually
+                    _gs_tax = st.number_input("Taxable account balance ($)", value=float(hold["total_tax"]),
+                        step=50000.0, key="gs_total_tax",
+                        help="Brokerage accounts, savings, CDs — anything outside retirement accounts.")
+                    _gs_ret = st.number_input("Retirement account balance ($)", value=float(hold["total_ret"]),
+                        step=50000.0, key="gs_total_ret",
+                        help="401(k), IRA, 403(b), TSP, Roth IRA — all retirement accounts combined.")
+                    st.caption("For detailed asset-class breakdown from holdings, use **Upload CSVs** "
+                               "or go to **Assumptions → Basics → Portfolio**.")
+
+                    # Process manual portfolio entry
+                    if abs(_gs_tax - hold["total_tax"]) > 1.0 or abs(_gs_ret - hold["total_ret"]) > 1.0:
+                        final_hold = dict(hold)
+                        final_hold["total_tax"] = _gs_tax
+                        final_hold["dollars_tax"] = {k: _gs_tax * hold["w_tax"][k] for k in ASSET_CLASSES}
+                        final_hold["total_ret"] = _gs_ret
+                        final_hold["dollars_ret"] = {k: _gs_ret * hold["w_ret"][k] for k in ASSET_CLASSES}
+                        st.session_state["hold"] = final_hold
+                        hold = final_hold
 
             if st.button("✓ I've entered my basics — dismiss this panel", key="gs_dismiss"):
                 st.session_state["_onboarding_dismissed"] = True
