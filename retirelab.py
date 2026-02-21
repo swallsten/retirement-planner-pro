@@ -4755,14 +4755,21 @@ def plan_setup_page():
             _max_horizon = int(cfg.get("end_age", 90)) - int(cfg.get("start_age", 55))
             _valid_starts = [y for y in _hist_years if y + _max_horizon <= max(_hist_years) + 1]
 
+            _hist_max_yr = max(_hist_years)
             _hist_mode = st.radio("Mode",
-                ["Test all starting years", "Pick a specific year"],
+                [f"Every historical period (1928–{_hist_max_yr})", "Single starting year"],
                 key="ps_hist_mode",
-                help="'Test all' distributes simulations across all valid starting years — gives you a "
-                     "survival rate across all historical periods. 'Pick a year' runs all simulations "
-                     "using one specific year's sequence — shows exactly what would have happened.")
+                help="**Every historical period** — Your simulations are spread across all valid starting years. "
+                     "For example, some sims replay the markets starting in 1928, others starting in 1929, and so on. "
+                     "This tells you what fraction of all historical periods your plan would have survived — "
+                     "the same question tools like cFIREsim and FIRECalc answer. "
+                     "The Deep Dive tab shows which specific periods failed.\n\n"
+                     "**Single starting year** — All simulations replay the exact same historical return sequence "
+                     "starting from one year you choose (e.g., 1966). This shows precisely what would have happened "
+                     "to your plan if you'd retired into that specific market environment. "
+                     "Differences between sims come only from mortality randomness (if enabled).")
 
-            if _hist_mode == "Pick a specific year":
+            if _hist_mode == "Single starting year":
                 _notable_in_range = {y: label for y, label in HISTORICAL_NOTABLE_YEARS.items() if y in _valid_starts}
                 if _notable_in_range:
                     st.caption("Notable periods: " + ", ".join(f"**{y}** ({label})" for y, label in sorted(_notable_in_range.items())))
