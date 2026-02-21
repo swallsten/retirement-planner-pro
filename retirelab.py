@@ -5019,23 +5019,19 @@ def deep_dive_page():
         home_eq = np.maximum(0.0, hv - mb)
         hsa_bal = out["hsa"]
 
-        # Stacked area charts for income sources and expenses (Change 3)
+        # ---- Stacked area charts: income sources and expenses ----
         _ret_age_idx = max(0, int(cfg_run.get("retire_age", 62)) - int(ages[0]))
         _post_ret_ages = ages[_ret_age_idx:]
         if len(_post_ret_ages) > 1:
-            # Use mean shares to break down the median total income by source.
-            # This avoids the "marginal median" problem (independent p50s per
-            # source can all be zero even when the median sim has money) and
-            # avoids picking a single sim that may be an outlier or go broke.
-            # Combine the three portfolio withdrawal types + RMDs into a single
-            # "Portfolio Withdrawals" category so the chart is easier to read.
-            _raw_keys = ["ss_inflow", "gross_rmd", "gross_tax_wd",
-                         "gross_trad_wd", "gross_roth_wd", "annuity_income", "event_income"]
-            # Merged groups: portfolio = RMDs + taxable + trad + roth
+            # Change 1: 6-category income chart with account-level breakdown
+            _raw_keys = ["ss_inflow", "gross_tax_wd", "gross_trad_wd",
+                         "gross_rmd", "gross_roth_wd", "annuity_income", "event_income"]
             _src_groups = {
                 "Social Security": ["ss_inflow"],
-                "Portfolio Withdrawals": ["gross_rmd", "gross_tax_wd", "gross_trad_wd", "gross_roth_wd"],
-                "Annuity Income": ["annuity_income"],
+                "Taxable Account": ["gross_tax_wd"],
+                "Traditional IRA": ["gross_trad_wd", "gross_rmd"],
+                "Roth IRA": ["gross_roth_wd"],
+                "Annuity": ["annuity_income"],
                 "Event Income": ["event_income"],
             }
             _src_labels = list(_src_groups.keys())
@@ -5090,8 +5086,6 @@ def deep_dive_page():
             _exp_df = pd.DataFrame(_expense_rows)
 
             # Compare total income vs total expenses per age.
-            # Where expenses > income, scale down expense categories and add
-            # a "Shortfall" band so the user sees the unfunded gap.
             _inc_src_cols = [c for c in _inc_df.columns if c != "Age"]
             _exp_cat_cols = [c for c in _exp_df.columns if c != "Age"]
             _inc_totals = _inc_df[_inc_src_cols].sum(axis=1)
@@ -5119,15 +5113,14 @@ def deep_dive_page():
             _inc_melt = _inc_df.melt("Age", var_name="Source", value_name="Amount ($K)")
             _exp_adj_melt = _exp_adj_df.melt("Age", var_name="Category", value_name="Amount ($K)")
 
-            _inc_domain = ["Social Security", "Portfolio Withdrawals", "Annuity Income", "Event Income"]
-            _inc_colors = ["#FF8F00", "#1B2A4A", "#7E57C2", "#4CAF50"]
+            _inc_domain = ["Social Security", "Taxable Account", "Traditional IRA", "Roth IRA", "Annuity", "Event Income"]
+            _inc_colors = ["#FF8F00", "#1B2A4A", "#E57373", "#00897B", "#7E57C2", "#4CAF50"]
             _exp_domain = ["Core Spending", "Housing", "Healthcare", "Taxes", "IRMAA", "Event Expenses", "Shortfall"]
             _exp_colors = ["#1B2A4A", "#8D6E63", "#E57373", "#FF8F00", "#9E9E9E", "#AB47BC", "#D32F2F"]
 
             st.caption("Each bar shows the median total across all simulations, split by average source proportions. "
                        "No single simulation path looks exactly like this — it's a composite picture of the typical outcome. "
-                       "'Portfolio Withdrawals' combines RMDs + taxable + traditional + Roth. "
-                       "Red 'Shortfall' on the expense chart shows planned spending exceeding available income.")
+                       "Traditional IRA includes RMDs. Red 'Shortfall' on the expense chart shows planned spending exceeding available income.")
             ch_inc, ch_exp = st.columns(2)
             with ch_inc:
                 st.markdown("**Where the Money Comes From**")
@@ -5152,8 +5145,91 @@ def deep_dive_page():
                 ).properties(height=350)
                 st.altair_chart(_exp_chart, use_container_width=True)
 
-        # Detailed cashflow table in expander
-        with st.expander("Detailed cashflow table", expanded=False):
+        # ---- Change 2: Year-by-Year Action Plan table ----
+        st.html('<div class="pro-section-title">Year-by-Year Plan (Median Scenario)</div>')
+        st.caption("Median values across all simulations. Use this as a starting-point plan — "
+                   "actual amounts will depend on market performance. All amounts in nominal dollars.")
+
+        _yy_ctrl1, _yy_ctrl2 = st.columns(2)
+        with _yy_ctrl1:
+            _yy_include_pre = st.toggle("Include pre-retirement years", value=False, key="dd_yy_pre_ret")
+        with _yy_ctrl2:
+            _yy_dollars = st.segmented_control("Dollar basis", ["Nominal", "Real"],
+                                                default="Nominal", key="dd_yy_real")
+
+        _yy_start_idx = 0 if _yy_include_pre else _ret_age_idx
+        _yy_infl = out["infl_index"]  # shape (n_sims, T+1)
+
+        # Check if events exist to decide whether to show those columns
+        _has_events = (np.any(de["event_income"] > 0) or np.any(de["event_expense"] > 0))
+
+        _yy_rows = []
+        for idx in range(_yy_start_idx, len(ages)):
+            _age = int(ages[idx])
+            _deflator = float(np.median(_yy_infl[:, idx])) if _yy_dollars == "Real" else 1.0
+            _deflator = max(_deflator, 1e-6)
+
+            row = {
+                "Age": _age,
+                "Total Spending": float(np.median(de["outflow_total"][:, idx])) / _deflator,
+                "SS Income": float(np.median(de["ss_inflow"][:, idx])) / _deflator,
+                "From Taxable": float(np.median(de["gross_tax_wd"][:, idx])) / _deflator,
+                "From Trad IRA": float(np.median(de["gross_trad_wd"][:, idx] + de["gross_rmd"][:, idx])) / _deflator,
+                "From Roth": float(np.median(de["gross_roth_wd"][:, idx])) / _deflator,
+                "Roth Convert": float(np.median(de["conv_gross"][:, idx])) / _deflator,
+            }
+            if _has_events:
+                row["Event Income"] = float(np.median(de["event_income"][:, idx])) / _deflator
+                row["Event Expenses"] = float(np.median(de["event_expense"][:, idx])) / _deflator
+            row["Taxes"] = float(np.median(de["taxes_paid"][:, idx])) / _deflator
+            row["MAGI"] = float(np.median(out["magi"][:, idx])) / _deflator
+            row["Marginal Rate"] = float(np.median(de["marginal_bracket"][:, idx]))
+            row["Eff. Rate"] = float(np.median(de["effective_rate"][:, idx]))
+            _yy_rows.append(row)
+
+        _yy_df = pd.DataFrame(_yy_rows)
+        # Format dollar columns
+        _yy_dollar_cols = [c for c in _yy_df.columns if c not in ("Age", "Marginal Rate", "Eff. Rate")]
+        for c in _yy_dollar_cols:
+            _yy_df[c] = _yy_df[c].apply(fmt_dollars)
+        # Format rate columns as percentages
+        _yy_df["Marginal Rate"] = _yy_df["Marginal Rate"].apply(lambda x: f"{x*100:.0f}%")
+        _yy_df["Eff. Rate"] = _yy_df["Eff. Rate"].apply(lambda x: f"{x*100:.1f}%")
+
+        st.dataframe(_yy_df, use_container_width=True, hide_index=True, height=400)
+        st.caption("This table shows the median path. In practice, amounts will vary with market returns. "
+                   "The **Withdrawal Rate** and **Accounts** tabs show the range of outcomes.")
+
+        # ---- Spending floor distribution chart ----
+        _spend_real_dd = de["spend_real_track"]
+        _ret_idx_dd = max(0, int(cfg_run.get("retire_age", 62)) - int(ages[0]))
+        _spend_real_post = _spend_real_dd[:, _ret_idx_dd:]
+        if _spend_real_post.shape[1] > 1:
+            with st.expander("Spending floor risk — minimum real spending distribution", expanded=False):
+                _min_spend_dd = np.min(_spend_real_post, axis=1) / 1e3
+                _hist_df = pd.DataFrame({"Minimum Real Spending ($K)": _min_spend_dd})
+                _hist_chart = alt.Chart(_hist_df).mark_bar(color="#1B2A4A", opacity=0.7).encode(
+                    alt.X("Minimum Real Spending ($K):Q", bin=alt.Bin(maxbins=40), title="Minimum Real Spending ($K)"),
+                    alt.Y("count():Q", title="Number of Simulations"),
+                    tooltip=[alt.Tooltip("Minimum Real Spending ($K):Q", bin=alt.Bin(maxbins=40), title="Spending ($K)"),
+                             alt.Tooltip("count():Q", title="Simulations")]
+                ).properties(height=250)
+
+                _floor_dd = float(cfg_run.get("spending_floor", 80000.0)) / 1e3
+                _floor_rule = alt.Chart(pd.DataFrame({"x": [_floor_dd]})).mark_rule(
+                    color="#D32F2F", strokeDash=[6, 3], strokeWidth=2
+                ).encode(x="x:Q")
+                _floor_label = alt.Chart(pd.DataFrame({"x": [_floor_dd + 2], "y": [0], "label": [f"Floor: ${_floor_dd:.0f}K"]})).mark_text(
+                    align="left", fontSize=11, color="#D32F2F", dy=-10
+                ).encode(x="x:Q", y="y:Q", text="label:N")
+
+                st.altair_chart(_hist_chart + _floor_rule + _floor_label, use_container_width=True)
+                _pct_below = float((_min_spend_dd < _floor_dd).mean()) * 100
+                st.caption(f"**{_pct_below:.1f}%** of simulations have at least one year where real core spending drops below the ${_floor_dd:.0f}K floor. "
+                           "This captures the tail risk from guardrail spending cuts.")
+
+        # ---- Change 3: Renamed raw data expander ----
+        with st.expander("Full simulation detail (all 30+ columns)", expanded=False):
             rows = []
             for idx, age in enumerate(ages):
                 idx_next = min(idx + 1, len(ages) - 1)
@@ -5197,34 +5273,6 @@ def deep_dive_page():
                 if c != "Age":
                     de_df[c] = de_df[c].apply(fmt_dollars)
             st.dataframe(de_df, use_container_width=True, hide_index=True, height=500)
-
-        # Spending floor distribution chart
-        _spend_real_dd = de["spend_real_track"]
-        _ret_idx_dd = max(0, int(cfg_run.get("retire_age", 62)) - int(ages[0]))
-        _spend_real_post = _spend_real_dd[:, _ret_idx_dd:]
-        if _spend_real_post.shape[1] > 1:
-            with st.expander("Spending floor risk — minimum real spending distribution", expanded=False):
-                _min_spend_dd = np.min(_spend_real_post, axis=1) / 1e3
-                _hist_df = pd.DataFrame({"Minimum Real Spending ($K)": _min_spend_dd})
-                _hist_chart = alt.Chart(_hist_df).mark_bar(color="#1B2A4A", opacity=0.7).encode(
-                    alt.X("Minimum Real Spending ($K):Q", bin=alt.Bin(maxbins=40), title="Minimum Real Spending ($K)"),
-                    alt.Y("count():Q", title="Number of Simulations"),
-                    tooltip=[alt.Tooltip("Minimum Real Spending ($K):Q", bin=alt.Bin(maxbins=40), title="Spending ($K)"),
-                             alt.Tooltip("count():Q", title="Simulations")]
-                ).properties(height=250)
-
-                _floor_dd = float(cfg_run.get("spending_floor", 80000.0)) / 1e3
-                _floor_rule = alt.Chart(pd.DataFrame({"x": [_floor_dd]})).mark_rule(
-                    color="#D32F2F", strokeDash=[6, 3], strokeWidth=2
-                ).encode(x="x:Q")
-                _floor_label = alt.Chart(pd.DataFrame({"x": [_floor_dd + 2], "y": [0], "label": [f"Floor: ${_floor_dd:.0f}K"]})).mark_text(
-                    align="left", fontSize=11, color="#D32F2F", dy=-10
-                ).encode(x="x:Q", y="y:Q", text="label:N")
-
-                st.altair_chart(_hist_chart + _floor_rule + _floor_label, use_container_width=True)
-                _pct_below = float((_min_spend_dd < _floor_dd).mean()) * 100
-                st.caption(f"**{_pct_below:.1f}%** of simulations have at least one year where real core spending drops below the ${_floor_dd:.0f}K floor. "
-                           "This captures the tail risk from guardrail spending cuts.")
 
     # ================================================================
     # ACCOUNTS (Change 1)
