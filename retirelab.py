@@ -3397,10 +3397,21 @@ def dashboard_page():
 
     hdr_left, hdr_switch, hdr_save_sc, hdr_mid, hdr_right = st.columns([3, 1, 1, 1, 1])
     with hdr_left:
-        outlook_name = cfg.get("scenario", "Base")
+        _hdr_rm = str(cfg.get("return_model", "standard"))
+        if _hdr_rm == "historical":
+            _hdr_hist_yr = int(cfg.get("hist_start_year", 0))
+            if _hdr_hist_yr == 0:
+                _badge_text = "Historical — all periods"
+            else:
+                _notable_h = HISTORICAL_NOTABLE_YEARS.get(_hdr_hist_yr, "")
+                _badge_text = f"Historical — {_hdr_hist_yr}" + (f" ({_notable_h})" if _notable_h else "")
+        elif _hdr_rm == "regime":
+            _badge_text = "Regime-switching"
+        else:
+            _badge_text = f"{cfg.get('scenario', 'Base')} market outlook"
         badges = f"""<span style="display:inline-block; background:#00897B; color:white; padding:2px 12px;
                      border-radius:12px; font-size:0.8rem; font-weight:600; margin-left:12px;
-                     vertical-align:middle;">{outlook_name} market outlook</span>"""
+                     vertical-align:middle;">{_badge_text}</span>"""
         if _active_sc:
             badges += f"""<span style="display:inline-block; background:#1B2A4A; color:white; padding:2px 12px;
                          border-radius:12px; font-size:0.8rem; font-weight:600; margin-left:6px;
