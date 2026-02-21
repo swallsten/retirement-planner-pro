@@ -72,6 +72,121 @@ DEFAULT_TRANSITION_MATRIX = [
 ]
 DEFAULT_REGIME_INITIAL_PROBS = [0.35, 0.50, 0.15]
 
+# Historical returns: nominal total return for US equities (S&P 500 + dividends),
+# 10-year US Treasury total return, T-bill return (cash proxy), and CPI inflation.
+# Sources: Damodaran/NYU annual returns dataset, Shiller CAPE dataset, FRED.
+# REIT proxy: use equity return (REITs didn't exist as an index before 1972).
+# Alternatives proxy: 50/50 equity/bond blend.
+HISTORICAL_RETURNS = {
+    1928: {"eq": 0.4381, "bond": 0.0084, "cash": 0.0308, "infl": -0.0116},
+    1929: {"eq": -0.0830, "bond": 0.0420, "cash": 0.0316, "infl": 0.0058},
+    1930: {"eq": -0.2512, "bond": 0.0454, "cash": 0.0455, "infl": -0.0640},
+    1931: {"eq": -0.4384, "bond": -0.0256, "cash": 0.0231, "infl": -0.0932},
+    1932: {"eq": -0.0864, "bond": 0.0879, "cash": 0.0107, "infl": -0.1027},
+    1933: {"eq": 0.4998, "bond": 0.0186, "cash": 0.0096, "infl": 0.0076},
+    1934: {"eq": -0.0119, "bond": 0.0796, "cash": 0.0028, "infl": 0.0203},
+    1935: {"eq": 0.4674, "bond": 0.0447, "cash": 0.0017, "infl": 0.0299},
+    1936: {"eq": 0.3194, "bond": 0.0502, "cash": 0.0017, "infl": 0.0121},
+    1937: {"eq": -0.3534, "bond": 0.0138, "cash": 0.0028, "infl": 0.0365},
+    1938: {"eq": 0.2928, "bond": 0.0421, "cash": -0.0002, "infl": -0.0278},
+    1939: {"eq": -0.0110, "bond": 0.0441, "cash": 0.0005, "infl": -0.0048},
+    1940: {"eq": -0.1067, "bond": 0.0540, "cash": 0.0004, "infl": 0.0096},
+    1941: {"eq": -0.1277, "bond": -0.0202, "cash": 0.0013, "infl": 0.0972},
+    1942: {"eq": 0.1917, "bond": 0.0229, "cash": 0.0034, "infl": 0.0929},
+    1943: {"eq": 0.2506, "bond": 0.0249, "cash": 0.0038, "infl": 0.0316},
+    1944: {"eq": 0.1903, "bond": 0.0258, "cash": 0.0038, "infl": 0.0211},
+    1945: {"eq": 0.3582, "bond": 0.0380, "cash": 0.0038, "infl": 0.0233},
+    1946: {"eq": -0.0843, "bond": 0.0313, "cash": 0.0038, "infl": 0.1828},
+    1947: {"eq": 0.0520, "bond": 0.0092, "cash": 0.0060, "infl": 0.0871},
+    1948: {"eq": 0.0570, "bond": 0.0195, "cash": 0.0105, "infl": 0.0271},
+    1949: {"eq": 0.1830, "bond": 0.0466, "cash": 0.0112, "infl": -0.0180},
+    1950: {"eq": 0.3081, "bond": 0.0043, "cash": 0.0120, "infl": 0.0579},
+    1951: {"eq": 0.2368, "bond": -0.0030, "cash": 0.0152, "infl": 0.0587},
+    1952: {"eq": 0.1815, "bond": 0.0227, "cash": 0.0172, "infl": 0.0088},
+    1953: {"eq": -0.0121, "bond": 0.0414, "cash": 0.0189, "infl": 0.0062},
+    1954: {"eq": 0.5256, "bond": 0.0329, "cash": 0.0094, "infl": -0.0050},
+    1955: {"eq": 0.3260, "bond": -0.0134, "cash": 0.0172, "infl": 0.0037},
+    1956: {"eq": 0.0744, "bond": -0.0226, "cash": 0.0262, "infl": 0.0286},
+    1957: {"eq": -0.1046, "bond": 0.0680, "cash": 0.0322, "infl": 0.0302},
+    1958: {"eq": 0.4372, "bond": -0.0210, "cash": 0.0177, "infl": 0.0176},
+    1959: {"eq": 0.1206, "bond": -0.0265, "cash": 0.0339, "infl": 0.0150},
+    1960: {"eq": 0.0034, "bond": 0.1164, "cash": 0.0287, "infl": 0.0148},
+    1961: {"eq": 0.2664, "bond": 0.0206, "cash": 0.0235, "infl": 0.0067},
+    1962: {"eq": -0.0881, "bond": 0.0569, "cash": 0.0277, "infl": 0.0122},
+    1963: {"eq": 0.2261, "bond": 0.0168, "cash": 0.0316, "infl": 0.0165},
+    1964: {"eq": 0.1642, "bond": 0.0373, "cash": 0.0355, "infl": 0.0119},
+    1965: {"eq": 0.1240, "bond": 0.0072, "cash": 0.0395, "infl": 0.0192},
+    1966: {"eq": -0.0997, "bond": 0.0291, "cash": 0.0486, "infl": 0.0335},
+    1967: {"eq": 0.2380, "bond": -0.0158, "cash": 0.0429, "infl": 0.0304},
+    1968: {"eq": 0.1081, "bond": 0.0327, "cash": 0.0534, "infl": 0.0472},
+    1969: {"eq": -0.0824, "bond": -0.0501, "cash": 0.0667, "infl": 0.0611},
+    1970: {"eq": 0.0356, "bond": 0.1675, "cash": 0.0639, "infl": 0.0549},
+    1971: {"eq": 0.1422, "bond": 0.0979, "cash": 0.0433, "infl": 0.0336},
+    1972: {"eq": 0.1876, "bond": 0.0282, "cash": 0.0406, "infl": 0.0341},
+    1973: {"eq": -0.1431, "bond": 0.0366, "cash": 0.0704, "infl": 0.0880},
+    1974: {"eq": -0.2590, "bond": 0.0199, "cash": 0.0785, "infl": 0.1220},
+    1975: {"eq": 0.3700, "bond": 0.0361, "cash": 0.0579, "infl": 0.0694},
+    1976: {"eq": 0.2383, "bond": 0.1598, "cash": 0.0498, "infl": 0.0486},
+    1977: {"eq": -0.0698, "bond": 0.0129, "cash": 0.0526, "infl": 0.0670},
+    1978: {"eq": 0.0651, "bond": -0.0078, "cash": 0.0718, "infl": 0.0902},
+    1979: {"eq": 0.1852, "bond": 0.0067, "cash": 0.1005, "infl": 0.1329},
+    1980: {"eq": 0.3174, "bond": -0.0299, "cash": 0.1139, "infl": 0.1252},
+    1981: {"eq": -0.0470, "bond": 0.0820, "cash": 0.1404, "infl": 0.0887},
+    1982: {"eq": 0.2042, "bond": 0.3281, "cash": 0.1109, "infl": 0.0383},
+    1983: {"eq": 0.2234, "bond": 0.0320, "cash": 0.0895, "infl": 0.0380},
+    1984: {"eq": 0.0615, "bond": 0.1373, "cash": 0.0992, "infl": 0.0395},
+    1985: {"eq": 0.3124, "bond": 0.2571, "cash": 0.0772, "infl": 0.0377},
+    1986: {"eq": 0.1849, "bond": 0.2428, "cash": 0.0615, "infl": 0.0118},
+    1987: {"eq": 0.0581, "bond": -0.0496, "cash": 0.0587, "infl": 0.0441},
+    1988: {"eq": 0.1654, "bond": 0.0822, "cash": 0.0676, "infl": 0.0442},
+    1989: {"eq": 0.3148, "bond": 0.1769, "cash": 0.0843, "infl": 0.0465},
+    1990: {"eq": -0.0306, "bond": 0.0618, "cash": 0.0770, "infl": 0.0611},
+    1991: {"eq": 0.3023, "bond": 0.1530, "cash": 0.0556, "infl": 0.0306},
+    1992: {"eq": 0.0749, "bond": 0.0942, "cash": 0.0352, "infl": 0.0290},
+    1993: {"eq": 0.0997, "bond": 0.1424, "cash": 0.0300, "infl": 0.0275},
+    1994: {"eq": 0.0133, "bond": -0.0804, "cash": 0.0415, "infl": 0.0267},
+    1995: {"eq": 0.3720, "bond": 0.2348, "cash": 0.0554, "infl": 0.0254},
+    1996: {"eq": 0.2268, "bond": 0.0143, "cash": 0.0517, "infl": 0.0332},
+    1997: {"eq": 0.3310, "bond": 0.0935, "cash": 0.0518, "infl": 0.0170},
+    1998: {"eq": 0.2834, "bond": 0.1492, "cash": 0.0486, "infl": 0.0161},
+    1999: {"eq": 0.2089, "bond": -0.0825, "cash": 0.0466, "infl": 0.0268},
+    2000: {"eq": -0.0903, "bond": 0.1666, "cash": 0.0582, "infl": 0.0339},
+    2001: {"eq": -0.1185, "bond": 0.0535, "cash": 0.0360, "infl": 0.0155},
+    2002: {"eq": -0.2197, "bond": 0.1512, "cash": 0.0163, "infl": 0.0240},
+    2003: {"eq": 0.2836, "bond": 0.0138, "cash": 0.0102, "infl": 0.0188},
+    2004: {"eq": 0.1074, "bond": 0.0449, "cash": 0.0123, "infl": 0.0326},
+    2005: {"eq": 0.0483, "bond": 0.0287, "cash": 0.0307, "infl": 0.0342},
+    2006: {"eq": 0.1561, "bond": 0.0196, "cash": 0.0474, "infl": 0.0254},
+    2007: {"eq": 0.0548, "bond": 0.1021, "cash": 0.0451, "infl": 0.0408},
+    2008: {"eq": -0.3655, "bond": 0.2025, "cash": 0.0159, "infl": 0.0009},
+    2009: {"eq": 0.2594, "bond": -0.1112, "cash": 0.0014, "infl": 0.0272},
+    2010: {"eq": 0.1482, "bond": 0.0836, "cash": 0.0013, "infl": 0.0150},
+    2011: {"eq": 0.0200, "bond": 0.1604, "cash": 0.0003, "infl": 0.0296},
+    2012: {"eq": 0.1589, "bond": 0.0497, "cash": 0.0005, "infl": 0.0174},
+    2013: {"eq": 0.3215, "bond": -0.0917, "cash": 0.0007, "infl": 0.0150},
+    2014: {"eq": 0.1352, "bond": 0.1075, "cash": 0.0005, "infl": 0.0076},
+    2015: {"eq": 0.0138, "bond": 0.0127, "cash": 0.0005, "infl": 0.0073},
+    2016: {"eq": 0.1177, "bond": 0.0069, "cash": 0.0032, "infl": 0.0207},
+    2017: {"eq": 0.2161, "bond": 0.0221, "cash": 0.0093, "infl": 0.0211},
+    2018: {"eq": -0.0423, "bond": 0.0015, "cash": 0.0193, "infl": 0.0191},
+    2019: {"eq": 0.3122, "bond": 0.0930, "cash": 0.0212, "infl": 0.0231},
+    2020: {"eq": 0.1840, "bond": 0.1126, "cash": 0.0036, "infl": 0.0124},
+    2021: {"eq": 0.2836, "bond": -0.0449, "cash": 0.0005, "infl": 0.0700},
+    2022: {"eq": -0.1821, "bond": -0.1715, "cash": 0.0155, "infl": 0.0650},
+    2023: {"eq": 0.2624, "bond": 0.0396, "cash": 0.0509, "infl": 0.0340},
+    2024: {"eq": 0.2502, "bond": 0.0087, "cash": 0.0517, "infl": 0.0290},
+}
+
+HISTORICAL_NOTABLE_YEARS = {
+    1929: "Great Depression",
+    1937: "1937 Recession",
+    1946: "Post-WWII Adjustment",
+    1966: "Start of Stagflation Era",
+    1973: "Oil Crisis / Nifty Fifty Crash",
+    2000: "Dot-Com Crash + Lost Decade",
+    2007: "Global Financial Crisis",
+}
+
 # ============================================================
 # SECTION 2: Utility functions
 # ============================================================
@@ -946,6 +1061,42 @@ def simulate(cfg: dict, hold: dict) -> dict:
             ])
     regime_track = np.zeros((n, T+1), dtype=int)  # track which regime
 
+    # Historical cycling model setup
+    use_historical = str(cfg.get("return_model", "standard")) == "historical"
+    hist_sim_starts = None
+    hist_eq = None
+    hist_bond = None
+    hist_cash = None
+    hist_infl_arr = None
+    if use_historical:
+        hist_start_year = int(cfg.get("hist_start_year", 0))
+        hist_years_available = sorted(HISTORICAL_RETURNS.keys())
+        max_hist_year = max(hist_years_available)
+        if hist_start_year == 0:
+            # "Test all years" — distribute sims across all valid starting years
+            valid_starts = [y for y in hist_years_available if y + T <= max_hist_year + 1]
+            if not valid_starts:
+                valid_starts = hist_years_available[:1]
+            hist_sim_starts = np.array([valid_starts[i % len(valid_starts)] for i in range(n)], dtype=int)
+        else:
+            hist_sim_starts = np.full(n, hist_start_year, dtype=int)
+
+        # Pre-build return arrays: shape (n, T) — store NOMINAL returns
+        hist_eq = np.zeros((n, T))
+        hist_bond = np.zeros((n, T))
+        hist_cash = np.zeros((n, T))
+        hist_infl_arr = np.zeros((n, T))
+        last_yr_data = HISTORICAL_RETURNS[max_hist_year]
+        for i in range(n):
+            sy = int(hist_sim_starts[i])
+            for t_idx in range(T):
+                yr = sy + t_idx
+                h = HISTORICAL_RETURNS.get(yr, last_yr_data)
+                hist_eq[i, t_idx] = h["eq"]
+                hist_bond[i, t_idx] = h["bond"]
+                hist_cash[i, t_idx] = h["cash"]
+                hist_infl_arr[i, t_idx] = h["infl"]
+
     # taxes — tax engine or legacy flat rates
     use_tax_engine = bool(cfg.get("tax_engine_on", True))
     filing_status = str(cfg.get("filing_status", "mfj"))
@@ -1223,7 +1374,18 @@ def simulate(cfg: dict, hold: dict) -> dict:
         one_alive = alive1 ^ alive2
         none_alive = ~(alive1 | alive2)
 
-        if equity_granular and not (use_regime and t <= regime_states.shape[1]):
+        if use_historical:
+            # Historical cycling: use pre-built return arrays (nominal returns)
+            t_idx = t - 1  # t is 1-based in the loop
+            r_eq = hist_eq[:, t_idx]
+            r_bond = hist_bond[:, t_idx]
+            r_cash = hist_cash[:, t_idx]
+            r_reit = r_eq  # REIT proxy = equity (no separate REIT history pre-1972)
+            r_alt = 0.5 * r_eq + 0.5 * r_bond  # alternatives proxy
+            infl = hist_infl_arr[:, t_idx]
+            home_app = infl + 0.01  # home appreciation ≈ inflation + 1% real (historical avg)
+
+        elif equity_granular and not (use_regime and t <= regime_states.shape[1]):
             # Equity sub-bucket model: draw from expanded covariance matrix
             g_shocks = draw_shocks(rng, n, cov_granular, str(cfg["dist_type"]), int(cfg["t_df"]))
             # g_shocks layout: [sub0..sub5, REIT, Bond, Alt, Cash, Inflation, Home]
@@ -1287,14 +1449,14 @@ def simulate(cfg: dict, hold: dict) -> dict:
 
         infl_index[:, t] = infl_index[:, t-1] * (1 + infl)
 
-        if crash_on:
+        if crash_on and not use_historical:
             crash = rng.uniform(size=n) < crash_prob
             r_eq[crash] = np.clip(r_eq[crash] + crash_eq_extra, -0.95, 2.0)
             r_reit[crash] = np.clip(r_reit[crash] + crash_reit_extra, -0.95, 2.0)
             r_alt[crash] = np.clip(r_alt[crash] + crash_alt_extra, -0.95, 2.0)
             home_app[crash] = np.clip(home_app[crash] + crash_home_extra, -0.95, 2.0)
 
-        if seq_on and age >= seq_start_age and age < seq_start_age + seq_years:
+        if seq_on and not use_historical and age >= seq_start_age and age < seq_start_age + seq_years:
             r_eq = np.clip(r_eq + seq_drop, -0.95, 2.0)
             r_reit = np.clip(r_reit + seq_drop, -0.95, 2.0)
             r_alt = np.clip(r_alt + 0.5 * seq_drop, -0.95, 2.0)
@@ -2092,6 +2254,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
         },
         "infl_index": _f32(infl_index),
         "regime_states": regime_track,
+        "hist_sim_starts": hist_sim_starts,
     }
 
 def summarize_end(paths: np.ndarray) -> dict:
@@ -2769,7 +2932,8 @@ def init_defaults():
     _d("t_df", 7)
 
     # Regime-switching model
-    _d("return_model", "standard")      # "standard" or "regime"
+    _d("return_model", "standard")      # "standard", "regime", or "historical"
+    _d("hist_start_year", 0)              # 0 = test all years
     _d("regime_params", dict(DEFAULT_REGIME_PARAMS))
     _d("regime_transition", [list(row) for row in DEFAULT_TRANSITION_MATRIX])
     _d("regime_initial_probs", list(DEFAULT_REGIME_INITIAL_PROBS))
@@ -3024,7 +3188,7 @@ _SECTION_KEYS = {
     "Health": ["health_model", "ltc_on"],
     "Taxes": ["tax_engine_on", "filing_status", "conv_on", "rmd_on", "gain_harvest_on",
               "irmaa_on", "qcd_on"],
-    "Market": ["return_model", "scenario", "manual_override"],
+    "Market": ["return_model", "scenario", "manual_override", "hist_start_year"],
     "Allocation": ["glide_on", "equity_granular_on"],
     "Stress Tests": ["crash_on", "seq_on"],
     "Advanced": ["n_sims", "seed", "dist_type", "t_df"],
@@ -3043,7 +3207,7 @@ _SECTION_DEFAULTS = {
     "home_on": False, "health_model": "aca_marketplace", "ltc_on": False,
     "tax_engine_on": True, "filing_status": "mfj", "conv_on": False, "rmd_on": True,
     "gain_harvest_on": False, "irmaa_on": False, "qcd_on": False,
-    "return_model": "standard", "scenario": "Base", "manual_override": False,
+    "return_model": "standard", "scenario": "Base", "manual_override": False, "hist_start_year": 0,
     "glide_on": False, "equity_granular_on": False,
     "crash_on": True, "seq_on": False,
     "n_sims": 3000, "seed": 42, "dist_type": "t", "t_df": 7,
@@ -4564,17 +4728,66 @@ def plan_setup_page():
     # ================================================================
     elif section == "Market":
         st.html('<div class="pro-section-title">Return Model</div>')
+        _return_model_options = ["standard", "regime", "historical"]
+        _return_model_current = str(cfg.get("return_model", "standard"))
+        if _return_model_current not in _return_model_options:
+            _return_model_current = "standard"
         cfg["return_model"] = st.selectbox("Return generation model",
-            ["standard", "regime"],
-            index=["standard", "regime"].index(str(cfg.get("return_model", "standard"))),
-            format_func=lambda x: "Standard (single outlook)" if x == "standard" else "Regime-switching (Bull/Normal/Bear cycles)",
+            _return_model_options,
+            index=_return_model_options.index(_return_model_current),
+            format_func=lambda x: {
+                "standard": "Standard (single outlook)",
+                "regime": "Regime-switching (Bull/Normal/Bear cycles)",
+                "historical": "Historical cycling (actual market history)"
+            }[x],
             key="ps_return_model",
-            help="**Standard** uses one set of return assumptions for the whole simulation — simple and transparent. "
-                 "**Regime-switching** models how markets actually behave: long bull runs, occasional bear markets, and "
-                 "transitions between them. This produces more realistic risk estimates because it captures the 'clustering' "
-                 "of bad years that simple models miss.")
+            help="**Standard** uses one set of return assumptions — simple and transparent. "
+                 "**Regime-switching** models bull/bear market cycles for more realistic risk estimates. "
+                 "**Historical** replays actual US market returns from 1928–2024 — "
+                 "answers 'would my plan have survived every historical period?'")
 
-        if cfg["return_model"] == "regime":
+        if cfg["return_model"] == "historical":
+            st.caption("Uses actual S&P 500, Treasury bond, T-bill returns, and CPI inflation from 1928–2024. "
+                       "Each simulation path replays the exact sequence of returns starting from a chosen year. "
+                       "This captures real events like the Great Depression, 1970s stagflation, dot-com crash, and 2008 GFC.")
+
+            _hist_years = sorted(HISTORICAL_RETURNS.keys())
+            _max_horizon = int(cfg.get("end_age", 90)) - int(cfg.get("start_age", 55))
+            _valid_starts = [y for y in _hist_years if y + _max_horizon <= max(_hist_years) + 1]
+
+            _hist_mode = st.radio("Mode",
+                ["Test all starting years", "Pick a specific year"],
+                key="ps_hist_mode",
+                help="'Test all' distributes simulations across all valid starting years — gives you a "
+                     "survival rate across all historical periods. 'Pick a year' runs all simulations "
+                     "using one specific year's sequence — shows exactly what would have happened.")
+
+            if _hist_mode == "Pick a specific year":
+                _notable_in_range = {y: label for y, label in HISTORICAL_NOTABLE_YEARS.items() if y in _valid_starts}
+                if _notable_in_range:
+                    st.caption("Notable periods: " + ", ".join(f"**{y}** ({label})" for y, label in sorted(_notable_in_range.items())))
+
+                if _valid_starts:
+                    _default_yr = min(_valid_starts, key=lambda y: abs(y - 1966))
+                    cfg["hist_start_year"] = st.selectbox("Start year",
+                        _valid_starts,
+                        index=_valid_starts.index(_default_yr),
+                        format_func=lambda y: f"{y}" + (f" — {HISTORICAL_NOTABLE_YEARS[y]}" if y in HISTORICAL_NOTABLE_YEARS else ""),
+                        key="ps_hist_year")
+                else:
+                    st.warning("Your plan horizon exceeds the available historical data (1928–2024). "
+                               "Consider shortening your end age or using a different return model.")
+                    cfg["hist_start_year"] = 1966
+            else:
+                cfg["hist_start_year"] = 0  # sentinel for "all years"
+
+            if _valid_starts:
+                st.info(f"With your {_max_horizon}-year plan horizon, valid starting years are "
+                        f"{min(_valid_starts)}–{max(_valid_starts)} ({len(_valid_starts)} periods).")
+            elif cfg["return_model"] == "historical":
+                st.warning("Your plan horizon exceeds the available historical data. Consider shortening your end age.")
+
+        elif cfg["return_model"] == "regime":
             st.caption("The market alternates between Bull, Normal, and Bear states with different return profiles. "
                        "This better captures real market behavior — long expansions punctuated by sharp downturns — "
                        "compared to a single fixed return assumption.")
@@ -4749,7 +4962,9 @@ def plan_setup_page():
         if not cfg["equity_granular_on"]:
             st.caption("Toggle on to model US Large, US Small, Intl Developed, Emerging, US Value, and Tech/AI as separate asset classes with distinct correlations.")
         if cfg["equity_granular_on"]:
-            if str(cfg.get("return_model", "standard")) == "regime":
+            if str(cfg.get("return_model", "standard")) == "historical":
+                st.warning("⚠️ Equity sub-buckets are not used with historical cycling — returns come directly from historical data.")
+            elif str(cfg.get("return_model", "standard")) == "regime":
                 st.warning("⚠️ Equity sub-buckets use the standard model (not regime-switching). Regime model will be overridden for equity returns.")
             sub_w = dict(cfg.get("equity_sub_weights", {k: v["weight"] for k, v in EQUITY_SUB_DEFAULTS.items()}))
             sub_m = dict(cfg.get("equity_sub_mu", {k: v["mu"] for k, v in EQUITY_SUB_DEFAULTS.items()}))
@@ -4991,6 +5206,8 @@ def deep_dive_page():
     _dd_tabs.extend(["Optimizer", "Retire When?", "Failure Analysis"])
     if str(cfg_run.get("return_model", "standard")) == "regime":
         _dd_tabs.append("Regimes")
+    if str(cfg_run.get("return_model", "standard")) == "historical":
+        _dd_tabs.append("Historical")
     _dd_tabs.append("Reallocation")
 
     # If previously-selected tab was hidden, reset to default
@@ -6100,6 +6317,225 @@ def deep_dive_page():
                 st.info("No regime data available. Run a simulation with regime-switching enabled.")
 
     # ================================================================
+    # HISTORICAL PERIODS
+    # ================================================================
+    elif analysis == "Historical":
+        _hist_model_run = str(cfg_run.get("return_model", "standard"))
+        _hist_model_live = str(cfg.get("return_model", "standard"))
+        if _hist_model_run != "historical":
+            if _hist_model_live == "historical":
+                st.warning("You've enabled historical cycling, but the current results were simulated with a different model. "
+                           "Go to the Dashboard and re-run the simulation to see historical analysis.")
+            else:
+                st.info("Historical cycling is off. Enable it in **Assumptions > Market** to see this analysis.")
+        else:
+            _hist_starts = out.get("hist_sim_starts", None)
+            _hist_cfg_year = int(cfg_run.get("hist_start_year", 0))
+            _hist_end_age = int(cfg_run.get("end_age", 90))
+            _hist_max_data_year = max(HISTORICAL_RETURNS.keys())
+
+            if _hist_starts is None:
+                st.info("No historical simulation data found. Re-run the simulation with historical cycling enabled.")
+            elif _hist_cfg_year == 0:
+                # ---- 4a: All years mode ----
+                st.html('<div class="pro-section-title">Historical Survival Analysis</div>')
+                st.caption(f"Your plan tested against every starting year in US market history (1928–{_hist_max_data_year}). "
+                           "Each row shows what would have happened if you'd retired into that year's market sequence.")
+
+                _unique_starts = sorted(set(int(s) for s in _hist_starts))
+                _ruin_age_hist = out["ruin_age"]
+                _liq_hist = out["liquid"]
+                _hist_table_rows = []
+                _n_survive = 0
+                _n_total = len(_unique_starts)
+
+                for _sy in _unique_starts:
+                    _mask = _hist_starts == _sy
+                    _end_liq = float(np.median(_liq_hist[_mask, -1]))
+                    _ra = _ruin_age_hist[_mask]
+                    _survived = bool(np.median(_ra) > _hist_end_age)
+                    if _survived:
+                        _n_survive += 1
+                    _notable = HISTORICAL_NOTABLE_YEARS.get(_sy, "")
+
+                    _row = {
+                        "Starting Year": _sy,
+                        "Notable Event": _notable,
+                        "End Liquid ($)": fmt_dollars(_end_liq) if _end_liq > 0 else "—",
+                        "Success": "✅" if _survived else "❌",
+                    }
+                    # Add lowest spending year if guardrails are on
+                    if bool(cfg_run.get("gk_on", False)):
+                        _spend_real_h = out["decomp"]["spend_real_track"][_mask, :]
+                        _ret_idx_h = max(0, int(cfg_run.get("retire_age", 62)) - int(ages[0]))
+                        _spend_post = _spend_real_h[:, _ret_idx_h:]
+                        if _spend_post.shape[1] > 0:
+                            _min_spend = float(np.median(np.min(_spend_post, axis=1)))
+                            _row["Lowest Spending (real $)"] = fmt_dollars(_min_spend)
+                    _hist_table_rows.append(_row)
+
+                _survival_pct = _n_survive / _n_total * 100 if _n_total > 0 else 0
+
+                # Summary metric
+                sm1, sm2 = st.columns(2, border=True)
+                with sm1:
+                    _surv_class = "metric-green" if _survival_pct >= 80 else ("metric-navy" if _survival_pct >= 60 else "metric-coral")
+                    st.html(_metric_card_html("Historical Survival Rate", f"{_survival_pct:.0f}%",
+                        f"{_n_survive} of {_n_total} periods", _surv_class))
+                with sm2:
+                    _worst_year = None
+                    _worst_liq = float("inf")
+                    for _r in _hist_table_rows:
+                        if _r["Success"] == "❌":
+                            if _worst_year is None:
+                                _worst_year = _r["Starting Year"]
+                    _worst_txt = f"Starting {_worst_year}" if _worst_year else "None"
+                    st.html(_metric_card_html("Worst Period", _worst_txt,
+                        "first historical failure" if _worst_year else "all periods survived", "metric-coral" if _worst_year else "metric-green"))
+
+                # Table with color-coding
+                _hist_tbl_df = pd.DataFrame(_hist_table_rows)
+                st.dataframe(_hist_tbl_df, use_container_width=True, hide_index=True, height=500)
+
+                # Bar chart: ending liquid by starting year
+                st.html('<div class="pro-section-title">Ending Liquid Assets by Starting Year</div>')
+                _bar_rows = []
+                for _r in _hist_table_rows:
+                    _sy = _r["Starting Year"]
+                    _survived = _r["Success"] == "✅"
+                    _mask = _hist_starts == _sy
+                    _end_val = float(np.median(_liq_hist[_mask, -1])) / 1e6
+                    _bar_rows.append({
+                        "Starting Year": _sy,
+                        "End Liquid ($M)": max(_end_val, -0.1),
+                        "Outcome": "Survived" if _survived else "Failed",
+                    })
+                _bar_df = pd.DataFrame(_bar_rows)
+                _bar_chart = alt.Chart(_bar_df).mark_bar().encode(
+                    x=alt.X("Starting Year:O", title="Starting Year", axis=alt.Axis(labelAngle=-60)),
+                    y=alt.Y("End Liquid ($M):Q", title="Ending Liquid Assets ($M)"),
+                    color=alt.Color("Outcome:N", scale=alt.Scale(
+                        domain=["Survived", "Failed"],
+                        range=["#00897B", "#E53935"])),
+                    tooltip=["Starting Year:O", "Outcome:N",
+                             alt.Tooltip("End Liquid ($M):Q", format=",.1f")]
+                ).properties(height=400)
+                st.altair_chart(_bar_chart, use_container_width=True)
+
+            else:
+                # ---- 4b: Specific year mode ----
+                _notable_name = HISTORICAL_NOTABLE_YEARS.get(_hist_cfg_year, None)
+                _title = f"Retirement as if it were {_hist_cfg_year}"
+                if _notable_name:
+                    _title += f" — {_notable_name}"
+                st.html(f'<div class="pro-section-title">{_title}</div>')
+
+                # Context about the historical period
+                _period_descriptions = {
+                    1929: "The Great Depression devastated markets — the S&P 500 lost ~86% from peak to trough (1929–1932). "
+                          "Deflation was severe but recovery began mid-1930s. Bond returns were modest but stable.",
+                    1937: "The 1937 recession saw a sharp ~49% equity drop within an already-fragile recovery from the Depression. "
+                          "Markets had barely recovered before another major setback.",
+                    1946: "Post-WWII brought a sudden inflation spike (18% in 1946) as wartime price controls were lifted. "
+                          "Equities declined but recovered quickly as the postwar boom took hold.",
+                    1966: "The start of 15 years of poor real returns. High inflation, oil shocks, and stagnant growth — "
+                          "the worst sustained period for retirees in modern US history.",
+                    1973: "The oil embargo and 'Nifty Fifty' crash produced two years of severe losses. "
+                          "Inflation hit double digits and bonds provided poor protection.",
+                    2000: "The dot-com bust wiped out three years of equity gains, then the 2008 GFC struck before portfolios fully recovered — "
+                          "the 'lost decade' where the S&P 500 ended lower than it started.",
+                    2007: "The Global Financial Crisis brought a 37% equity decline in 2008 alone, with real estate and alternatives "
+                          "also falling sharply. One of the steepest drawdowns in history.",
+                }
+                _desc = _period_descriptions.get(_hist_cfg_year,
+                    f"Starting from {_hist_cfg_year}, this simulation replays the actual sequence of US market returns, "
+                    "bond yields, and inflation that occurred historically.")
+                st.caption(_desc)
+
+                # Since all sims use the same returns, show median path (differs only from mortality randomness)
+                _liq_hist = out["liquid"]
+                _ruin_hist = out["ruin_age"]
+                _med_liq = np.median(_liq_hist, axis=0) / 1e6
+                _survived_pct = float((_ruin_hist > _hist_end_age).mean()) * 100
+
+                hm1, hm2 = st.columns(2, border=True)
+                with hm1:
+                    _surv_class = "metric-green" if _survived_pct >= 80 else ("metric-navy" if _survived_pct >= 60 else "metric-coral")
+                    st.html(_metric_card_html("Survival Rate", f"{_survived_pct:.0f}%",
+                        f"starting from {_hist_cfg_year}", _surv_class))
+                with hm2:
+                    _end_liq = float(_med_liq[-1])
+                    st.html(_metric_card_html("Ending Liquid", f"${_end_liq:.1f}M",
+                        "median (nominal)", "metric-green" if _end_liq > 0 else "metric-coral"))
+
+                # Line chart of liquid assets
+                _liq_chart_rows = [{"Age": int(ages[i]), "Liquid ($M)": float(_med_liq[i])} for i in range(len(ages))]
+                _liq_chart_df = pd.DataFrame(_liq_chart_rows)
+                _liq_line = alt.Chart(_liq_chart_df).mark_area(
+                    color="#1B2A4A", opacity=0.3, line={"color": "#1B2A4A", "strokeWidth": 2}
+                ).encode(
+                    x=alt.X("Age:Q", title="Age"),
+                    y=alt.Y("Liquid ($M):Q", title="Liquid Assets ($M nominal)"),
+                    tooltip=["Age:Q", alt.Tooltip("Liquid ($M):Q", format=",.2f")]
+                ).properties(height=350)
+                st.altair_chart(_liq_line, use_container_width=True)
+
+                # Year-by-year action plan for this specific historical scenario
+                st.html('<div class="pro-section-title">Year-by-Year Plan (Historical Scenario)</div>')
+                de = out["decomp"]
+                _ret_idx_h = max(0, int(cfg_run.get("retire_age", 62)) - int(ages[0]))
+                _has_events_h = (np.any(de["event_income"] > 0) or np.any(de["event_expense"] > 0))
+
+                _yy_h_rows = []
+                for idx in range(len(ages)):
+                    _age = int(ages[idx])
+                    row = {
+                        "Age": _age,
+                        "Total Spending": fmt_dollars(float(np.median(de["outflow_total"][:, idx]))),
+                        "SS Income": fmt_dollars(float(np.median(de["ss_inflow"][:, idx]))),
+                        "From Taxable": fmt_dollars(float(np.median(de["gross_tax_wd"][:, idx]))),
+                        "From Trad IRA": fmt_dollars(float(np.median(de["gross_trad_wd"][:, idx] + de["gross_rmd"][:, idx]))),
+                        "From Roth": fmt_dollars(float(np.median(de["gross_roth_wd"][:, idx]))),
+                        "Roth Convert": fmt_dollars(float(np.median(de["conv_gross"][:, idx]))),
+                    }
+                    if _has_events_h:
+                        row["Event Income"] = fmt_dollars(float(np.median(de["event_income"][:, idx])))
+                        row["Event Expenses"] = fmt_dollars(float(np.median(de["event_expense"][:, idx])))
+                    row["Taxes"] = fmt_dollars(float(np.median(de["taxes_paid"][:, idx])))
+                    row["MAGI"] = fmt_dollars(float(np.median(out["magi"][:, idx])))
+                    _yy_h_rows.append(row)
+
+                _yy_h_df = pd.DataFrame(_yy_h_rows)
+                st.dataframe(_yy_h_df, use_container_width=True, hide_index=True, height=400)
+
+                # What the actual market did
+                st.html('<div class="pro-section-title">Actual Market Performance</div>')
+                st.caption(f"Cumulative total returns starting from {_hist_cfg_year}, using actual historical data.")
+                T_plan = len(ages)
+                _cum_eq = [1.0]
+                _cum_bond = [1.0]
+                for t_idx in range(T_plan):
+                    yr = _hist_cfg_year + t_idx
+                    h = HISTORICAL_RETURNS.get(yr, HISTORICAL_RETURNS[_hist_max_data_year])
+                    _cum_eq.append(_cum_eq[-1] * (1 + h["eq"]))
+                    _cum_bond.append(_cum_bond[-1] * (1 + h["bond"]))
+
+                _mkt_rows = []
+                for i, age in enumerate(ages):
+                    _mkt_rows.append({"Age": int(age), "Asset": "S&P 500", "Growth of $1": _cum_eq[i]})
+                    _mkt_rows.append({"Age": int(age), "Asset": "10Y Treasury", "Growth of $1": _cum_bond[i]})
+                _mkt_df = pd.DataFrame(_mkt_rows)
+                _mkt_chart = alt.Chart(_mkt_df).mark_area(opacity=0.3).encode(
+                    x=alt.X("Age:Q", title="Age"),
+                    y=alt.Y("Growth of $1:Q", title="Growth of $1"),
+                    color=alt.Color("Asset:N", scale=alt.Scale(
+                        domain=["S&P 500", "10Y Treasury"],
+                        range=["#1B2A4A", "#FF8F00"])),
+                    tooltip=["Age:Q", "Asset:N", alt.Tooltip("Growth of $1:Q", format=",.2f")]
+                ).properties(height=300)
+                st.altair_chart(_mkt_chart, use_container_width=True)
+
+    # ================================================================
     # REALLOCATION
     # ================================================================
     elif analysis == "Reallocation":
@@ -6160,7 +6596,7 @@ _DIFF_KEYS = [
     ("phase1_mult", "Go-Go Multiplier"), ("phase2_mult", "Slow-Go Multiplier"), ("phase3_mult", "No-Go Multiplier"),
     ("gk_on", "Guardrails On"), ("gk_cut", "Guardrail Cut"), ("gk_raise", "Guardrail Raise"),
     ("scenario", "Market Outlook"), ("manual_override", "Manual Override"),
-    ("return_model", "Return Model"),
+    ("return_model", "Return Model"), ("hist_start_year", "Historical Start Year"),
     ("infl_mu", "Inflation Mean"), ("infl_vol", "Inflation Vol"),
     ("tax_engine_on", "Tax Engine"), ("filing_status", "Filing Status"),
     ("niit_on", "NIIT"), ("state_rate_ordinary", "State Ordinary Rate"),
@@ -6366,7 +6802,7 @@ def compare_page():
         ("Spending Phases", ["phase1_end", "phase2_end", "phase1_mult", "phase2_mult", "phase3_mult"]),
         ("Guardrails", ["gk_on", "gk_upper_pct", "gk_lower_pct", "gk_cut", "gk_raise"]),
         ("Market Outlook", ["scenario", "manual_override", "override_params"]),
-        ("Return Model", ["return_model", "regime_params", "regime_transition", "regime_initial_probs"]),
+        ("Return Model", ["return_model", "regime_params", "regime_transition", "regime_initial_probs", "hist_start_year"]),
         ("Inflation", ["infl_mu", "infl_vol", "infl_min", "infl_max"]),
         ("Tax Engine", ["tax_engine_on", "filing_status", "niit_on",
                         "state_rate_ordinary", "state_rate_capgains"]),
