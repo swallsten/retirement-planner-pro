@@ -3735,34 +3735,18 @@ def plan_setup_page():
     st.html('<div style="font-size:1.8rem; font-weight:700; color:#1B2A4A; margin-bottom:0.5rem;">Plan Setup</div>')
 
     # Section names with completion indicators (Feature 4)
+    # Use bare names for the widget (no checkmarks in labels) to avoid
+    # label-mismatch issues that cause the tab to jump back to Basics.
+    # Instead, show a small "✓" via a caption below.
     _section_names = ["Basics", "Income", "Spending", "Home", "Health", "Taxes", "Market", "Allocation", "Stress Tests", "Advanced"]
-    _section_labels = []
-    _name_to_label = {}
-    for sn in _section_names:
-        if _section_is_customized(cfg, sn):
-            _lbl = f"✓ {sn}"
-        else:
-            _lbl = sn
-        _section_labels.append(_lbl)
-        _name_to_label[sn] = _lbl
-    _label_to_name = dict(zip(_section_labels, _section_names))
 
-    # Fix up the stored widget value if the checkmark prefix changed
-    # (e.g. "Income" → "✓ Income" after adding an event).  Without this,
-    # st.segmented_control can't find the old label and falls back to default.
-    _stored = st.session_state.get("setup_section")
-    if _stored is not None and _stored not in _section_labels:
-        # Try to match the bare name (strip any existing checkmark)
-        _bare = _stored.lstrip("✓ ").strip() if _stored.startswith("✓") else _stored
-        if _bare in _name_to_label:
-            st.session_state["setup_section"] = _name_to_label[_bare]
-
-    section_label = st.segmented_control(
+    section = st.segmented_control(
         "Section",
-        _section_labels,
-        default=_section_labels[0], key="setup_section"
+        _section_names,
+        default="Basics", key="setup_section"
     )
-    section = _label_to_name.get(section_label, "Basics") if section_label else "Basics"
+    if section is None:
+        section = "Basics"
 
     # ================================================================
     # BASICS
@@ -4910,9 +4894,7 @@ def deep_dive_page():
     st.html('<div style="font-size:1.8rem; font-weight:700; color:#1B2A4A; margin-bottom:0.5rem;">Deep Dive Analysis</div>')
 
     if "sim_result" not in st.session_state or "cfg_run" not in st.session_state:
-        st.warning("Run a simulation from the Dashboard first to see detailed analysis.")
-        if st.button("Go to Dashboard", key="dd_go_dash"):
-            st.switch_page("Dashboard")
+        st.warning("Run a simulation from **Results** first to see detailed analysis.")
         return
 
     out = st.session_state["sim_result"]
