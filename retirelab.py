@@ -3624,15 +3624,13 @@ def my_plan_page():
                 help="Download current plan (settings + portfolio) as JSON",
             )
         with _hdr_r_r:
-            with st.popover(":material/upload:", use_container_width=True, help="Upload a saved plan"):
-                up = st.file_uploader(
-                    "Upload a saved .json plan", type=["json", "txt"], key="dash_load",
-                    label_visibility="collapsed",
-                )
-                if up is not None:
-                    # Stash raw bytes in session state; processed at top of page on next rerun
-                    st.session_state["_pending_plan_upload"] = up.read().decode("utf-8")
-                    st.rerun()
+            up = st.file_uploader(
+                "Upload plan", type=["json", "txt"], key="dash_load",
+                label_visibility="collapsed",
+            )
+            if up is not None:
+                st.session_state["_pending_plan_upload"] = up.read().decode("utf-8")
+                st.rerun()
 
     # ==================================================================
     # ONBOARDING WIZARD — shown on first visit (never run yet)
