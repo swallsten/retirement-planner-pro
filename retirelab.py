@@ -3624,13 +3624,20 @@ def my_plan_page():
                 help="Download current plan (settings + portfolio) as JSON",
             )
         with _hdr_r_r:
-            up = st.file_uploader(
-                "Upload plan", type=["json", "txt"], key="dash_load",
-                label_visibility="collapsed",
-            )
-            if up is not None:
-                st.session_state["_pending_plan_upload"] = up.read().decode("utf-8")
-                st.rerun()
+            def _handle_plan_upload():
+                """Callback: fires when file_uploader value changes, before UI re-renders."""
+                up_file = st.session_state.get("dash_load")
+                if up_file is not None:
+                    raw = up_file.read()
+                    if raw:
+                        st.session_state["_pending_plan_upload"] = raw.decode("utf-8")
+
+            with st.popover(":material/upload:", use_container_width=True, help="Upload a saved plan"):
+                st.file_uploader(
+                    "Upload a saved .json plan", type=["json", "txt"], key="dash_load",
+                    label_visibility="collapsed",
+                    on_change=_handle_plan_upload,
+                )
 
     # ==================================================================
     # ONBOARDING WIZARD — shown on first visit (never run yet)
