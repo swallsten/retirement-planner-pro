@@ -166,20 +166,24 @@ def _styles():
     s = getSampleStyleSheet()
     return {
         "title": ParagraphStyle("title", fontName="Helvetica-Bold", fontSize=18,
-                                textColor=NAVY, spaceAfter=2, alignment=TA_LEFT),
-        "subtitle": ParagraphStyle("subtitle", fontName="Helvetica", fontSize=10,
-                                   textColor=colors.HexColor("#666666"), spaceAfter=8),
+                                textColor=NAVY, spaceAfter=4, alignment=TA_LEFT,
+                                leading=22),
+        "subtitle": ParagraphStyle("subtitle", fontName="Helvetica", fontSize=9,
+                                   textColor=colors.HexColor("#666666"), spaceAfter=10,
+                                   leading=12),
         "h2": ParagraphStyle("h2", fontName="Helvetica-Bold", fontSize=14,
-                             textColor=NAVY, spaceBefore=12, spaceAfter=6),
+                             textColor=NAVY, spaceBefore=14, spaceAfter=8,
+                             leading=18),
         "h3": ParagraphStyle("h3", fontName="Helvetica-Bold", fontSize=11,
-                             textColor=TEAL, spaceBefore=8, spaceAfter=4),
+                             textColor=TEAL, spaceBefore=10, spaceAfter=6,
+                             leading=14),
         "body": ParagraphStyle("body", fontName="Helvetica", fontSize=9,
                                textColor=DARK_TEXT, leading=12, spaceAfter=4),
         "body_small": ParagraphStyle("body_small", fontName="Helvetica", fontSize=8,
                                      textColor=colors.HexColor("#555555"), leading=10),
         "verdict": ParagraphStyle("verdict", fontName="Helvetica-Bold", fontSize=11,
                                   textColor=NAVY, alignment=TA_CENTER,
-                                  spaceBefore=6, spaceAfter=6, leading=14),
+                                  spaceBefore=8, spaceAfter=8, leading=15),
         "metric_label": ParagraphStyle("metric_label", fontName="Helvetica", fontSize=8,
                                        textColor=colors.HexColor("#666666"),
                                        alignment=TA_CENTER),
@@ -257,7 +261,7 @@ def _page1_executive_summary(cfg, hold, out, ages, styles) -> list:
     metrics_tbl = Table([m_values, m_header], colWidths=[col_w] * n_cols, hAlign="CENTER")
     metrics_tbl.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, 0), 16),
+        ("FONTSIZE", (0, 0), (-1, 0), 14),
         ("TEXTCOLOR", (0, 0), (-1, 0), NAVY),
         ("ALIGNMENT", (0, 0), (-1, -1), "CENTER"),
         ("FONTNAME", (0, 1), (-1, 1), "Helvetica"),
@@ -473,54 +477,53 @@ def _page3_income_strategy(cfg, hold, out, ages, styles) -> list:
         elements.append(Paragraph("Not enough post-retirement years to display.", styles["body"]))
         return elements
 
-    # Gather series
-    series_map = {
-        "Social Security": np.median(de["ss_inflow"], axis=0)[retire_idx:],
-        "Taxable WD": np.median(de["gross_tax_wd"], axis=0)[retire_idx:],
-        "Traditional/RMD": np.median(de["gross_trad_wd"], axis=0)[retire_idx:],
-        "Roth WD": np.median(de["gross_roth_wd"], axis=0)[retire_idx:],
-        "Roth Conversions": np.median(de["conv_gross"], axis=0)[retire_idx:],
-        "Annuity": np.median(de["annuity_income"], axis=0)[retire_idx:],
-    }
+    # Gather series — use ordered list to control stacking order (bottom to top)
+    series_defs = [
+        ("Social Security",  de["ss_inflow"]),
+        ("Taxable WD",       de["gross_tax_wd"]),
+        ("Traditional/RMD",  de["gross_trad_wd"]),
+        ("Roth WD",          de["gross_roth_wd"]),
+        ("Annuity",          de["annuity_income"]),
+    ]
     if bool(cfg.get("hsa_on", False)):
-        series_map["HSA"] = np.median(de["hsa_used_med"], axis=0)[retire_idx:]
+        series_defs.append(("HSA (Medical)", de["hsa_used_med"]))
 
-    # Filter to nonzero series
-    active_series = {}
-    for name, arr in series_map.items():
-        if np.any(arr > 0):
-            active_series[name] = arr
+    # Conversions shown as overlay line, not stacked
+    conv_raw = np.median(de["conv_gross"], axis=0)[retire_idx:]
 
-    # Colors for income sources
+    # Build active stacked series — clip negatives and filter zeros
+    active_names = []
+    active_data = []
+    for name, raw_arr in series_defs:
+        med = np.clip(np.median(raw_arr, axis=0)[retire_idx:], 0, None)
+        if np.any(med > 0):
+            active_names.append(name)
+            active_data.append(med)
+
+    # Distinct colors — maximally separated hues
     color_map = {
-        "Social Security": "#1565C0",
-        "Taxable WD": "#00897B",
-        "Traditional/RMD": "#E65100",
-        "Roth WD": "#6A1B9A",
-        "Roth Conversions": "#AD1457",
-        "Annuity": "#2E7D32",
-        "HSA": "#00838F",
+        "Social Security":  "#1565C0",  # blue
+        "Taxable WD":       "#F9A825",  # amber
+        "Traditional/RMD":  "#E65100",  # deep orange
+        "Roth WD":          "#6A1B9A",  # purple
+        "Annuity":          "#2E7D32",  # green
+        "HSA (Medical)":    "#00838F",  # teal
+        "Roth Conversions": "#AD1457",  # pink
     }
 
     fig, ax = plt.subplots(figsize=(7.0, 4.0))
 
-    if active_series:
-        # Separate conversions (not stacked with income)
-        conv_data = active_series.pop("Roth Conversions", None)
-
-        # Stack the income sources
-        stack_names = list(active_series.keys())
-        stack_data = np.array([active_series[n] for n in stack_names])
-
-        ax.stackplot(ret_ages, stack_data,
-                     labels=stack_names,
-                     colors=[color_map.get(n, "#888888") for n in stack_names],
+    if active_data:
+        stack_arr = np.array(active_data)
+        ax.stackplot(ret_ages, stack_arr,
+                     labels=active_names,
+                     colors=[color_map.get(n, "#888888") for n in active_names],
                      alpha=0.85)
 
-        # Overlay conversions as a separate line
-        if conv_data is not None and np.any(conv_data > 0):
-            ax.plot(ret_ages, conv_data, color=color_map["Roth Conversions"],
-                    linewidth=1.5, linestyle="--", label="Roth Conversions")
+    # Overlay conversions as a separate line
+    if np.any(conv_raw > 0):
+        ax.plot(ret_ages, conv_raw, color=color_map["Roth Conversions"],
+                linewidth=1.5, linestyle="--", label="Roth Conversions")
 
     ax.set_xlabel("Age", fontsize=9, color="#555555")
     ax.set_ylabel("Annual Income (Nominal $)", fontsize=9, color="#555555")
