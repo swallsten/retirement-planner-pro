@@ -3508,6 +3508,7 @@ def _run_and_store_simulation():
     st.session_state["_cfg_at_last_run"] = copy.deepcopy(dict(cfg))
     st.session_state["_hold_at_last_run"] = copy.deepcopy(dict(hold))
     st.session_state["_has_ever_run"] = True
+    st.session_state.pop("_pdf_bytes", None)  # clear stale PDF cache
     return cfg_run, out
 
 
@@ -3819,20 +3820,28 @@ def my_plan_page():
     st.info(f"{_interp_icon} {_interpretation}")
 
     # ── PDF Report download ──
-    with st.popover(":material/picture_as_pdf: Download PDF Report", use_container_width=False):
-        st.caption("Generate a polished multi-page PDF retirement plan summary.")
-        if st.button("Generate Report", key="gen_pdf_btn", type="primary"):
+    # Generate PDF on demand; cache bytes so download_button can serve them
+    if "_pdf_bytes" not in st.session_state:
+        if st.button(":material/picture_as_pdf: Generate PDF Report", key="gen_pdf_btn"):
             from pdf_report import generate_report_pdf
             _tornado_cache = st.session_state.get("_tornado_df", None)
-            with st.spinner("Generating PDF..."):
-                _pdf_bytes = generate_report_pdf(
+            with st.spinner("Generating PDF report..."):
+                st.session_state["_pdf_bytes"] = generate_report_pdf(
                     cfg_run, hold, out, ages, tornado_df=_tornado_cache,
                 )
+            st.rerun()
+    else:
+        _pdf_dl_l, _pdf_dl_r = st.columns([1, 4])
+        with _pdf_dl_l:
             st.download_button(
-                "Download Report",
-                _pdf_bytes, "retirelab_report.pdf", "application/pdf",
+                ":material/picture_as_pdf: Download Report",
+                st.session_state["_pdf_bytes"], "retirelab_report.pdf", "application/pdf",
                 key="dl_pdf",
             )
+        with _pdf_dl_r:
+            if st.button("Regenerate", key="regen_pdf_btn", help="Regenerate PDF with latest results"):
+                del st.session_state["_pdf_bytes"]
+                st.rerun()
 
     # ---- Spending floor probability ----
     _retire_idx_dash = max(0, int(cfg["retire_age"]) - int(out["ages"][0]))
