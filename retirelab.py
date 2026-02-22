@@ -458,13 +458,17 @@ def compute_federal_tax(
     filing_status: str,              # "mfj" or "single"
     infl_factor: np.ndarray,         # inflation index for bracket adjustment
     niit_on: bool,
+    tax_exempt_interest: np.ndarray = None,  # muni bond interest (added to SS provisional income per IRS rules)
 ) -> dict:
     """Vectorized federal tax computation. All array inputs are (n,).
     Returns dict with component taxes and diagnostic fields."""
     n = len(ordinary_income)
+    if tax_exempt_interest is None:
+        tax_exempt_interest = np.zeros(n)
 
     # 1. SS taxation via provisional income
-    other_for_provisional = ordinary_income + qualified_dividends + ltcg_realized
+    # Per IRS: provisional = other income + tax-exempt interest + 0.5 * SS
+    other_for_provisional = ordinary_income + qualified_dividends + ltcg_realized + tax_exempt_interest
     ss_taxable = compute_ss_taxable(ss_gross, other_for_provisional,
                                      filing_status, infl_factor)
 
@@ -912,7 +916,8 @@ def simulate(cfg: dict, hold: dict) -> dict:
     # HSA
     hsa_on = bool(cfg["hsa_on"])
     hsa0 = float(cfg["hsa_balance0"]) if hsa_on else 0.0
-    hsa_like_ret = bool(cfg["hsa_like_ret"])
+    # Backward compat: old configs have hsa_like_ret (bool), new ones have hsa_invest_mode (str)
+    hsa_invest_mode = str(cfg.get("hsa_invest_mode", "retirement" if bool(cfg.get("hsa_like_ret", True)) else "conservative"))
     hsa_med_real = float(cfg["hsa_med_real"]) if hsa_on else 0.0
 
     taxable = np.zeros((n, T+1)); taxable[:, 0] = start_tax
@@ -1115,6 +1120,8 @@ def simulate(cfg: dict, hold: dict) -> dict:
     eff_div = min(0.95, max(0.0, float(cfg["fed_div"]) + float(cfg["state_capg"])))
     eff_ord = min(0.95, max(0.0, float(cfg["fed_ord"]) + float(cfg["state_ord"])))
     eff_capg_wd = eff_capg * (1 - float(cfg["tlh_reduction"])) if bool(cfg["tlh_on"]) else eff_capg
+    muni_bond_frac = float(cfg.get("muni_bond_frac", 0.0))
+    muni_yield_val = float(cfg.get("muni_yield", 0.03))
     taxable_tax_drag = float(cfg["div_yield"]) * eff_div + float(cfg["dist_yield"]) * eff_capg
 
     # crash + seq stress
@@ -1740,8 +1747,8 @@ def simulate(cfg: dict, hold: dict) -> dict:
                 div_est = tax_prev * (float(cfg["div_yield"]) + float(cfg["dist_yield"]))
                 ordinary_est = ss_est + rmd_preview + div_est + ann_income_this_year + evt_income_taxable_nom
                 infl_factor_t = infl_index[:, t-1]
-                # Use median inflation factor for bracket inflation
-                median_infl = float(np.median(infl_factor_t))
+                # Use lagged inflation for bracket thresholds (CPI-U adjustment lag)
+                median_infl = float(np.median(infl_index[:, max(0, t-2)]))
                 conv_gross = bracket_fill_conversion(
                     ordinary_est, trad_prev, conv_target_bracket,
                     conv_brackets, median_infl, conv_irmaa_aware, conv_irmaa_limit
@@ -1790,6 +1797,22 @@ def simulate(cfg: dict, hold: dict) -> dict:
         dist_yield_val = float(cfg["dist_yield"])
         qual_divs = tax_prev * div_yield_val           # qualified dividends
         infl_factor_t = infl_index[:, t-1]
+        # IRS adjusts brackets based on prior-year chained CPI-U → 1-year lag for "bracket creep"
+        infl_factor_brackets = infl_index[:, max(0, t-2)]
+
+        # Tax-exempt muni bond interest: added to SS provisional income per IRS rules
+        # but NOT included in taxable income. Estimated as taxable balance × bond weight × muni frac × muni yield.
+        if muni_bond_frac > 0 and age >= retire_age:
+            if glide_on:
+                _eq_frac = glide_equity_frac(age, glide_tax_eq_start, glide_tax_eq_end,
+                                             glide_tax_start_age, glide_tax_end_age)
+                _wt_tmp = _build_glide_weights(_eq_frac, base_w_tax)
+                bond_weight_tax = float(_wt_tmp[2])
+            else:
+                bond_weight_tax = float(w_tax[2])
+            muni_interest = tax_prev * bond_weight_tax * muni_bond_frac * muni_yield_val
+        else:
+            muni_interest = np.zeros(n)
 
         # Gain harvesting: step up basis when in 0% LTCG bracket
         gain_harvested = np.zeros(n)
@@ -1797,9 +1820,9 @@ def simulate(cfg: dict, hold: dict) -> dict:
             ss_for_tax = 0.85 * ss_nom
             div_inc = tax_prev * (div_yield_val + dist_yield_val)
             ordinary_income_est = ss_for_tax + taxable_rmd + conv_gross + ann_income_this_year + evt_income_taxable_nom + div_inc
-            std_ded_adj = std_deduction * infl_factor_t
+            std_ded_adj = std_deduction * infl_factor_brackets
             taxable_income_est = np.maximum(0.0, ordinary_income_est - std_ded_adj)
-            ltcg_threshold_adj = ltcg_0pct_threshold * infl_factor_t
+            ltcg_threshold_adj = ltcg_0pct_threshold * infl_factor_brackets
             room = np.maximum(0.0, ltcg_threshold_adj - taxable_income_est)
             unrealized_gain = np.maximum(0.0, tax_prev - bas_prev)
             gain_harvested = np.minimum(room, unrealized_gain)
@@ -1819,13 +1842,19 @@ def simulate(cfg: dict, hold: dict) -> dict:
             # --- Pass 1: estimate taxes before withdrawal ---
             tax_result_1 = compute_federal_tax(
                 ordinary_income_pre, qual_divs, ltcg_pre, ss_nom,
-                filing_status, infl_factor_t, niit_on)
+                filing_status, infl_factor_brackets, niit_on,
+                tax_exempt_interest=muni_interest)
             state_tax_1 = state_rate_ord * np.maximum(0.0, tax_result_1["magi"] - tax_result_1["std_deduction"])
             total_tax_1 = tax_result_1["fed_total"] + state_tax_1
             magi_1 = tax_result_1["magi"]
             magi_track[:, t] = magi_1
 
-            # Estimate effective tax on pre-withdrawal income using marginal rate
+            # Estimate marginal rate for allocating conversion tax payment between accounts.
+            # NOTE: This marginal-rate estimate is only used to decide how much to pull from
+            # taxable vs. trad to *cover* the conversion tax cost mid-loop. The ACTUAL tax on
+            # the conversion is computed correctly via full progressive bracket math in Pass 2
+            # (compute_federal_tax with ordinary_income_final, which includes conv_gross).
+            # Large conversions spanning multiple brackets are handled accurately in Pass 2.
             marg_1 = tax_result_1["marginal_bracket"]
             eff_ord_est = marg_1 + state_rate_ord
 
@@ -1892,7 +1921,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
             # Estimate marginal rates for withdrawal tax
             marg_rate = tax_result_1["marginal_bracket"]
             ltcg_thresh = (LTCG_0PCT_THRESHOLD_MFJ_2024 if filing_status == "mfj"
-                          else LTCG_0PCT_THRESHOLD_SINGLE_2024) * infl_factor_t
+                          else LTCG_0PCT_THRESHOLD_SINGLE_2024) * infl_factor_brackets
             est_capg_rate = np.where(tax_result_1["taxable_ordinary"] < ltcg_thresh,
                                      0.0, 0.15) + state_rate_cg
             est_ord_rate = marg_rate + state_rate_ord
@@ -1932,7 +1961,8 @@ def simulate(cfg: dict, hold: dict) -> dict:
             ltcg_final = ltcg_from_wd + ltcg_pre
             tax_result_2 = compute_federal_tax(
                 ordinary_income_final, qual_divs, ltcg_final, ss_nom,
-                filing_status, infl_factor_t, niit_on)
+                filing_status, infl_factor_brackets, niit_on,
+                tax_exempt_interest=muni_interest)
             state_tax_2 = state_rate_ord * np.maximum(0.0,
                 tax_result_2["taxable_ordinary"]) + state_rate_cg * ltcg_final
             total_tax_2 = tax_result_2["fed_total"] + state_tax_2
@@ -1951,7 +1981,9 @@ def simulate(cfg: dict, hold: dict) -> dict:
 
         else:
             # Legacy flat-rate tax path (pre-retirement or tax_engine_on=False)
-            # Conversion tax (flat rate)
+            # NOTE: This uses a single flat eff_ord rate for conversion tax, which may
+            # under-calculate if a large conversion spans multiple brackets. The full tax
+            # engine path (above) handles multi-bracket spanning correctly via _bracket_tax.
             conv_tax = conv_gross * eff_ord
             pay_from_tax = np.minimum(tax_prev, conv_tax)
             tax_prev -= pay_from_tax
@@ -2047,11 +2079,14 @@ def simulate(cfg: dict, hold: dict) -> dict:
         roth[:, t] = roth_before * (1 + rr)
         basis[:, t] = bas_after
 
-        # HSA growth
+        # HSA growth — "retirement" uses retirement weights, "taxable" uses taxable weights,
+        # "conservative" uses 80/20 bond/cash (legacy default for non-brokerage HSAs)
         if hsa_on:
-            if hsa_like_ret:
+            if hsa_invest_mode == "retirement":
                 hsa[:, t] = hsa_after_med * (1 + rr)
-            else:
+            elif hsa_invest_mode == "taxable":
+                hsa[:, t] = hsa_after_med * (1 + rt)
+            else:  # "conservative"
                 hsa_r = 0.8 * r_bond + 0.2 * r_cash
                 hsa[:, t] = hsa_after_med * (1 + np.clip(hsa_r, -0.95, 2.0))
             hsa_end_track[:, t] = hsa[:, t]
@@ -2111,13 +2146,14 @@ def simulate(cfg: dict, hold: dict) -> dict:
             # Estimate federal + state tax on working income (including taxable events)
             if use_tax_engine:
                 # compute_federal_tax handles standard deduction internally
+                ci_brackets = infl_index[:, max(0, t-2)]  # CPI-U lag for bracket adjustment
                 pre_ret_tax_result = compute_federal_tax(
                     ordinary_income=_pre_ret_total_ordinary,
                     qualified_dividends=np.zeros(n),
                     ltcg_realized=np.zeros(n),
                     ss_gross=np.zeros(n),
                     filing_status=filing_status,
-                    infl_factor=ci,
+                    infl_factor=ci_brackets,
                     niit_on=False,
                 )
                 fed_tax_working = pre_ret_tax_result["fed_total"]
@@ -2996,6 +3032,8 @@ def init_defaults():
     _d("basis_frac", 0.60)
     _d("div_yield", 0.015)
     _d("dist_yield", 0.005)
+    _d("muni_bond_frac", 0.0)        # fraction of taxable-account bonds that are municipal (tax-exempt)
+    _d("muni_yield", 0.03)            # estimated annual muni bond coupon yield (for SS provisional income calc)
     _d("tlh_on", True)
     _d("tlh_reduction", 0.35)
     _d("wd_strategy", "taxable_first")
@@ -3140,7 +3178,8 @@ def init_defaults():
     # HSA
     _d("hsa_on", True)
     _d("hsa_balance0", 34000.0)
-    _d("hsa_like_ret", True)
+    _d("hsa_like_ret", True)          # legacy: kept for backward compat with saved scenarios
+    _d("hsa_invest_mode", "retirement")  # "retirement", "taxable", or "conservative" (80/20 bond/cash)
     _d("hsa_med_real", 9000.0)
     # Pre-retirement income & contributions
     _d("contrib_on", True)
@@ -4685,7 +4724,18 @@ def plan_setup_page():
                 cfg["hsa_balance0"] = st.number_input("Current HSA balance", value=float(cfg["hsa_balance0"]), step=1000.0, key="ps_hsa_bal")
                 cfg["hsa_med_real"] = st.number_input("Annual medical spending (today's $)", value=float(cfg["hsa_med_real"]), step=500.0, key="ps_hsa_med")
             with hs2:
-                cfg["hsa_like_ret"] = st.toggle("Invest HSA like retirement", value=bool(cfg["hsa_like_ret"]), key="ps_hsa_invest")
+                _hsa_modes = ["retirement", "taxable", "conservative"]
+                _hsa_labels = {"retirement": "Like retirement acct", "taxable": "Like taxable acct", "conservative": "Conservative (80/20 bond/cash)"}
+                _cur_mode = str(cfg.get("hsa_invest_mode", "retirement" if bool(cfg.get("hsa_like_ret", True)) else "conservative"))
+                if _cur_mode not in _hsa_modes:
+                    _cur_mode = "retirement"
+                cfg["hsa_invest_mode"] = st.selectbox("HSA investment strategy",
+                    _hsa_modes, index=_hsa_modes.index(_cur_mode),
+                    format_func=lambda x: _hsa_labels[x], key="ps_hsa_invest_mode",
+                    help="How your HSA is invested. Many modern HSAs allow full brokerage access (use retirement or taxable weights). "
+                         "Conservative uses a fixed 80% bonds / 20% cash mix for basic HSA providers.")
+                # Keep hsa_like_ret in sync for backward compat
+                cfg["hsa_like_ret"] = cfg["hsa_invest_mode"] == "retirement"
 
         st.html('<div class="pro-section-title">Long-Term Care Risk</div>')
         cfg["ltc_on"] = st.toggle("Model LTC risk", value=bool(cfg["ltc_on"]), key="ps_ltc_on",
@@ -4764,6 +4814,14 @@ def plan_setup_page():
         with ws2:
             cfg["div_yield"] = st.number_input("Dividend yield", value=float(cfg["div_yield"]), step=0.001, format="%.3f", key="ps_div")
             cfg["dist_yield"] = st.number_input("Cap gains distributions", value=float(cfg["dist_yield"]), step=0.001, format="%.3f", key="ps_dist")
+            cfg["muni_bond_frac"] = st.number_input("Muni bond fraction (of taxable bonds)",
+                value=float(cfg["muni_bond_frac"]), step=0.05, format="%.2f", key="ps_muni_frac", min_value=0.0, max_value=1.0,
+                help="Fraction of your taxable-account bond allocation in municipal bonds. Muni interest is tax-exempt "
+                     "but counts toward Social Security provisional income, which can increase taxable SS benefits.")
+            if float(cfg["muni_bond_frac"]) > 0:
+                cfg["muni_yield"] = st.number_input("Muni coupon yield",
+                    value=float(cfg["muni_yield"]), step=0.005, format="%.3f", key="ps_muni_yield", min_value=0.0,
+                    help="Estimated annual coupon yield on your municipal bonds (typically 3-4%).")
 
         st.html('<div class="pro-section-title">Tax Optimization</div>')
         tl1, tl2 = st.columns(2, border=True)
@@ -6756,7 +6814,13 @@ def analysis_page():
         ret_total = float(hold["total_ret"])
         hsa_total = float(cfg_run.get("hsa_balance0", 0)) if bool(cfg_run.get("hsa_on", False)) else 0.0
 
-        hsa_w = w_ret if bool(cfg_run.get("hsa_like_ret", True)) else {"Equities": 0, "REIT": 0, "Bonds": 0.8, "Alternatives": 0, "Cash": 0.2}
+        _hsa_mode = str(cfg_run.get("hsa_invest_mode", "retirement" if bool(cfg_run.get("hsa_like_ret", True)) else "conservative"))
+        if _hsa_mode == "retirement":
+            hsa_w = w_ret
+        elif _hsa_mode == "taxable":
+            hsa_w = w_tax
+        else:
+            hsa_w = {"Equities": 0, "REIT": 0, "Bonds": 0.8, "Alternatives": 0, "Cash": 0.2}
         w_comb = combined_weights([(tax_total, w_tax), (ret_total, w_ret), (hsa_total, hsa_w)])
         tot_all = tax_total + ret_total + hsa_total
 
@@ -6809,7 +6873,8 @@ _DIFF_KEYS = [
     ("conv_on", "Roth Conversions"), ("conv_start", "Roth Conv Start"),
     ("conv_end", "Roth Conv End"), ("conv_real", "Roth Conv Amount"),
     ("conv_type", "Roth Conv Type"), ("conv_target_bracket", "Target Bracket"),
-    ("gain_harvest_on", "Gain Harvesting"), ("qcd_on", "QCDs"),
+    ("muni_bond_frac", "Muni Bond Fraction"), ("muni_yield", "Muni Yield"),
+    ("hsa_invest_mode", "HSA Investment"), ("gain_harvest_on", "Gain Harvesting"), ("qcd_on", "QCDs"),
     ("qcd_annual_real", "QCD Annual"), ("qcd_start_age", "QCD Start Age"),
     ("glide_on", "Glide Path"), ("glide_tax_eq_start", "Glide Tax Eq Start"),
     ("glide_tax_eq_end", "Glide Tax Eq End"),
@@ -7018,8 +7083,8 @@ def compare_page():
         ("Tax Engine", ["tax_engine_on", "filing_status", "niit_on",
                         "state_rate_ordinary", "state_rate_capgains"]),
         ("Tax Rates", ["fed_capg", "fed_div", "fed_ord", "state_capg", "state_ord"]),
-        ("Tax Strategy", ["basis_frac", "div_yield", "dist_yield", "tlh_on", "tlh_reduction",
-                          "wd_strategy", "rmd_on", "rmd_start_age", "roth_frac"]),
+        ("Tax Strategy", ["basis_frac", "div_yield", "dist_yield", "muni_bond_frac", "muni_yield",
+                          "tlh_on", "tlh_reduction", "wd_strategy", "rmd_on", "rmd_start_age", "roth_frac"]),
         ("Roth Conversions", ["conv_on", "conv_start", "conv_end", "conv_real", "conv_type",
                               "conv_target_bracket", "conv_irmaa_aware", "conv_irmaa_target_tier", "conv_filing_status"]),
         ("Gain Harvesting", ["gain_harvest_on", "gain_harvest_filing"]),
@@ -7041,7 +7106,7 @@ def compare_page():
                   "mortgage_balance0", "mortgage_rate", "mortgage_term_years",
                   "sale_on", "sale_age", "selling_cost_pct", "post_sale_mode", "downsize_fraction", "rent_real"]),
         ("Inheritance", ["inh_on", "inh_min", "inh_mean", "inh_sigma", "inh_prob", "inh_horizon"]),
-        ("HSA", ["hsa_on", "hsa_balance0", "hsa_like_ret", "hsa_med_real"]),
+        ("HSA", ["hsa_on", "hsa_balance0", "hsa_invest_mode", "hsa_like_ret", "hsa_med_real"]),
         ("Pre-Ret Income & Contributions", ["contrib_on", "pretax_income_1", "pretax_income_2",
             "income_growth_real", "pre_ret_spend_real", "contrib_ret_annual", "contrib_roth_401k_frac",
             "contrib_match_annual", "contrib_taxable_annual", "contrib_hsa_annual"]),
