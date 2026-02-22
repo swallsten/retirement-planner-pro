@@ -478,10 +478,12 @@ def _page3_income_strategy(cfg, hold, out, ages, styles) -> list:
         return elements
 
     # Gather series — use ordered list to control stacking order (bottom to top)
+    # Traditional IRA = discretionary withdrawals + RMDs (stored separately in decomp)
+    trad_plus_rmd = de["gross_trad_wd"] + de.get("gross_rmd", np.zeros_like(de["gross_trad_wd"]))
     series_defs = [
         ("Social Security",  de["ss_inflow"]),
         ("Taxable WD",       de["gross_tax_wd"]),
-        ("Traditional/RMD",  de["gross_trad_wd"]),
+        ("Traditional/RMD",  trad_plus_rmd),
         ("Roth WD",          de["gross_roth_wd"]),
         ("Annuity",          de["annuity_income"]),
     ]
