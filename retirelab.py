@@ -3601,25 +3601,32 @@ def my_plan_page():
     with hdr_right:
         _hdr_r_l, _hdr_r_r = st.columns(2)
         with _hdr_r_l:
+            _save_data = {"cfg": dict(cfg), "hold": dict(hold)}
             st.download_button(
                 ":material/download:",
-                json.dumps(cfg, indent=2), "retirelab_config.json", "application/json",
+                json.dumps(_save_data, indent=2), "retirelab_plan.json", "application/json",
                 use_container_width=True, key="dash_save",
-                help="Download current settings as JSON",
+                help="Download current plan (settings + portfolio) as JSON",
             )
         with _hdr_r_r:
             up = st.file_uploader(
                 ":material/upload:", type=["json", "txt"], key="dash_load",
                 label_visibility="collapsed",
-                help="Upload a saved .json config",
+                help="Upload a saved .json plan",
             )
             if up is not None:
                 try:
-                    loaded_cfg = json.loads(up.read().decode("utf-8"))
-                    st.session_state["cfg"] = loaded_cfg
+                    loaded = json.loads(up.read().decode("utf-8"))
+                    # Support both new format {"cfg": ..., "hold": ...} and legacy cfg-only format
+                    if "cfg" in loaded and "hold" in loaded:
+                        st.session_state["cfg"] = loaded["cfg"]
+                        st.session_state["hold"] = loaded["hold"]
+                    else:
+                        # Legacy: entire file is the cfg dict
+                        st.session_state["cfg"] = loaded
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Error loading config: {e}")
+                    st.error(f"Error loading plan: {e}")
 
     # ==================================================================
     # ONBOARDING WIZARD — shown on first visit (never run yet)
