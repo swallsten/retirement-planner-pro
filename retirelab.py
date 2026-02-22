@@ -4268,60 +4268,177 @@ def plan_setup_page():
                            f"Retirement: {fmt_dollars(final_hold['total_ret'])} | "
                            f"Combined: {fmt_dollars(final_hold['total_tax'] + final_hold['total_ret'])}")
 
-                # --- Equity sub-bucket auto-classification from CSV holdings ---
-                all_sub_display = []
-                combined_sub_weights = {c: 0.0 for c in EQUITY_SUB_CLASSES}
-                combined_eq_total = 0.0
+                # --- Classification review & override for CSV holdings ---
+                # Build unified holdings DataFrame with auto-classifications
+                _all_holdings = []
+                _name_col_map = {}  # cache name column per DataFrame
+
+                def _find_name_col(df):
+                    for c in df.columns:
+                        cn = _norm(c)
+                        if cn in ("name", "description", "desc", "holdingname", "securityname",
+                                  "security", "secname", "securitydescription"):
+                            return c
+                    return None
+
+                def _build_holdings_rows(df, valcol, account_label):
+                    rows = []
+                    name_col = _find_name_col(df)
+                    for i, r in df.iterrows():
+                        val = float(r[valcol]) if pd.notna(r[valcol]) else 0.0
+                        if val <= 0:
+                            continue
+                        ticker = _detect_ticker(r)
+                        name = str(r[name_col])[:50] if name_col and pd.notna(r.get(name_col)) else "—"
+                        asset_class = classify_asset(r)
+                        sub_class = classify_equity_sub(r) if asset_class == "Equities" else "—"
+                        rows.append({
+                            "Account": account_label, "Ticker": ticker if ticker else "—",
+                            "Name": name, "Value": val,
+                            "Asset Class": asset_class, "Equity Sub-Class": sub_class,
+                            "_key": f"{account_label}:{ticker or name or i}",
+                        })
+                    return rows
 
                 if tax_ok and tax_df_raw is not None:
-                    sub_w_tax, disp_tax = equity_sub_from_holdings(tax_df_raw, tax_val_raw)
-                    eq_tax_total = float(dollars_tax_u.get("Equities", 0.0))
-                    if not disp_tax.empty:
-                        disp_tax.insert(0, "Account", "Taxable")
-                        all_sub_display.append(disp_tax)
-                    for c in EQUITY_SUB_CLASSES:
-                        combined_sub_weights[c] += sub_w_tax.get(c, 0.0) * eq_tax_total
-                    combined_eq_total += eq_tax_total
-
+                    _all_holdings.extend(_build_holdings_rows(tax_df_raw, tax_val_raw, "Taxable"))
                 if ret_ok and ret_df_raw is not None:
-                    sub_w_ret, disp_ret = equity_sub_from_holdings(ret_df_raw, ret_val_raw)
-                    eq_ret_total = float(dollars_ret_u.get("Equities", 0.0))
-                    if not disp_ret.empty:
-                        disp_ret.insert(0, "Account", "Retirement")
-                        all_sub_display.append(disp_ret)
-                    for c in EQUITY_SUB_CLASSES:
-                        combined_sub_weights[c] += sub_w_ret.get(c, 0.0) * eq_ret_total
-                    combined_eq_total += eq_ret_total
+                    _all_holdings.extend(_build_holdings_rows(ret_df_raw, ret_val_raw, "Retirement"))
 
-                # Normalize combined weights
-                if combined_eq_total > 0:
-                    for c in EQUITY_SUB_CLASSES:
-                        combined_sub_weights[c] /= combined_eq_total
+                if _all_holdings:
+                    _holdings_df = pd.DataFrame(_all_holdings)
 
-                    # Show classification review
-                    with st.expander("🔍 Equity sub-bucket classification from holdings", expanded=False):
-                        st.caption("Each equity holding was classified into a sub-bucket using ticker symbols and description keywords. "
-                                   "Review the mapping below — you can adjust weights in the Allocation section.")
-                        if all_sub_display:
-                            review_df = pd.concat(all_sub_display, ignore_index=True)
-                            review_df["Value"] = review_df["Value"].apply(lambda v: fmt_dollars(v))
-                            st.dataframe(review_df, use_container_width=True, hide_index=True)
+                    # Apply any persisted overrides from session state
+                    _overrides = st.session_state.get("classification_overrides", {})
+                    _n_overrides = 0
+                    for idx, row in _holdings_df.iterrows():
+                        key = row["_key"]
+                        if key in _overrides:
+                            ov = _overrides[key]
+                            if "Asset Class" in ov and ov["Asset Class"] != row["Asset Class"]:
+                                _holdings_df.at[idx, "Asset Class"] = ov["Asset Class"]
+                                _n_overrides += 1
+                                # Reset sub-class if asset class changed away from Equities
+                                if ov["Asset Class"] != "Equities":
+                                    _holdings_df.at[idx, "Equity Sub-Class"] = "—"
+                            if "Equity Sub-Class" in ov and ov["Equity Sub-Class"] != row["Equity Sub-Class"]:
+                                if _holdings_df.at[idx, "Asset Class"] == "Equities":
+                                    _holdings_df.at[idx, "Equity Sub-Class"] = ov["Equity Sub-Class"]
+                                    _n_overrides += 1
 
-                        # Show computed sub-bucket weight summary
+                    # Determine if this is a fresh upload (expand by default)
+                    _just_uploaded = st.session_state.get("_csv_just_uploaded", False)
+                    if tax_file or ret_file:
+                        st.session_state["_csv_just_uploaded"] = True
+                        _just_uploaded = True
+
+                    # Expander label with override count
+                    _exp_label = "🔍 Holdings classification"
+                    if _n_overrides > 0:
+                        _exp_label += f" ({_n_overrides} override{'s' if _n_overrides > 1 else ''})"
+
+                    with st.expander(_exp_label, expanded=_just_uploaded):
+                        st.caption("Auto-classified using ticker symbols and description keywords. "
+                                   "Edit Asset Class or Equity Sub-Class to override any holding.")
+
+                        # Prepare editor DataFrame (drop internal _key column for display)
+                        _edit_df = _holdings_df[["Account", "Ticker", "Name", "Value", "Asset Class", "Equity Sub-Class"]].copy()
+                        _edit_df["Value"] = _edit_df["Value"].round(2)
+
+                        _sub_class_options = EQUITY_SUB_CLASSES + ["—"]
+
+                        edited = st.data_editor(
+                            _edit_df,
+                            column_config={
+                                "Account": st.column_config.TextColumn("Account", disabled=True),
+                                "Ticker": st.column_config.TextColumn("Ticker", disabled=True),
+                                "Name": st.column_config.TextColumn("Name", disabled=True, width="medium"),
+                                "Value": st.column_config.NumberColumn("Value", format="$%.2f", disabled=True),
+                                "Asset Class": st.column_config.SelectboxColumn(
+                                    "Asset Class", options=ASSET_CLASSES, required=True),
+                                "Equity Sub-Class": st.column_config.SelectboxColumn(
+                                    "Equity Sub-Class", options=_sub_class_options, required=True),
+                            },
+                            use_container_width=True, hide_index=True, num_rows="fixed",
+                            key="ps_holdings_editor",
+                        )
+
+                        # Detect and persist overrides
+                        _new_overrides = {}
+                        for idx in range(len(edited)):
+                            key = _holdings_df.iloc[idx]["_key"]
+                            orig_class = _all_holdings[idx]["Asset Class"]
+                            orig_sub = _all_holdings[idx]["Equity Sub-Class"]
+                            new_class = edited.iloc[idx]["Asset Class"]
+                            new_sub = edited.iloc[idx]["Equity Sub-Class"]
+                            if new_class != orig_class or new_sub != orig_sub:
+                                _new_overrides[key] = {"Asset Class": new_class, "Equity Sub-Class": new_sub}
+                        st.session_state["classification_overrides"] = _new_overrides
+
+                        # Recompute weights using edited classifications
+                        _final_class = edited["Asset Class"]
+                        _final_values = _holdings_df["Value"]
+                        _final_accounts = _holdings_df["Account"]
+
+                        # Recompute per-account weights and dollars
+                        for acct_label, acct_key_w, acct_key_d, acct_key_t in [
+                            ("Taxable", "w_tax", "dollars_tax", "total_tax"),
+                            ("Retirement", "w_ret", "dollars_ret", "total_ret"),
+                        ]:
+                            mask = _final_accounts == acct_label
+                            if not mask.any():
+                                continue
+                            acct_classes = _final_class[mask]
+                            acct_vals = _final_values[mask]
+                            total = float(acct_vals.sum())
+                            if total <= 0:
+                                continue
+                            dollars_new = {k: 0.0 for k in ASSET_CLASSES}
+                            for cls, val in zip(acct_classes, acct_vals):
+                                if cls in dollars_new:
+                                    dollars_new[cls] += val
+                            weights_new = {k: dollars_new[k] / total for k in ASSET_CLASSES}
+                            hold[acct_key_t] = total
+                            hold[acct_key_w] = weights_new
+                            hold[acct_key_d] = dollars_new
+                        st.session_state["hold"] = hold
+
+                    # Recompute equity sub-bucket weights from edited classifications
+                    combined_sub_weights = {c: 0.0 for c in EQUITY_SUB_CLASSES}
+                    combined_eq_total = 0.0
+                    eq_mask = edited["Asset Class"] == "Equities"
+                    for idx in range(len(edited)):
+                        if not eq_mask.iloc[idx]:
+                            continue
+                        sub = edited.iloc[idx]["Equity Sub-Class"]
+                        val = _holdings_df.iloc[idx]["Value"]
+                        if sub in combined_sub_weights:
+                            combined_sub_weights[sub] += val
+                        combined_eq_total += val
+
+                    if combined_eq_total > 0:
+                        for c in EQUITY_SUB_CLASSES:
+                            combined_sub_weights[c] /= combined_eq_total
+
+                    # Show sub-bucket weight summary below the expander
+                    if combined_eq_total > 0:
                         sw_df = pd.DataFrame({
                             "Sub-Class": EQUITY_SUB_CLASSES,
-                            "Weight from CSV": [f"{combined_sub_weights[c]:.1%}" for c in EQUITY_SUB_CLASSES],
+                            "Weight": [f"{combined_sub_weights[c]:.1%}" for c in EQUITY_SUB_CLASSES],
                             "Dollar Amount": [fmt_dollars(combined_sub_weights[c] * combined_eq_total) for c in EQUITY_SUB_CLASSES],
                         })
                         st.dataframe(sw_df, use_container_width=True, hide_index=True)
-                        st.info(f"Total equities classified: {fmt_dollars(combined_eq_total)}")
 
                     # Auto-populate sub-bucket weights in config
                     cfg["equity_sub_weights"] = combined_sub_weights
                     # Auto-enable granular mode when we have CSV-derived sub-bucket data
-                    if not cfg.get("equity_granular_on", False):
+                    if combined_eq_total > 0 and not cfg.get("equity_granular_on", False):
                         cfg["equity_granular_on"] = True
                         st.toast("📊 Equity sub-bucket detail auto-enabled from CSV holdings", icon="📊")
+
+                    # Clear fresh-upload flag after first render
+                    if _just_uploaded:
+                        st.session_state["_csv_just_uploaded"] = False
             elif not tax_file and not ret_file:
                 st.info("Upload one or both CSV files above. You can also use Manual entry.")
         else:
@@ -6178,6 +6295,167 @@ def analysis_page():
                 for c in dollar_cols:
                     tb_df[c] = tb_df[c].apply(fmt_dollars)
                 st.dataframe(tb_df, use_container_width=True, hide_index=True, height=500)
+
+                # --- Tax Cliff Proximity Warnings ---
+                _irmaa_on_run = bool(cfg_run.get("irmaa_on", False))
+                _filing = str(cfg_run.get("conv_filing_status", cfg_run.get("filing_status", "mfj")))
+                _medicare_age = int(cfg_run.get("medicare_age", 65))
+                _is_mfj = _filing == "mfj"
+                _irmaa_magi_tiers = IRMAA_MAGI_TIERS_MFJ_2024 if _is_mfj else IRMAA_MAGI_TIERS_SINGLE_2024
+                _irmaa_b_sched = cfg_run.get("irmaa_part_b_schedule",
+                    IRMAA_PART_B_2024_MFJ if _is_mfj else IRMAA_PART_B_2024_SINGLE)
+                _irmaa_d_sched = cfg_run.get("irmaa_part_d_schedule",
+                    IRMAA_PART_D_2024_MFJ if _is_mfj else IRMAA_PART_D_2024_SINGLE)
+                _brackets = FED_BRACKETS_MFJ_2024 if _is_mfj else FED_BRACKETS_SINGLE_2024
+                _std_ded_base = STANDARD_DEDUCTION_MFJ_2024 if _is_mfj else STANDARD_DEDUCTION_SINGLE_2024
+                _people_mult = 2 if _is_mfj else 1  # both spouses pay IRMAA
+                _cliff_warn_dist = 10000  # warn when within $10K of a cliff
+
+                if not _irmaa_on_run:
+                    st.info("💡 IRMAA is not enabled. Enable it in Assumptions → Health to see Medicare surcharge cliff warnings.")
+                else:
+                    # Compute IRMAA cliff proximity for each retirement year
+                    _irmaa_warnings = []
+                    _magi_chart_rows = []
+                    _irmaa_lines = []  # for chart threshold lines
+
+                    for idx, age in enumerate(ages):
+                        if age < retire_age:
+                            continue
+                        med_infl = float(np.median(infl_idx[:, idx]))
+                        # MAGI for IRMAA uses 2-year lookback
+                        lookback_idx = max(0, idx - 2)
+                        med_magi = float(np.median(out["magi"][:, lookback_idx]))
+
+                        _magi_chart_rows.append({"Age": int(age), "MAGI (lookback)": med_magi, "_infl": med_infl})
+
+                        if age < _medicare_age:
+                            continue
+
+                        # Find current IRMAA tier and distance to next
+                        current_tier = -1  # below all tiers
+                        for ti, tier_base in enumerate(_irmaa_magi_tiers):
+                            tier_adj = tier_base * med_infl
+                            if med_magi >= tier_adj:
+                                current_tier = ti
+                        # Distance to next tier above current
+                        next_tier_idx = current_tier + 1
+                        if next_tier_idx < len(_irmaa_magi_tiers):
+                            next_tier_base = _irmaa_magi_tiers[next_tier_idx]
+                            next_tier_adj = next_tier_base * med_infl
+                            distance = next_tier_adj - med_magi
+                            if 0 < distance < _cliff_warn_dist:
+                                # Calculate surcharge cost of crossing
+                                b_surcharge = _irmaa_b_sched[next_tier_idx][1] if next_tier_idx < len(_irmaa_b_sched) else 0
+                                d_surcharge = _irmaa_d_sched[next_tier_idx][1] if next_tier_idx < len(_irmaa_d_sched) else 0
+                                annual_cost = (b_surcharge + d_surcharge) * 12 * _people_mult
+                                # Inflate the surcharge cost too
+                                annual_cost *= med_infl
+                                _irmaa_warnings.append({
+                                    "age": int(age), "distance": distance,
+                                    "tier": next_tier_idx + 1,
+                                    "threshold": next_tier_adj,
+                                    "annual_cost": annual_cost,
+                                })
+
+                    # Federal bracket cliff proximity (all retirement years)
+                    _bracket_warnings = []
+                    for idx, age in enumerate(ages):
+                        if age < retire_age:
+                            continue
+                        med_infl = float(np.median(infl_idx[:, idx]))
+                        med_magi = float(np.median(out["magi"][:, idx]))
+                        std_ded_adj = _std_ded_base * med_infl
+                        taxable_inc_est = max(0, med_magi - std_ded_adj)
+                        # Find current bracket and distance to next
+                        for bi in range(len(_brackets) - 1):
+                            thresh, rate = _brackets[bi]
+                            next_thresh, next_rate = _brackets[bi + 1]
+                            adj_thresh = next_thresh * med_infl
+                            if thresh * med_infl <= taxable_inc_est < adj_thresh:
+                                distance = adj_thresh - taxable_inc_est
+                                if 0 < distance < _cliff_warn_dist:
+                                    _bracket_warnings.append({
+                                        "age": int(age), "distance": distance,
+                                        "current_rate": rate, "next_rate": next_rate,
+                                        "threshold": adj_thresh,
+                                    })
+                                break
+
+                    # Display IRMAA warnings
+                    if _irmaa_warnings:
+                        st.html('<div class="pro-section-title">⚠️ IRMAA Cliff Warnings</div>')
+                        for w in _irmaa_warnings:
+                            st.warning(
+                                f"**Age {w['age']}:** MAGI is ~${w['distance']:,.0f} below IRMAA Tier {w['tier']} "
+                                f"(${w['threshold']:,.0f} for {_filing.upper()}). "
+                                f"Crossing adds ~**${w['annual_cost']:,.0f}/yr** in Medicare surcharges. "
+                                f"Consider capping Roth conversions or using QCDs."
+                            )
+
+                    # Display federal bracket warnings
+                    if _bracket_warnings:
+                        st.html('<div class="pro-section-title">📊 Federal Bracket Proximity</div>')
+                        for w in _bracket_warnings[:5]:  # cap at 5 to avoid clutter
+                            st.info(
+                                f"**Age {w['age']}:** Taxable income is ~${w['distance']:,.0f} below the "
+                                f"{w['next_rate']:.0%} bracket (${w['threshold']:,.0f}). "
+                                f"Currently in the {w['current_rate']:.0%} bracket."
+                            )
+
+                    # IRMAA Danger Zone Chart
+                    if _magi_chart_rows:
+                        st.html('<div class="pro-section-title">MAGI vs IRMAA Thresholds</div>')
+                        _chart_df = pd.DataFrame(_magi_chart_rows)
+                        # Add danger zone flag
+                        _chart_df["Zone"] = "Normal"
+                        for _, row in _chart_df.iterrows():
+                            _med_infl = row["_infl"]
+                            _magi_val = row["MAGI (lookback)"]
+                            for tier_base in _irmaa_magi_tiers:
+                                tier_adj = tier_base * _med_infl
+                                if abs(_magi_val - tier_adj) < _cliff_warn_dist:
+                                    _chart_df.loc[_chart_df["Age"] == row["Age"], "Zone"] = "⚠️ Near Cliff"
+                                    break
+
+                        # Build IRMAA threshold lines (inflation-adjusted per year)
+                        _tier_labels = [f"Tier {i+1}" for i in range(len(_irmaa_magi_tiers))]
+                        _threshold_rows = []
+                        for _, row in _chart_df.iterrows():
+                            for ti, tier_base in enumerate(_irmaa_magi_tiers):
+                                _threshold_rows.append({
+                                    "Age": row["Age"],
+                                    "Threshold": tier_base * row["_infl"],
+                                    "IRMAA Tier": _tier_labels[ti],
+                                })
+                        _thresh_df = pd.DataFrame(_threshold_rows)
+
+                        # MAGI line colored by zone
+                        magi_line = alt.Chart(_chart_df).mark_line(strokeWidth=3).encode(
+                            x=alt.X("Age:Q", title="Age"),
+                            y=alt.Y("MAGI (lookback):Q", title="MAGI ($)", axis=alt.Axis(format="$,.0f")),
+                            color=alt.Color("Zone:N", scale=alt.Scale(
+                                domain=["Normal", "⚠️ Near Cliff"],
+                                range=["#1B2A4A", "#E53935"])),
+                            tooltip=[alt.Tooltip("Age:Q"), alt.Tooltip("MAGI (lookback):Q", format="$,.0f"), "Zone:N"],
+                        )
+                        # IRMAA threshold lines (dashed)
+                        tier_lines = alt.Chart(_thresh_df).mark_line(
+                            strokeDash=[6, 4], strokeWidth=1.5, opacity=0.6
+                        ).encode(
+                            x="Age:Q",
+                            y=alt.Y("Threshold:Q"),
+                            color=alt.Color("IRMAA Tier:N", scale=alt.Scale(scheme="oranges"),
+                                            legend=alt.Legend(title="IRMAA Tiers")),
+                            tooltip=[alt.Tooltip("Age:Q"), alt.Tooltip("Threshold:Q", format="$,.0f"), "IRMAA Tier:N"],
+                        )
+                        cliff_chart = (magi_line + tier_lines).properties(
+                            height=350, title="MAGI vs IRMAA Tier Thresholds (inflation-adjusted)"
+                        )
+                        st.altair_chart(cliff_chart, use_container_width=True)
+                        st.caption("Blue/red line = median MAGI (2-year lookback for IRMAA). "
+                                   "Red segments indicate MAGI within $10K of an IRMAA threshold. "
+                                   "Dashed lines = IRMAA tier thresholds (inflation-adjusted).")
             else:
                 st.info("No retirement-age data to display.")
         else:
