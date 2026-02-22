@@ -3614,18 +3614,7 @@ def my_plan_page():
                         st.session_state["_active_scenario_name"] = _sc_name
                         st.rerun()
     with hdr_right:
-        _has_sim = "sim_result" in st.session_state and "cfg_run" in st.session_state
-        if _has_sim:
-            _hdr_r_pdf, _hdr_r_l, _hdr_r_r = st.columns(3)
-        else:
-            _hdr_r_pdf = None
-            _hdr_r_l, _hdr_r_r = st.columns(2)
-        if _has_sim and _hdr_r_pdf is not None:
-            with _hdr_r_pdf:
-                if st.button(":material/picture_as_pdf:", use_container_width=True,
-                             key="gen_pdf_btn", help="Generate & download PDF report"):
-                    st.session_state["_pdf_requested"] = True
-                    st.rerun()
+        _hdr_r_l, _hdr_r_r = st.columns(2)
         with _hdr_r_l:
             _save_data = {"cfg": dict(cfg), "hold": dict(hold)}
             st.download_button(
@@ -3726,20 +3715,6 @@ def my_plan_page():
     liquid_real = out["liquid_real"]
     net_worth_real = out["net_worth_real"]
 
-    # ── PDF report generation (deferred: only runs when button was clicked) ──
-    if st.session_state.pop("_pdf_requested", False):
-        from pdf_report import generate_report_pdf
-        _tornado_cache = st.session_state.get("_tornado_df", None)
-        with st.spinner("Generating PDF report..."):
-            _pdf_bytes = generate_report_pdf(
-                cfg_run, hold, out, ages, tornado_df=_tornado_cache,
-            )
-        st.download_button(
-            ":material/picture_as_pdf: Download Report",
-            _pdf_bytes, "retirelab_report.pdf", "application/pdf",
-            use_container_width=True, key="dl_pdf",
-        )
-
     sL = summarize_end(liquid)
     sN = summarize_end(net_worth)
     sLr = summarize_end(liquid_real)
@@ -3835,6 +3810,22 @@ def my_plan_page():
     else:
         _interp_icon = "🔴"
     st.info(f"{_interp_icon} {_interpretation}")
+
+    # ── PDF Report download ──
+    with st.popover(":material/picture_as_pdf: Download PDF Report", use_container_width=False):
+        st.caption("Generate a polished multi-page PDF retirement plan summary.")
+        if st.button("Generate Report", key="gen_pdf_btn", type="primary"):
+            from pdf_report import generate_report_pdf
+            _tornado_cache = st.session_state.get("_tornado_df", None)
+            with st.spinner("Generating PDF..."):
+                _pdf_bytes = generate_report_pdf(
+                    cfg_run, hold, out, ages, tornado_df=_tornado_cache,
+                )
+            st.download_button(
+                "Download Report",
+                _pdf_bytes, "retirelab_report.pdf", "application/pdf",
+                key="dl_pdf",
+            )
 
     # ---- Spending floor probability ----
     _retire_idx_dash = max(0, int(cfg["retire_age"]) - int(out["ages"][0]))
