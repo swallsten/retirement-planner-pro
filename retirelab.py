@@ -3608,14 +3608,18 @@ def my_plan_page():
                 help="Download current settings as JSON",
             )
         with _hdr_r_r:
-            with st.popover(":material/upload:", use_container_width=True):
-                up = st.file_uploader(
-                    "Upload a saved .json config", type=["json", "txt"], key="dash_load",
-                    label_visibility="collapsed",
-                )
-                if up is not None:
-                    st.session_state["cfg"] = json.loads(up.read().decode("utf-8"))
+            up = st.file_uploader(
+                ":material/upload:", type=["json", "txt"], key="dash_load",
+                label_visibility="collapsed",
+                help="Upload a saved .json config",
+            )
+            if up is not None:
+                try:
+                    loaded_cfg = json.loads(up.read().decode("utf-8"))
+                    st.session_state["cfg"] = loaded_cfg
                     st.rerun()
+                except Exception as e:
+                    st.error(f"Error loading config: {e}")
 
     # ==================================================================
     # ONBOARDING WIZARD — shown on first visit (never run yet)
