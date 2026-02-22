@@ -3512,6 +3512,20 @@ def _run_and_store_simulation():
 
 # ---- 8a: My Plan page ----
 def my_plan_page():
+    # Process any pending JSON upload (set by file_uploader in popover on previous rerun)
+    _pending = st.session_state.pop("_pending_plan_upload", None)
+    if _pending is not None:
+        try:
+            loaded = json.loads(_pending)
+            if "cfg" in loaded and "hold" in loaded:
+                st.session_state["cfg"] = loaded["cfg"]
+                st.session_state["hold"] = loaded["hold"]
+            else:
+                st.session_state["cfg"] = loaded
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error loading plan: {e}")
+
     cfg = st.session_state["cfg"]
     hold = st.session_state["hold"]
 
@@ -3609,24 +3623,15 @@ def my_plan_page():
                 help="Download current plan (settings + portfolio) as JSON",
             )
         with _hdr_r_r:
-            up = st.file_uploader(
-                ":material/upload:", type=["json", "txt"], key="dash_load",
-                label_visibility="collapsed",
-                help="Upload a saved .json plan",
-            )
-            if up is not None:
-                try:
-                    loaded = json.loads(up.read().decode("utf-8"))
-                    # Support both new format {"cfg": ..., "hold": ...} and legacy cfg-only format
-                    if "cfg" in loaded and "hold" in loaded:
-                        st.session_state["cfg"] = loaded["cfg"]
-                        st.session_state["hold"] = loaded["hold"]
-                    else:
-                        # Legacy: entire file is the cfg dict
-                        st.session_state["cfg"] = loaded
+            with st.popover(":material/upload:", use_container_width=True, help="Upload a saved plan"):
+                up = st.file_uploader(
+                    "Upload a saved .json plan", type=["json", "txt"], key="dash_load",
+                    label_visibility="collapsed",
+                )
+                if up is not None:
+                    # Stash raw bytes in session state; processed at top of page on next rerun
+                    st.session_state["_pending_plan_upload"] = up.read().decode("utf-8")
                     st.rerun()
-                except Exception as e:
-                    st.error(f"Error loading plan: {e}")
 
     # ==================================================================
     # ONBOARDING WIZARD — shown on first visit (never run yet)
