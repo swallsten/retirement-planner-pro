@@ -3622,21 +3622,10 @@ def my_plan_page():
             _hdr_r_l, _hdr_r_r = st.columns(2)
         if _has_sim and _hdr_r_pdf is not None:
             with _hdr_r_pdf:
-                from pdf_report import generate_report_pdf
-                _pdf_out = st.session_state["sim_result"]
-                _pdf_cfg_run = st.session_state["cfg_run"]
-                _pdf_ages = _pdf_out["ages"]
-                _tornado_cache = st.session_state.get("_tornado_df", None)
-                _pdf_bytes = generate_report_pdf(
-                    _pdf_cfg_run, hold, _pdf_out, _pdf_ages,
-                    tornado_df=_tornado_cache,
-                )
-                st.download_button(
-                    ":material/picture_as_pdf:",
-                    _pdf_bytes, "retirelab_report.pdf", "application/pdf",
-                    use_container_width=True, key="dl_pdf",
-                    help="Download a polished PDF retirement plan report",
-                )
+                if st.button(":material/picture_as_pdf:", use_container_width=True,
+                             key="gen_pdf_btn", help="Generate & download PDF report"):
+                    st.session_state["_pdf_requested"] = True
+                    st.rerun()
         with _hdr_r_l:
             _save_data = {"cfg": dict(cfg), "hold": dict(hold)}
             st.download_button(
@@ -3736,6 +3725,20 @@ def my_plan_page():
     net_worth = out["net_worth"]
     liquid_real = out["liquid_real"]
     net_worth_real = out["net_worth_real"]
+
+    # ── PDF report generation (deferred: only runs when button was clicked) ──
+    if st.session_state.pop("_pdf_requested", False):
+        from pdf_report import generate_report_pdf
+        _tornado_cache = st.session_state.get("_tornado_df", None)
+        with st.spinner("Generating PDF report..."):
+            _pdf_bytes = generate_report_pdf(
+                cfg_run, hold, out, ages, tornado_df=_tornado_cache,
+            )
+        st.download_button(
+            ":material/picture_as_pdf: Download Report",
+            _pdf_bytes, "retirelab_report.pdf", "application/pdf",
+            use_container_width=True, key="dl_pdf",
+        )
 
     sL = summarize_end(liquid)
     sN = summarize_end(net_worth)
