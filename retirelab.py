@@ -2273,6 +2273,13 @@ def summarize_end(paths: np.ndarray) -> dict:
 
 OPTIMIZER_CONV_LEVELS = [0, 25000, 50000, 75000, 100000, 150000, 200000]
 OPTIMIZER_CONV_LABELS = ["$0", "$25k", "$50k", "$75k", "$100k", "$150k", "$200k"]
+# Bracket-fill strategies: (target_bracket, irmaa_aware)
+OPTIMIZER_BRACKET_FILLS = [
+    (0.22, True,  "Fill 22% (IRMAA cap)"),
+    (0.24, True,  "Fill 24% (IRMAA cap)"),
+    (0.24, False, "Fill 24% (no IRMAA cap)"),
+    (0.32, True,  "Fill 32% (IRMAA cap)"),
+]
 OPTIMIZER_WD_STRATEGIES = ["taxable_first", "pro_rata"]
 OPTIMIZER_WD_LABELS = {"taxable_first": "Taxable first", "pro_rata": "Pro rata"}
 OPTIMIZER_OBJECTIVES = {
@@ -2301,8 +2308,26 @@ def run_optimizer(cfg: dict, hold: dict, objective: str) -> dict:
     out_base = simulate(cfg_base, hold)
     base_score = _eval_objective(out_base, cfg_base, objective)
 
-    # Grid search: conversion levels × withdrawal strategies
+    # Grid search: (fixed conversion levels + bracket_fill strategies) × withdrawal strategies
     candidates = []
+
+    def _record_candidate(cfg_trial, wd_strat, conv_label, conv_level_num):
+        cfg_trial["seed"] = int(cfg.get("seed", 42)) + hash((conv_label, wd_strat)) % 10000
+        out_trial = simulate(cfg_trial, hold)
+        score = _eval_objective(out_trial, cfg_trial, objective)
+        candidates.append({
+            "conv_level": conv_level_num,
+            "conv_label": conv_label,
+            "wd_strategy": wd_strat,
+            "score": score,
+            "success_rate": _success_rate(out_trial, cfg_trial),
+            "median_legacy": float(np.median(out_trial["legacy"])),
+            "median_tax": float(np.median(out_trial["decomp"]["taxes_paid"].sum(axis=1)
+                                          + out_trial["decomp"]["irmaa"].sum(axis=1))),
+            "spend_vol": float(np.std(out_trial["decomp"]["core_adjusted"][:, -1] /
+                                      np.maximum(out_trial["infl_index"][:, -1], 1e-9))),
+        })
+
     for conv_level in OPTIMIZER_CONV_LEVELS:
         for wd_strat in OPTIMIZER_WD_STRATEGIES:
             cfg_trial = dict(cfg)
@@ -2314,20 +2339,20 @@ def run_optimizer(cfg: dict, hold: dict, objective: str) -> dict:
                 cfg_trial["conv_on"] = True
                 cfg_trial["conv_type"] = "fixed"
                 cfg_trial["conv_real"] = float(conv_level)
-            # Each combo gets a different seed to reduce noise
-            cfg_trial["seed"] = int(cfg.get("seed", 42)) + hash((conv_level, wd_strat)) % 10000
-            out_trial = simulate(cfg_trial, hold)
-            score = _eval_objective(out_trial, cfg_trial, objective)
-            candidates.append({
-                "conv_level": conv_level,
-                "wd_strategy": wd_strat,
-                "score": score,
-                "success_rate": _success_rate(out_trial, cfg_trial),
-                "median_legacy": float(np.median(out_trial["legacy"])),
-                "median_tax": float(np.median(out_trial["decomp"]["taxes_paid"].sum(axis=1))),
-                "spend_vol": float(np.std(out_trial["decomp"]["core_adjusted"][:, -1] /
-                                          np.maximum(out_trial["infl_index"][:, -1], 1e-9))),
-            })
+            lbl = f"${conv_level:,}/yr" if conv_level > 0 else "None"
+            _record_candidate(cfg_trial, wd_strat, lbl, conv_level)
+
+    # Bracket-fill strategies
+    for target_bracket, irmaa_aware, bf_label in OPTIMIZER_BRACKET_FILLS:
+        for wd_strat in OPTIMIZER_WD_STRATEGIES:
+            cfg_trial = dict(cfg)
+            cfg_trial["n_sims"] = n_fast
+            cfg_trial["wd_strategy"] = wd_strat
+            cfg_trial["conv_on"] = True
+            cfg_trial["conv_type"] = "bracket_fill"
+            cfg_trial["conv_target_bracket"] = target_bracket
+            cfg_trial["conv_irmaa_aware"] = irmaa_aware
+            _record_candidate(cfg_trial, wd_strat, bf_label, -1)
 
     # Sort by objective (lower is better for ruin/vol/taxes, higher for legacy)
     reverse = objective == "legacy"
@@ -2340,7 +2365,8 @@ def run_optimizer(cfg: dict, hold: dict, objective: str) -> dict:
             "score": base_score,
             "success_rate": _success_rate(out_base, cfg_base),
             "median_legacy": float(np.median(out_base["legacy"])),
-            "median_tax": float(np.median(out_base["decomp"]["taxes_paid"].sum(axis=1))),
+            "median_tax": float(np.median(out_base["decomp"]["taxes_paid"].sum(axis=1)
+                                          + out_base["decomp"]["irmaa"].sum(axis=1))),
         },
         "elapsed": elapsed,
         "objective": objective,
@@ -2365,8 +2391,10 @@ def _eval_objective(out: dict, cfg: dict, objective: str) -> float:
         # Higher is better: median legacy
         return float(np.median(out["legacy"]))
     elif objective == "taxes":
-        # Lower is better: median lifetime taxes
-        return float(np.median(out["decomp"]["taxes_paid"].sum(axis=1)))
+        # Lower is better: median lifetime taxes + IRMAA surcharges
+        taxes = out["decomp"]["taxes_paid"].sum(axis=1)
+        irmaa = out["decomp"]["irmaa"].sum(axis=1)
+        return float(np.median(taxes + irmaa))
     return 0.0
 
 
@@ -6231,7 +6259,7 @@ def analysis_page():
 
             # Best candidate
             best = candidates[0]
-            conv_lbl = f"${best['conv_level']:,}/yr" if best["conv_level"] > 0 else "No conversions"
+            conv_lbl = best.get("conv_label", f"${best['conv_level']:,}/yr" if best["conv_level"] > 0 else "No conversions")
             wd_lbl = OPTIMIZER_WD_LABELS.get(best["wd_strategy"], best["wd_strategy"])
 
             st.markdown(f"### Recommended: {conv_lbl}, {wd_lbl}")
@@ -6246,7 +6274,7 @@ def analysis_page():
                 st.metric("Median Legacy", f"${best['median_legacy']/1e6:.2f}M",
                           delta=f"${(best['median_legacy'] - baseline['median_legacy'])/1e6:+.2f}M")
             with mc3:
-                st.metric("Lifetime Taxes", f"${best['median_tax']/1e6:.2f}M",
+                st.metric("Lifetime Tax+IRMAA", f"${best['median_tax']/1e6:.2f}M",
                           delta=f"${(best['median_tax'] - baseline['median_tax'])/1e6:+.2f}M",
                           delta_color="inverse")
             with mc4:
@@ -6258,11 +6286,11 @@ def analysis_page():
             rows = []
             for c in candidates[:10]:
                 rows.append({
-                    "Conv Amount": f"${c['conv_level']:,}/yr" if c["conv_level"] > 0 else "None",
+                    "Conversion": c.get("conv_label", f"${c['conv_level']:,}/yr" if c["conv_level"] > 0 else "None"),
                     "Withdrawal": OPTIMIZER_WD_LABELS.get(c["wd_strategy"], c["wd_strategy"]),
                     "Success %": f"{c['success_rate']:.1f}%",
                     "Median Legacy": fmt_dollars(c["median_legacy"]),
-                    "Lifetime Tax": fmt_dollars(c["median_tax"]),
+                    "Lifetime Tax+IRMAA": fmt_dollars(c["median_tax"]),
                     "Rank": "⭐" if c is best else "",
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -6271,13 +6299,13 @@ def analysis_page():
             sr_data = []
             for c in candidates:
                 sr_data.append({
-                    "Conv Level": f"${c['conv_level']//1000}k" if c['conv_level'] > 0 else "$0",
+                    "Conversion": c.get("conv_label", f"${c['conv_level']//1000}k" if c['conv_level'] > 0 else "$0"),
                     "Strategy": OPTIMIZER_WD_LABELS.get(c["wd_strategy"], c["wd_strategy"]),
                     "Success Rate": c["success_rate"],
                 })
             sr_df = pd.DataFrame(sr_data)
             sr_chart = alt.Chart(sr_df).mark_bar().encode(
-                x=alt.X("Conv Level:N", sort=None, title="Roth Conversion Amount"),
+                x=alt.X("Conversion:N", sort=None, title="Roth Conversion Strategy"),
                 y=alt.Y("Success Rate:Q", title="Success Rate (%)"),
                 color=alt.Color("Strategy:N"),
                 xOffset="Strategy:N",
