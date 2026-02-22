@@ -2837,6 +2837,7 @@ def render_mini_tornado(cfg_run: dict, hold: dict, top_n: int = 6):
     """Quick sensitivity analysis with top N factors displayed."""
     with st.spinner("Analyzing sensitivity..."):
         tor = _run_sensitivity_tests(cfg_run, hold, n_fast=800)
+    st.session_state["_tornado_df"] = tor  # cache for PDF report
     render_tornado_chart(tor, top_n=top_n)
 
 
@@ -3613,7 +3614,29 @@ def my_plan_page():
                         st.session_state["_active_scenario_name"] = _sc_name
                         st.rerun()
     with hdr_right:
-        _hdr_r_l, _hdr_r_r = st.columns(2)
+        _has_sim = "sim_result" in st.session_state and "cfg_run" in st.session_state
+        if _has_sim:
+            _hdr_r_pdf, _hdr_r_l, _hdr_r_r = st.columns(3)
+        else:
+            _hdr_r_pdf = None
+            _hdr_r_l, _hdr_r_r = st.columns(2)
+        if _has_sim and _hdr_r_pdf is not None:
+            with _hdr_r_pdf:
+                from pdf_report import generate_report_pdf
+                _pdf_out = st.session_state["sim_result"]
+                _pdf_cfg_run = st.session_state["cfg_run"]
+                _pdf_ages = _pdf_out["ages"]
+                _tornado_cache = st.session_state.get("_tornado_df", None)
+                _pdf_bytes = generate_report_pdf(
+                    _pdf_cfg_run, hold, _pdf_out, _pdf_ages,
+                    tornado_df=_tornado_cache,
+                )
+                st.download_button(
+                    ":material/picture_as_pdf:",
+                    _pdf_bytes, "retirelab_report.pdf", "application/pdf",
+                    use_container_width=True, key="dl_pdf",
+                    help="Download a polished PDF retirement plan report",
+                )
         with _hdr_r_l:
             _save_data = {"cfg": dict(cfg), "hold": dict(hold)}
             st.download_button(
@@ -5956,6 +5979,7 @@ def analysis_page():
         st.caption("Each variable shows the impact of both an increase and decrease. Uses 1,000 simulations per test for speed.")
         with st.spinner("Running sensitivity tests..."):
             tor = _run_sensitivity_tests(cfg_run, hold, n_fast=1000)
+        st.session_state["_tornado_df"] = tor  # cache for PDF report
         render_tornado_chart(tor)
         # Show clean table
         display_df = tor[["Variable", "Up ($M)", "Down ($M)", "Up Label", "Down Label"]].copy()
