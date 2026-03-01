@@ -1293,6 +1293,27 @@ def simulate(cfg: dict, hold: dict) -> dict:
                     dur = np.full(int(triggers.sum()), max(1.0, ltc_dur_mean))
                 ltc_end_age[triggers] = a + np.ceil(dur).astype(int)
 
+    # CCRC (Continuing Care Retirement Community)
+    ccrc_on = bool(cfg.get("ccrc_on", False))
+    ccrc_entry_age = int(cfg.get("ccrc_entry_age", 78)) if ccrc_on else 999
+    ccrc_entry_fee_real = float(cfg.get("ccrc_entry_fee", 400000.0)) if ccrc_on else 0.0
+    ccrc_monthly_fee_real = float(cfg.get("ccrc_monthly_fee_real", 4200.0)) if ccrc_on else 0.0
+    ccrc_fee_escalation = float(cfg.get("ccrc_fee_escalation", 0.05)) if ccrc_on else 0.0
+    ccrc_contract_type = str(cfg.get("ccrc_contract_type", "A"))
+    ccrc_refund_pct = float(cfg.get("ccrc_refund_pct", 0.90)) if ccrc_on else 0.0
+    ccrc_amort_rate = float(cfg.get("ccrc_amort_rate", 0.02)) if ccrc_on else 0.0
+    ccrc_amort_initial = float(cfg.get("ccrc_amort_initial", 0.04)) if ccrc_on else 0.0
+    ccrc_al_market_real = float(cfg.get("ccrc_al_market_rate_real", 6000.0)) if ccrc_on else 0.0
+    ccrc_snf_market_real = float(cfg.get("ccrc_snf_market_rate_real", 10000.0)) if ccrc_on else 0.0
+    ccrc_type_b_days = int(cfg.get("ccrc_type_b_included_days", 60)) if ccrc_on else 0
+    ccrc_type_b_discount = float(cfg.get("ccrc_type_b_discount", 0.25)) if ccrc_on else 0.0
+    ccrc_replaces_home = bool(cfg.get("ccrc_replaces_home", True)) if ccrc_on else False
+
+    # CCRC state: track entry fee paid (nominal) and months of residency per sim
+    ccrc_fee_paid = np.zeros(n)  # nominal entry fee actually paid
+    ccrc_entered = np.zeros(n, dtype=bool)
+    ccrc_months_resident = np.zeros(n, dtype=int)  # incremented each year by 12
+
     # Pre-retirement income & contributions
     contrib_on = bool(cfg.get("contrib_on", False)) and (start_age < retire_age)
     pretax_income_1 = float(cfg.get("pretax_income_1", 0.0)) if contrib_on else 0.0
@@ -1320,6 +1341,9 @@ def simulate(cfg: dict, hold: dict) -> dict:
     event_expense_track = np.zeros((n, T+1))
     event_income_track = np.zeros((n, T+1))
     ltc_cost_track = np.zeros((n, T+1))
+    ccrc_entry_fee_track = np.zeros((n, T+1))
+    ccrc_monthly_fee_track = np.zeros((n, T+1))
+    ccrc_care_surcharge_track = np.zeros((n, T+1))  # extra cost for AL/SNF above monthly fee
     baseline_core_track = np.zeros((n, T+1))
     core_spend_track = np.zeros((n, T+1))
     ss_nom_track = np.zeros((n, T+1))
@@ -1650,6 +1674,98 @@ def simulate(cfg: dict, hold: dict) -> dict:
             ltc_nom[in_ltc] = ltc_cost_real * infl_index[in_ltc, t-1]
         ltc_cost_track[:, t] = ltc_nom
 
+        # CCRC costs
+        ccrc_entry_nom = np.zeros(n)
+        ccrc_monthly_nom = np.zeros(n)
+        ccrc_care_surcharge = np.zeros(n)
+        if ccrc_on:
+            someone_alive = alive1 | alive2 if mort_on else np.ones(n, dtype=bool)
+
+            # Entry fee payment at ccrc_entry_age
+            if age == ccrc_entry_age:
+                entering = someone_alive & ~ccrc_entered
+                if entering.any():
+                    fee_nom = ccrc_entry_fee_real * infl_index[entering, t-1]
+                    ccrc_fee_paid[entering] = fee_nom
+                    ccrc_entered[entering] = True
+                    ccrc_entry_nom[entering] = fee_nom
+                    # If CCRC replaces home, sell the home and add net proceeds to taxable
+                    if ccrc_replaces_home and home_on:
+                        has_home = entering & ~rent_on & (home_value[:, t-1] > 0)
+                        if has_home.any():
+                            sale_price_ccrc = home_value[has_home, t-1]
+                            net_ccrc = np.maximum(0.0, sale_price_ccrc * (1 - selling_cost) - mortgage[has_home, t-1])
+                            rent_on[has_home] = True
+                            home_value[has_home, t] = 0.0
+                            mortgage[has_home, t] = 0.0
+                            taxable[has_home, t-1] += net_ccrc
+                            basis[has_home, t-1] += net_ccrc
+                            # Zero out home costs and mortgage for these sims this year
+                            home_cost_nom[has_home] = 0.0
+                            mort_pay_nom[has_home] = 0.0
+                            # Zero out rent since CCRC monthly fee replaces it
+                            rent_nom[has_home] = 0.0
+
+            # Monthly fees (annual) for CCRC residents who are alive
+            in_ccrc = ccrc_entered & someone_alive
+            if in_ccrc.any():
+                # CCRC monthly fees escalate at their own rate (often faster than CPI)
+                years_since_entry = np.maximum(0, age - ccrc_entry_age)
+                # Compound the CCRC-specific escalation on top of the real base fee
+                ccrc_annual_fee = ccrc_monthly_fee_real * 12.0 * infl_index[in_ccrc, t-1] * \
+                    ((1 + ccrc_fee_escalation) ** years_since_entry) / \
+                    ((1 + float(cfg.get("infl_mu", 0.025))) ** years_since_entry)
+                # The infl_index already accounts for general inflation; the ratio above
+                # applies only the excess escalation above general inflation
+                ccrc_monthly_nom[in_ccrc] = ccrc_annual_fee
+                ccrc_months_resident[in_ccrc] += 12
+
+                # Zero out rent for CCRC residents (monthly fee replaces rent)
+                rent_nom[in_ccrc] = 0.0
+
+                # Care surcharges when in LTC at CCRC (depends on contract type)
+                if ltc_on:
+                    in_ccrc_ltc = in_ccrc & (age >= ltc_onset_age) & (age < ltc_end_age)
+                    if in_ccrc_ltc.any():
+                        if ccrc_contract_type == "A":
+                            # Type A (Life Care): monthly fee stays the same, no surcharge.
+                            # The existing ltc_nom represents standalone LTC cost which
+                            # is NOT incurred at a Type A CCRC — the entry fee pre-paid it.
+                            ltc_nom[in_ccrc_ltc] = 0.0
+                            ltc_cost_track[in_ccrc_ltc, t] = 0.0
+                        elif ccrc_contract_type == "B":
+                            # Type B (Modified): included days at discount, then market rate
+                            # Approximate: included_days cover a fraction of the year
+                            fraction_covered = min(1.0, ccrc_type_b_days / 365.0)
+                            # For the covered portion, cost is already in monthly fee
+                            # For the uncovered portion, pay market rate minus discount
+                            uncovered_frac = max(0.0, 1.0 - fraction_covered)
+                            # Market-rate surcharge for uncovered period (AL rate as proxy)
+                            al_annual = ccrc_al_market_real * 12.0 * infl_index[in_ccrc_ltc, t-1]
+                            surcharge = uncovered_frac * al_annual * (1 - ccrc_type_b_discount)
+                            ccrc_care_surcharge[in_ccrc_ltc] = surcharge
+                            # Replace standalone LTC cost with the CCRC surcharge
+                            ltc_nom[in_ccrc_ltc] = 0.0
+                            ltc_cost_track[in_ccrc_ltc, t] = 0.0
+                        else:
+                            # Type C (Fee-for-Service): full market rate for AL/SNF
+                            # The existing ltc_nom already represents this cost, but we
+                            # can refine it to use the CCRC's market rates
+                            al_annual_c = ccrc_al_market_real * 12.0 * infl_index[in_ccrc_ltc, t-1]
+                            ccrc_care_surcharge[in_ccrc_ltc] = al_annual_c
+                            # Replace generic LTC cost with CCRC-specific market rate
+                            ltc_nom[in_ccrc_ltc] = 0.0
+                            ltc_cost_track[in_ccrc_ltc, t] = 0.0
+
+        ccrc_entry_fee_track[:, t] = ccrc_entry_nom
+        ccrc_monthly_fee_track[:, t] = ccrc_monthly_nom
+        ccrc_care_surcharge_track[:, t] = ccrc_care_surcharge
+        # Re-update home/rent trackers after CCRC may have zeroed them
+        if ccrc_on:
+            home_cost_track[:, t] = home_cost_nom
+            mort_pay_track[:, t] = mort_pay_nom
+            rent_track[:, t] = rent_nom
+
         # Spending events: compute event expenses and income for this age
         evt_expense_nom = np.zeros(n)
         evt_income_nom = np.zeros(n)
@@ -1676,8 +1792,8 @@ def simulate(cfg: dict, hold: dict) -> dict:
         event_expense_track[:, t] = evt_expense_nom
         event_income_track[:, t] = evt_income_nom
 
-        # Total outflow (including event expenses)
-        outflow_nom = adjusted_core_nom + home_cost_nom + mort_pay_nom + rent_nom + health_nom + medical_short + ltc_nom + evt_expense_nom
+        # Total outflow (including event expenses and CCRC)
+        outflow_nom = adjusted_core_nom + home_cost_nom + mort_pay_nom + rent_nom + health_nom + medical_short + ltc_nom + evt_expense_nom + ccrc_entry_nom + ccrc_monthly_nom + ccrc_care_surcharge
         total_outflow_track[:, t] = outflow_nom
 
         # inheritance
@@ -2196,11 +2312,25 @@ def simulate(cfg: dict, hold: dict) -> dict:
     liquid_real = liquid / infl_index
     net_worth_real = net_worth / infl_index
 
+    # CCRC entry fee refund to estate at death
+    ccrc_refund = np.zeros(n)
+    if ccrc_on:
+        for i in range(n):
+            if ccrc_entered[i]:
+                months = int(ccrc_months_resident[i])
+                fee = float(ccrc_fee_paid[i])
+                # Declining-balance portion: amortizes from (1 - initial_deduction)
+                amortized_frac = ccrc_amort_initial + ccrc_amort_rate * months
+                declining_refund = fee * max(0.0, 1.0 - amortized_frac)
+                # Guaranteed refund floor
+                guaranteed = fee * ccrc_refund_pct
+                ccrc_refund[i] = max(declining_refund, guaranteed)
+
     legacy = np.zeros(n)
     for i in range(n):
         d = int(second_death[i])
         idx = min(max(d - start_age, 0), T)
-        legacy[i] = net_worth[i, idx]
+        legacy[i] = net_worth[i, idx] + ccrc_refund[i]
 
     _RUIN_SENTINEL = end_age + 1  # sentinel: sim never ran out of money
     ruin_age = np.full(n, _RUIN_SENTINEL, dtype=int)
@@ -2238,6 +2368,7 @@ def simulate(cfg: dict, hold: dict) -> dict:
         "magi": _f32(magi_track),
         "irmaa_tier": tier_track,
         "legacy": _f32(legacy),
+        "ccrc_refund": _f32(ccrc_refund),
         "ruin_age": ruin_age,
         "funded_through_age": funded_through_age,
         "second_death": second_death,
@@ -2287,6 +2418,9 @@ def simulate(cfg: dict, hold: dict) -> dict:
             "pre_ret_savings": _f32(pre_ret_savings_track),
             "event_expense": _f32(event_expense_track),
             "event_income": _f32(event_income_track),
+            "ccrc_entry_fee": _f32(ccrc_entry_fee_track),
+            "ccrc_monthly_fee": _f32(ccrc_monthly_fee_track),
+            "ccrc_care_surcharge": _f32(ccrc_care_surcharge_track),
         },
         "infl_index": _f32(infl_index),
         "regime_states": regime_track,
@@ -3175,6 +3309,23 @@ def init_defaults():
     _d("ltc_cost_real", 120000.0)
     _d("ltc_duration_mean", 3.0)
     _d("ltc_duration_sigma", 1.5)
+
+    # CCRC (Continuing Care Retirement Community)
+    _d("ccrc_on", False)
+    _d("ccrc_entry_age", 78)              # Age you move into the CCRC
+    _d("ccrc_entry_fee", 400000.0)        # Upfront entry fee (today's $)
+    _d("ccrc_monthly_fee_real", 4200.0)   # Monthly fee for independent living (today's $)
+    _d("ccrc_fee_escalation", 0.05)       # Annual escalation rate for monthly fees (often 4-6%, outpaces CPI)
+    _d("ccrc_contract_type", "A")         # "A" = Life Care, "B" = Modified, "C" = Fee-for-Service
+    _d("ccrc_refund_pct", 0.90)           # Guaranteed refundable % of entry fee (0 = declining balance, 0.5, 0.75, 0.90)
+    _d("ccrc_amort_rate", 0.02)           # Monthly amortization rate for non-refundable portion
+    _d("ccrc_amort_initial", 0.04)        # Initial deduction at move-in (e.g., 4%)
+    _d("ccrc_al_market_rate_real", 6000.0)   # Market rate for assisted living per month (today's $)
+    _d("ccrc_snf_market_rate_real", 10000.0) # Market rate for skilled nursing per month (today's $)
+    _d("ccrc_type_b_included_days", 60)   # Type B: discounted care days per year
+    _d("ccrc_type_b_discount", 0.25)      # Type B: discount off market rate during included days
+    _d("ccrc_replaces_home", True)        # If True, home is sold when entering CCRC
+    _d("ccrc_refund_delay_months", 12)    # Months after death before estate receives refund
 
     # HSA
     _d("hsa_on", True)
@@ -4859,6 +5010,116 @@ def plan_setup_page():
                 cfg["ltc_duration_mean"] = st.number_input("Average years of care", value=float(cfg["ltc_duration_mean"]), step=0.5, format="%.1f", key="ps_ltc_dur")
                 cfg["ltc_duration_sigma"] = st.number_input("Duration uncertainty", value=float(cfg["ltc_duration_sigma"]), step=0.5, format="%.1f", key="ps_ltc_sig")
 
+        st.html('<div class="pro-section-title">Continuing Care Retirement Community (CCRC)</div>')
+        cfg["ccrc_on"] = st.toggle("Plan to move into a CCRC", value=bool(cfg.get("ccrc_on", False)), key="ps_ccrc_on",
+            help="Model moving into a Continuing Care Retirement Community (also called a Life Plan Community). "
+                 "CCRCs charge an upfront entry fee plus ongoing monthly fees. Upon death, your estate "
+                 "receives a partial refund of the entry fee depending on the contract type. "
+                 "If you also have LTC risk enabled, the CCRC contract type determines how much "
+                 "of assisted living / skilled nursing costs are covered.")
+        if not cfg["ccrc_on"]:
+            st.caption("Toggle on to model the costs and benefits of a Continuing Care Retirement Community, "
+                       "including entry fee, monthly fees, contract type, and estate refund.")
+        if cfg["ccrc_on"]:
+            cc1, cc2 = st.columns(2, border=True)
+            with cc1:
+                cfg["ccrc_entry_age"] = st.number_input("Move-in age", value=int(cfg.get("ccrc_entry_age", 78)),
+                    min_value=55, max_value=95, step=1, key="ps_ccrc_entry_age",
+                    help="Age when you plan to enter the CCRC. Most people enter between 75-84. "
+                         "You must be independent at entry (most CCRCs require it).")
+                cfg["ccrc_entry_fee"] = st.number_input("Entry fee (today's $)", value=float(cfg.get("ccrc_entry_fee", 400000.0)),
+                    min_value=0.0, step=25000.0, key="ps_ccrc_entry_fee",
+                    help="Upfront fee paid at move-in. National average is ~$400K. "
+                         "Ranges from $100K to $1M+ depending on location, unit, and contract type.")
+                cfg["ccrc_monthly_fee_real"] = st.number_input("Monthly fee (today's $)", value=float(cfg.get("ccrc_monthly_fee_real", 4200.0)),
+                    min_value=0.0, step=100.0, key="ps_ccrc_monthly",
+                    help="Monthly fee for independent living. National average ~$4,200. "
+                         "Covers meals, housekeeping, amenities, and (for Type A) future care.")
+                cfg["ccrc_fee_escalation"] = st.number_input("Annual fee escalation rate", value=float(cfg.get("ccrc_fee_escalation", 0.05)),
+                    min_value=0.0, max_value=0.15, step=0.005, format="%.3f", key="ps_ccrc_escalation",
+                    help="CCRC monthly fees typically increase 4-6% per year, often exceeding general inflation. "
+                         "This rate is applied on top of general inflation.")
+            with cc2:
+                _contract_types = ["A", "B", "C"]
+                _contract_labels = {
+                    "A": "Type A — Life Care (all-inclusive)",
+                    "B": "Type B — Modified (limited included days)",
+                    "C": "Type C — Fee-for-Service (market rate)",
+                }
+                cfg["ccrc_contract_type"] = st.selectbox("Contract type",
+                    _contract_types,
+                    index=_contract_types.index(str(cfg.get("ccrc_contract_type", "A"))),
+                    format_func=lambda x: _contract_labels[x], key="ps_ccrc_contract",
+                    help="**Type A**: Highest entry fee but monthly fee stays the same even if you need "
+                         "assisted living or skilled nursing. LTC insurance has limited value here. "
+                         "**Type B**: Moderate entry fee. Includes a set number of discounted care days per year; "
+                         "after that, you pay market rate. LTC insurance is useful. "
+                         "**Type C**: Lowest entry fee but you pay full market rate for any care above "
+                         "independent living. LTC insurance is most valuable here.")
+                _refund_options = [0.0, 0.50, 0.75, 0.90]
+                _refund_labels = {0.0: "Declining balance (no guarantee)", 0.50: "50% refundable", 0.75: "75% refundable", 0.90: "90% refundable"}
+                _cur_refund = float(cfg.get("ccrc_refund_pct", 0.90))
+                if _cur_refund not in _refund_options:
+                    _cur_refund = 0.90
+                cfg["ccrc_refund_pct"] = st.selectbox("Entry fee refund type",
+                    _refund_options,
+                    index=_refund_options.index(_cur_refund),
+                    format_func=lambda x: _refund_labels[x], key="ps_ccrc_refund",
+                    help="How much of your entry fee is refundable to your estate at death. "
+                         "90% refundable is common but costs more upfront. Declining balance "
+                         "means the refund shrinks ~2%/month until it reaches zero.")
+                cfg["ccrc_replaces_home"] = st.toggle("Sell home when entering CCRC",
+                    value=bool(cfg.get("ccrc_replaces_home", True)), key="ps_ccrc_replaces_home",
+                    help="If enabled, your home is sold at the CCRC entry age and net proceeds "
+                         "are added to your taxable account. Home costs and mortgage payments stop.")
+
+            # Show Type B details if selected
+            if cfg["ccrc_contract_type"] == "B":
+                st.caption("Type B details:")
+                tb1, tb2 = st.columns(2, border=True)
+                with tb1:
+                    cfg["ccrc_type_b_included_days"] = st.number_input("Included care days per year",
+                        value=int(cfg.get("ccrc_type_b_included_days", 60)),
+                        min_value=0, max_value=365, step=10, key="ps_ccrc_b_days",
+                        help="Number of days per year of assisted living / skilled nursing included "
+                             "at a discounted rate in your monthly fee.")
+                with tb2:
+                    cfg["ccrc_type_b_discount"] = st.number_input("Discount off market rate",
+                        value=float(cfg.get("ccrc_type_b_discount", 0.25)),
+                        min_value=0.0, max_value=1.0, step=0.05, format="%.2f", key="ps_ccrc_b_disc",
+                        help="Discount applied during included days (e.g., 0.25 = 25% off market rate).")
+
+            # Show market rates for Types B and C
+            if cfg["ccrc_contract_type"] in ("B", "C"):
+                st.caption("Market care rates (used for surcharges above the monthly fee):")
+                mr1, mr2 = st.columns(2, border=True)
+                with mr1:
+                    cfg["ccrc_al_market_rate_real"] = st.number_input("Assisted living monthly rate (today's $)",
+                        value=float(cfg.get("ccrc_al_market_rate_real", 6000.0)),
+                        min_value=0.0, step=500.0, key="ps_ccrc_al_rate",
+                        help="Market rate for assisted living per month. National median ~$5,900.")
+                with mr2:
+                    cfg["ccrc_snf_market_rate_real"] = st.number_input("Skilled nursing monthly rate (today's $)",
+                        value=float(cfg.get("ccrc_snf_market_rate_real", 10000.0)),
+                        min_value=0.0, step=500.0, key="ps_ccrc_snf_rate",
+                        help="Market rate for skilled nursing per month. National median ~$9,300 (semi-private).")
+
+            # LTC interaction note
+            if cfg["ltc_on"] and cfg["ccrc_on"]:
+                if cfg["ccrc_contract_type"] == "A":
+                    st.info("With a **Type A (Life Care)** contract, your monthly fee covers assisted living "
+                            "and skilled nursing at no extra cost. The standalone LTC cost you set above "
+                            "will be zeroed out while you are in the CCRC. LTC insurance has limited value "
+                            "under this contract type (only cash-indemnity policies provide a benefit).")
+                elif cfg["ccrc_contract_type"] == "B":
+                    st.info("With a **Type B (Modified)** contract, your included care days are covered. "
+                            "After those days are exhausted, you pay a discounted market rate. "
+                            "LTC insurance can help cover the excess costs.")
+                else:
+                    st.info("With a **Type C (Fee-for-Service)** contract, you pay full market rate "
+                            "for assisted living and skilled nursing. LTC insurance is most valuable here "
+                            "and can offset these costs dollar-for-dollar.")
+
     # ================================================================
     # TAXES
     # ================================================================
@@ -5708,7 +5969,10 @@ def analysis_page():
                 _health_total = (float(np.percentile(de["health"][:, idx], 50)) +
                                  float(np.percentile(de["medical_nom"][:, idx], 50)) +
                                  float(np.percentile(de["ltc_cost"][:, idx], 50)))
-                _expense_rows.append({
+                _ccrc_total = (float(np.percentile(de["ccrc_entry_fee"][:, idx], 50)) +
+                               float(np.percentile(de["ccrc_monthly_fee"][:, idx], 50)) +
+                               float(np.percentile(de["ccrc_care_surcharge"][:, idx], 50)))
+                _row = {
                     "Age": int(age),
                     "Core Spending": float(np.percentile(de["core_adjusted"][:, idx], 50)) / 1e3,
                     "Housing": _hc / 1e3,
@@ -5716,7 +5980,10 @@ def analysis_page():
                     "Taxes": float(np.percentile(de["taxes_paid"][:, idx], 50)) / 1e3,
                     "IRMAA": float(np.percentile(de["irmaa"][:, idx], 50)) / 1e3,
                     "Event Expenses": float(np.percentile(de["event_expense"][:, idx], 50)) / 1e3,
-                })
+                }
+                if _ccrc_total > 0 or bool(cfg_run.get("ccrc_on", False)):
+                    _row["CCRC"] = _ccrc_total / 1e3
+                _expense_rows.append(_row)
 
             _inc_df = pd.DataFrame(_income_rows)
             _exp_df = pd.DataFrame(_expense_rows)
@@ -6073,7 +6340,10 @@ def analysis_page():
         if not bool(cfg_run.get("legacy_on", True)):
             st.info("Legacy analysis is off. Enable it in Plan Setup > Advanced.")
         else:
-            st.caption("Estimated estate value at second death, nominal $. Includes home equity. Assumes stepped-up cost basis.")
+            _ccrc_note = ""
+            if bool(cfg_run.get("ccrc_on", False)):
+                _ccrc_note = " Includes CCRC entry fee refund to estate."
+            st.caption(f"Estimated estate value at second death, nominal $. Includes home equity. Assumes stepped-up cost basis.{_ccrc_note}")
             legacy = out["legacy"]
             lc1, lc2, lc3 = st.columns(3, border=True)
             with lc1:
@@ -6082,6 +6352,19 @@ def analysis_page():
                 st.html(_metric_card_html("p10 (Low)", f"${np.percentile(legacy, 10)/1e6:.1f}M", "", "metric-coral"))
             with lc3:
                 st.html(_metric_card_html("p90 (High)", f"${np.percentile(legacy, 90)/1e6:.1f}M", "", "metric-green"))
+
+            # CCRC refund breakdown
+            if bool(cfg_run.get("ccrc_on", False)):
+                ccrc_refund = out.get("ccrc_refund", np.zeros(1))
+                if np.any(ccrc_refund > 0):
+                    st.markdown("**CCRC Entry Fee Refund to Estate**")
+                    cr1, cr2, cr3 = st.columns(3, border=True)
+                    with cr1:
+                        st.metric("Median Refund", f"${np.median(ccrc_refund):,.0f}")
+                    with cr2:
+                        st.metric("p10 Refund", f"${np.percentile(ccrc_refund, 10):,.0f}")
+                    with cr3:
+                        st.metric("p90 Refund", f"${np.percentile(ccrc_refund, 90):,.0f}")
 
             # Distribution histogram
             leg_m = legacy / 1e6
