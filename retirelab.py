@@ -2372,6 +2372,8 @@ def simulate(cfg: dict, hold: dict) -> dict:
         "ruin_age": ruin_age,
         "funded_through_age": funded_through_age,
         "second_death": second_death,
+        "death1": death1,
+        "death2": death2,
         "decomp": {
             "baseline_core": _f32(baseline_core_track),
             "core_adjusted": _f32(core_spend_track),
@@ -5853,6 +5855,8 @@ def analysis_page():
         de = out["decomp"]
         liq = out["liquid"]
         nw = out["net_worth"]
+        n_sims = liq.shape[0]
+        end_age_val = int(ages[-1])
         hv = out["home_value"]
         mb = out["mortgage"]
         home_eq = np.maximum(0.0, hv - mb)
@@ -5917,7 +5921,7 @@ def analysis_page():
 
         # ---- Income & Expense Charts ----
         st.html('<div class="pro-section-title">Income Sources & Expenses</div>')
-        st.caption("Median (50th percentile) values across all simulations, in nominal dollars. Post-retirement years only.")
+        st.caption("Median (50th percentile) values conditional on at least one person being alive, in nominal dollars. Post-retirement years only.")
 
         if len(_post_ret_ages) > 1:
             # Change 1: 6-category income chart with account-level breakdown
@@ -5942,44 +5946,73 @@ def analysis_page():
                 sum(de[k] for k in keys) for keys in _src_groups.values()
             ])
 
+            # Build survival mask: for each sim, at least one person alive at each age
+            _mort_on = bool(cfg_run.get("mort_on", True))
+            _death1 = out.get("death1", np.full(n_sims, end_age_val + 1))
+            _death2 = out.get("death2", np.full(n_sims, end_age_val + 1))
+
+            def _alive_median(arr, idx, age_val):
+                """Median of arr[:, idx] conditional on at least one person alive."""
+                if not _mort_on:
+                    return float(np.percentile(arr[:, idx], 50))
+                alive_mask = (age_val < _death1) | (age_val < _death2)
+                vals = arr[alive_mask, idx]
+                if len(vals) == 0:
+                    return 0.0
+                return float(np.median(vals))
+
             _income_rows = []
             _expense_rows = []
+            _survival_pct = []
             for i, age in enumerate(_post_ret_ages):
                 idx = _ret_age_idx + i
-                _med_total = float(np.percentile(_total_inc[:, idx], 50))
-                _col_total = _total_inc[:, idx]
-                _col_total_safe = np.maximum(_col_total, 1e-6)
+                _age_val = int(age)
+
+                # Survival probability at this age
+                if _mort_on:
+                    _alive_mask = (_age_val < _death1) | (_age_val < _death2)
+                    _surv = float(_alive_mask.mean())
+                else:
+                    _alive_mask = np.ones(n_sims, dtype=bool)
+                    _surv = 1.0
+                _survival_pct.append({"Age": _age_val, "Survival %": _surv * 100})
+
+                # Income (conditional on alive)
+                _alive_inc = _total_inc[_alive_mask, idx] if _alive_mask.any() else _total_inc[:, idx]
+                _med_total = float(np.median(_alive_inc)) if len(_alive_inc) > 0 else 0.0
+                _col_total_safe = np.maximum(_alive_inc, 1e-6)
                 _shares = np.array([
-                    float(np.mean(_group_arrays[g, :, idx] / _col_total_safe))
+                    float(np.mean(_group_arrays[g, _alive_mask, idx] / _col_total_safe))
+                    if _alive_mask.any() else 0.0
                     for g in range(len(_src_labels))
-                ])
+                ]) if len(_alive_inc) > 0 else np.zeros(len(_src_labels))
                 _share_sum = _shares.sum()
                 if _share_sum > 0:
                     _shares = _shares / _share_sum
                 _amounts = _shares * _med_total
 
                 _income_rows.append({
-                    "Age": int(age),
+                    "Age": _age_val,
                     **{label: float(amt) / 1e3 for label, amt in zip(_src_labels, _amounts)}
                 })
 
-                _hc = (float(np.percentile(de["home_cost"][:, idx], 50)) +
-                       float(np.percentile(de["mort_pay"][:, idx], 50)) +
-                       float(np.percentile(de["rent"][:, idx], 50)))
-                _health_total = (float(np.percentile(de["health"][:, idx], 50)) +
-                                 float(np.percentile(de["medical_nom"][:, idx], 50)) +
-                                 float(np.percentile(de["ltc_cost"][:, idx], 50)))
-                _ccrc_total = (float(np.percentile(de["ccrc_entry_fee"][:, idx], 50)) +
-                               float(np.percentile(de["ccrc_monthly_fee"][:, idx], 50)) +
-                               float(np.percentile(de["ccrc_care_surcharge"][:, idx], 50)))
+                _hc = (_alive_median(de["home_cost"], idx, _age_val) +
+                       _alive_median(de["mort_pay"], idx, _age_val) +
+                       _alive_median(de["rent"], idx, _age_val))
+                _health_total = (_alive_median(de["health"], idx, _age_val) +
+                                 _alive_median(de["medical_nom"], idx, _age_val) +
+                                 _alive_median(de["ltc_cost"], idx, _age_val))
+                _ccrc_total = (_alive_median(de["ccrc_entry_fee"], idx, _age_val) +
+                               _alive_median(de["ccrc_monthly_fee"], idx, _age_val) +
+                               _alive_median(de["ccrc_care_surcharge"], idx, _age_val))
                 _row = {
-                    "Age": int(age),
-                    "Core Spending": float(np.percentile(de["core_adjusted"][:, idx], 50)) / 1e3,
+                    "Age": _age_val,
+                    "Core Spending": _alive_median(de["core_adjusted"], idx, _age_val) / 1e3,
                     "Housing": _hc / 1e3,
                     "Healthcare": _health_total / 1e3,
-                    "Taxes": float(np.percentile(de["taxes_paid"][:, idx], 50)) / 1e3,
-                    "IRMAA": float(np.percentile(de["irmaa"][:, idx], 50)) / 1e3,
-                    "Event Expenses": float(np.percentile(de["event_expense"][:, idx], 50)) / 1e3,
+                    "Taxes": _alive_median(de["taxes_paid"], idx, _age_val) / 1e3,
+                    "IRMAA": _alive_median(de["irmaa"], idx, _age_val) / 1e3,
+                    "Event Expenses": _alive_median(de["event_expense"], idx, _age_val) / 1e3,
                 }
                 if _ccrc_total > 0 or bool(cfg_run.get("ccrc_on", False)):
                     _row["CCRC"] = _ccrc_total / 1e3
@@ -6047,6 +6080,23 @@ def analysis_page():
                     tooltip=["Age:Q", "Category:N", alt.Tooltip("Amount ($K):Q", format=",.0f")]
                 ).properties(height=350)
                 st.altair_chart(_exp_chart, use_container_width=True)
+
+            # ---- Survival probability chart ----
+            if _mort_on and len(_survival_pct) > 1:
+                st.html('<div class="pro-section-title">Survival Probability</div>')
+                st.caption("Probability that at least one person in the household is alive at each age, "
+                           "based on the mortality model. Income and expense charts above show medians "
+                           "conditional on survival.")
+                _surv_df = pd.DataFrame(_survival_pct)
+                _surv_chart = alt.Chart(_surv_df).mark_area(
+                    color="#1B2A4A", opacity=0.3, line={"color": "#1B2A4A", "strokeWidth": 2}
+                ).encode(
+                    x=alt.X("Age:Q", title="Age"),
+                    y=alt.Y("Survival %:Q", title="% of Simulations with Someone Alive",
+                            scale=alt.Scale(domain=[0, 100])),
+                    tooltip=[alt.Tooltip("Age:Q"), alt.Tooltip("Survival %:Q", format=".1f")]
+                ).properties(height=250)
+                st.altair_chart(_surv_chart, use_container_width=True)
 
         # ---- Spending floor distribution chart ----
         _spend_real_dd = de["spend_real_track"]
