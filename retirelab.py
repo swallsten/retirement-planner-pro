@@ -3087,7 +3087,7 @@ def init_defaults():
 
     # Ages
     _d("start_age", 55)
-    _d("end_age", 90)
+    _d("end_age", 95)
     _d("retire_age", 62)
 
     # Household
